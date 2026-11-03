@@ -5,7 +5,7 @@
 //! device, meeting audio 60 days / 10 GB. Partial config files are valid:
 //! missing fields fall back to defaults.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +15,11 @@ use crate::storage::Result;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Root directory of the local archive (ADR rev 5): `activity.db` lives
+    /// at `<data_dir>/activity.db` and media files under
+    /// `<data_dir>/media/<kind>/<YYYY>/<MM>/<DD>/`. The central hub mirrors
+    /// this layout and keeps its copy forever by default.
+    pub data_dir: PathBuf,
     /// How often the window watcher polls the foreground window (seconds).
     pub poll_interval_s: u64,
     /// Input idle time after which the user counts as AFK (minutes).
@@ -70,6 +75,7 @@ pub struct SyncConfig {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            data_dir: PathBuf::from("data"),
             poll_interval_s: 5,
             afk_threshold_min: 5,
             screen: ScreenConfig::default(),
@@ -145,6 +151,7 @@ mod tests {
         assert_eq!(cfg.screen.interval_s, 10);
         assert_eq!(cfg.screen.max_age_days, 90);
         assert_eq!(cfg.screen.max_total_mb, 20 * 1024);
+        assert_eq!(cfg.data_dir, PathBuf::from("data"));
         assert_eq!(cfg.poll_interval_s, 5);
         assert_eq!(cfg.afk_threshold_min, 5);
         assert_eq!(cfg.sync.device_name, "laptop");
@@ -158,6 +165,12 @@ mod tests {
         let text = toml::to_string(&Config::default()).expect("serialize");
         let parsed = Config::from_toml_str(&text).expect("parse");
         assert_eq!(parsed, Config::default());
+    }
+
+    #[test]
+    fn data_dir_can_be_overridden() {
+        let cfg = Config::from_toml_str("data_dir = \"D:\\\\archive\"\n").expect("parse");
+        assert_eq!(cfg.data_dir, PathBuf::from("D:\\archive"));
     }
 
     #[test]
