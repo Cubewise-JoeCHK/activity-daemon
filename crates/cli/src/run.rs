@@ -17,11 +17,16 @@
 //! - Logs to `{data_dir}/daemon.log` via the `log` crate.
 //! - Ctrl+C (Windows console handler) sets [`SHUTDOWN`]; the main thread
 //!   joins every worker and logs a clean exit.
+//! - Auto-update (#17): with `sync.auto_update` on, the main loop checks
+//!   GitHub Releases every `sync.update_interval_s` (default daily); an
+//!   applied update - or a restart request written by a manual `update` -
+//!   runs the same graceful shutdown (workers join, session flush) and then
+//!   relaunches the updated exe.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use activity_core::Db;
 use activity_sync::SyncSettings;
@@ -31,12 +36,28 @@ use crate::config;
 use crate::heartbeat;
 use crate::lock::{DaemonLock, LockOutcome};
 use crate::logging::FileLogger;
+use crate::update;
 
 /// The process-wide daemon shutdown flag. One daemon per process (the
 /// single-instance lock enforces it), so a static is the simplest correct
 /// shape; the Windows console handler writes it from its own thread and
 /// every worker reads it as a `&'static AtomicBool`.
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Poll cadence of the main wait loop.
+const WAIT_SLICE: Duration = Duration::from_millis(200);
+
+/// What the main loop decided: plain stop, or a graceful restart onto the
+/// updated exe (relaunch happens after the single-instance lock is
+/// released, so the new instance can acquire it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitAction {
+    /// Ctrl+C or service stop.
+    Stop,
+    /// An update was applied (or `update/restart.request` was written by a
+    /// manual `update`): relaunch after the workers are joined.
+    Restart,
+}
 
 /// `run` subcommand entry point.
 pub fn cmd_run(config_override: Option<&Path>) -> Result<()> {
@@ -70,11 +91,20 @@ pub fn cmd_run(config_override: Option<&Path>) -> Result<()> {
     }
     let run_result = run_locked(&data_dir, &cfg);
     lock.release();
-    run_result
+    match run_result? {
+        ExitAction::Stop => {
+            println!("daemon stopped cleanly.");
+            Ok(())
+        }
+        ExitAction::Restart => {
+            println!("daemon stopped cleanly; relaunching on the updated version...");
+            update::relaunch_after_update()
+        }
+    }
 }
 
 /// The daemon body while holding the lock.
-fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<()> {
+fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<ExitAction> {
     // The plugins resolve their media roots from ACTIVITY_DATA_DIR (the
     // documented env override); pin it to the configured data dir before
     // any worker thread starts so every watcher lands in the same tree.
@@ -82,10 +112,12 @@ fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<()> {
 
     FileLogger::init_global(&data_dir.join("daemon.log"), true);
     log::info!(
-        "activity-daemon starting: data_dir={} device={} poll={}s",
+        "activity-daemon starting: data_dir={} device={} poll={}s auto_update={} interval={}s",
         data_dir.display(),
         cfg.sync.device_name,
-        cfg.poll_interval_s
+        cfg.poll_interval_s,
+        cfg.sync.auto_update,
+        cfg.sync.update_interval_s
     );
 
     let handles = spawn_workers(cfg, data_dir);
@@ -98,11 +130,14 @@ fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<()> {
         data_dir.display()
     );
 
-    // Wait for the shutdown flag (set by Ctrl+C or service stop).
-    while !SHUTDOWN.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    log::info!("shutdown requested; joining workers");
+    let exit_action = wait_for_shutdown_or_update(cfg, data_dir);
+    log::info!(
+        "{}; joining workers",
+        match exit_action {
+            ExitAction::Stop => "shutdown requested",
+            ExitAction::Restart => "update applied - restarting gracefully",
+        }
+    );
 
     let mut failed = 0usize;
     for handle in handles {
@@ -115,8 +150,54 @@ fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<()> {
         log::warn!("{failed} worker thread(s) panicked during shutdown");
     }
     log::info!("activity-daemon stopped cleanly");
-    println!("daemon stopped cleanly.");
-    Ok(())
+    Ok(exit_action)
+}
+
+/// The main wait loop. Returns when
+/// - Ctrl+C sets [`SHUTDOWN`] (plain stop), or
+/// - a manual `update` wrote `update/restart.request` (graceful restart on
+///   the already-swapped exe), or
+/// - `sync.auto_update` is on and a due GitHub Releases check applied an
+///   update (graceful restart on the new exe).
+///
+/// Network/API failures of the update check are logged and ignored - the
+/// daemon keeps running and the next check happens after the interval.
+/// The check runs synchronously here (one update in flight, ever).
+fn wait_for_shutdown_or_update(cfg: &activity_core::Config, data_dir: &Path) -> ExitAction {
+    let check_interval = Duration::from_secs(cfg.sync.update_interval_s.max(1));
+    let mut last_check = Instant::now();
+    loop {
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            return ExitAction::Stop;
+        }
+        // A manual `update` asked the daemon to restart on the new exe.
+        if update::take_restart_request(data_dir) {
+            log::info!(
+                "restart requested via update/{}",
+                update::RESTART_REQUEST_FILE
+            );
+            return ExitAction::Restart;
+        }
+        if cfg.sync.auto_update && last_check.elapsed() >= check_interval {
+            last_check = Instant::now();
+            log::info!("auto-update: checking for a new release");
+            match check_for_update(data_dir) {
+                Ok(true) => return ExitAction::Restart,
+                Ok(false) => {}
+                Err(e) => log::warn!("auto-update check failed (continuing): {e:#}"),
+            }
+        }
+        std::thread::sleep(WAIT_SLICE);
+    }
+}
+
+/// One update check + apply against GitHub Releases. `Ok(true)` = the new
+/// exe is in place, the daemon should restart gracefully.
+fn check_for_update(data_dir: &Path) -> Result<bool> {
+    let fetcher = update::GitHubFetcher::new();
+    let downloader = update::HttpDownloader::new();
+    let updater = update::Updater::real(data_dir, &fetcher, &downloader)?;
+    Ok(updater.check_and_apply()?.is_some())
 }
 
 /// Spawn the four watcher/sync workers. Each opens its own `Db` connection
