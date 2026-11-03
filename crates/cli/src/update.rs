@@ -689,6 +689,13 @@ fn schtasks_run() -> Result<()> {
     }
 }
 
+#[cfg(not(windows))]
+fn schtasks_run() -> Result<()> {
+    // Unreachable through relaunch_after_update (task_exists() is false on
+    // non-Windows); this stub only keeps the code cross-platform-compilable.
+    bail!("schtasks is only available on Windows: /run /tn {TASK_NAME}")
+}
+
 /// Spawn `exe run` detached so it survives this process exiting.
 #[cfg(windows)]
 fn spawn_detached(exe: &Path) -> Result<()> {
