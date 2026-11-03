@@ -1,0 +1,13 @@
+[package]
+name = "activity-cli"
+description = "activity-daemon command line interface"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "activity-daemon"
+path = "src/main.rs"
+
+[dependencies]
+activity-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }

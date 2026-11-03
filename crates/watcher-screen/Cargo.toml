@@ -1,0 +1,7 @@
+[package]
+name = "watcher-screen"
+description = "Screen frame watcher retention planning for activity-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
