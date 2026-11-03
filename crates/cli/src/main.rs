@@ -1,10 +1,29 @@
-//! `activity-daemon` CLI. The daemon binary for the Windows client.
-//! Subcommands are stubs for now: they print exactly what they will do,
-//! so the CLI contract is fixed before the watchers land (#3-#6, #18).
+//! `activity-daemon` CLI: run / status / startup / record (issue #7).
+//!
+//! - `run` - the daemon: four worker threads (window, screen, audio, sync),
+//!   each with its own core `Db` connection, one shared shutdown flag,
+//!   single-instance lock, heartbeat and `daemon.log` in the data dir.
+//! - `status` - heartbeat liveness, current foreground, today active time,
+//!   sync backlog, storage usage vs budgets; `--json` for machines.
+//! - `startup install|uninstall|status` - Windows Task Scheduler autostart
+//!   (logon trigger, restart on failure, hidden); `--dry-run` previews.
+//! - `record start|stop` - manual mic-only recording via the watcher-audio
+//!   `record.json` control file (atomic write, `trigger: "cli"`).
+//!
+//! Global flag: `--config <path>` (default `%APPDATA%\activity-daemon\config.toml`;
+//! a missing file is created as a commented template with defaults).
+
+mod config;
+mod heartbeat;
+mod lock;
+mod logging;
+mod record;
+mod run;
+mod startup;
+mod status;
 
 use std::path::PathBuf;
 
-use activity_core::Db;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -15,19 +34,35 @@ use clap::{Parser, Subcommand};
     long_about = None
 )]
 struct Cli {
+    /// Path to config.toml (default: %APPDATA%\activity-daemon\config.toml;
+    /// a missing file is created as a commented template with defaults).
+    #[arg(long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the daemon: watchers + sync forwarder loop, 24/7, local-first.
+    /// Run the daemon: watchers + sync forwarder, 24/7, local-first.
     Run,
-    /// Print event counts from the local database.
-    Status,
-    /// Register the daemon to start automatically with Windows.
-    Startup,
-    /// Manual meeting-audio recording (mic only; #6).
+    /// Show daemon liveness, current activity and storage state.
+    Status {
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage autostart via the Windows Task Scheduler (task "ActivityDaemon").
+    Startup {
+        #[command(subcommand)]
+        action: startup::StartupAction,
+        /// Print the task XML / commands instead of calling schtasks
+        /// (accepted before or after the subcommand).
+        #[arg(long, global = true)]
+        dry_run: bool,
+    },
+    /// Manual meeting-audio recording (mic only; in-person meetings).
     Record {
         #[command(subcommand)]
         action: RecordAction,
@@ -44,70 +79,23 @@ enum RecordAction {
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Run => {
-            println!("TODO(#3): run the daemon loop:");
-            println!("  - window/AFK watcher polling every config.poll_interval_s s (#4)");
-            println!(
-                "  - screen frame watcher every config.screen.interval_s s, hash-deduped (#5)"
-            );
-            println!("  - meeting audio watcher, hotkey + conferencing auto-trigger (#6)");
-            println!("  - forwarder loop: batch unsynced events to the WSL hub over Tailscale, then mark synced (#18)");
-            println!(
-                "  - local SQLite is always written first; collection never waits on the network"
-            );
-        }
-        Command::Status => status(),
-        Command::Startup => {
-            println!("TODO: register autostart (scheduled task or Run key) so 24/7 collection survives reboots.");
+    let result = match cli.command {
+        Command::Run => run::cmd_run(cli.config.as_deref()),
+        Command::Status { json } => status::cmd_status(json, cli.config.as_deref()),
+        Command::Startup { dry_run, action } => {
+            startup::cmd_startup(action, dry_run, cli.config.as_deref())
         }
         Command::Record { action } => match action {
             RecordAction::Start => {
-                println!("TODO(#6): start meeting-audio recording (mic only; loopback is added by the conferencing auto-trigger).");
+                record::cmd_record(record::RecordAction::Start, cli.config.as_deref())
             }
             RecordAction::Stop => {
-                println!("TODO(#6): stop the active meeting-audio recording.");
+                record::cmd_record(record::RecordAction::Stop, cli.config.as_deref())
             }
         },
-    }
-}
-
-/// Local database location; overridable for tests and the central server.
-fn db_path() -> PathBuf {
-    std::env::var_os("ACTIVITY_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("activity.db"))
-}
-
-fn status() {
-    let path = db_path();
-    if !path.exists() {
-        println!(
-            "no local database at {} yet - run `activity-daemon run` first",
-            path.display()
-        );
-        return;
-    }
-    let db = match Db::open_db(&path) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("failed to open {}: {e}", path.display());
-            std::process::exit(1);
-        }
     };
-    match db.counts_by_bucket() {
-        Ok(rows) => {
-            println!("local db: {}", path.display());
-            for (bucket, count) in rows {
-                println!("  {bucket}: {count}");
-            }
-            let total = db.event_count().unwrap_or(0);
-            let unsynced = db.unsynced_count().unwrap_or(0);
-            println!("  total: {total} event(s), unsynced: {unsynced}");
-        }
-        Err(e) => {
-            eprintln!("query failed: {e}");
-            std::process::exit(1);
-        }
+    if let Err(e) = result {
+        eprintln!("error: {e:?}");
+        std::process::exit(1);
     }
 }

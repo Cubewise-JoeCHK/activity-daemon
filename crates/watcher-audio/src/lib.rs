@@ -148,6 +148,8 @@ mod tests {
     #[test]
     fn grace_default_matches_issue() {
         assert_eq!(DEFAULT_GRACE_STOP_S, 10);
+        // Core's config default must agree with this crate's ADR const.
+        assert_eq!(activity_core::Config::default().audio.grace_stop_s, 10);
     }
 
     #[test]

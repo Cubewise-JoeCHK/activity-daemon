@@ -131,8 +131,9 @@ fn input_idle_s() -> f64 {
 ///
 /// 1. if input idle >= `afk_threshold_min`, skip this tick (AFK/lock pause);
 /// 2. capture the primary monitor via GDI;
-/// 3. JPEG-encode (quality [`DEFAULT_JPEG_QUALITY`]) and skip the write if
-///    the frame's `sha16` matches the previous frame;
+/// 3. JPEG-encode (quality `screen.quality`, default
+///    [`DEFAULT_JPEG_QUALITY`]) and skip the write if the frame's `sha16`
+///    matches the previous frame;
 /// 4. otherwise write `media/frames/YYYY/MM/DD/HHMMSS_<sha16>.jpg` and
 ///    insert the `media` index row via `Db::insert_event`;
 /// 5. once an hour (and once at startup), sweep old/oversized frames
@@ -143,9 +144,10 @@ fn input_idle_s() -> f64 {
 /// (no capture backend; see [`default_frame_source`]).
 pub fn run(cfg: &Config, db: &Db, shutdown: &AtomicBool) -> anyhow::Result<()> {
     let media_root = data_dir().join("media");
+    let quality = cfg.screen.quality;
     let mut watcher = Watcher::new(
         default_frame_source()?,
-        FrameStore::new(media_root.clone(), DEFAULT_JPEG_QUALITY),
+        FrameStore::new(media_root.clone(), quality),
         cfg.afk_threshold_min.saturating_mul(60),
     );
     let budget = RetentionBudget {
@@ -156,7 +158,7 @@ pub fn run(cfg: &Config, db: &Db, shutdown: &AtomicBool) -> anyhow::Result<()> {
     info!(
         "watcher-screen: interval {}s, quality {}, retention {}/{} MB, media root {}",
         cfg.screen.interval_s,
-        DEFAULT_JPEG_QUALITY,
+        quality,
         budget.max_age_days,
         budget.max_total_mb,
         media_root.display()
