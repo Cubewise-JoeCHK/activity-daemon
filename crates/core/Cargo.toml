@@ -1,0 +1,11 @@
+[package]
+name = "activity-core"
+description = "Core storage and configuration for activity-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"

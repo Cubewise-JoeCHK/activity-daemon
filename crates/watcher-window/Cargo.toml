@@ -1,0 +1,10 @@
+[package]
+name = "watcher-window"
+description = "Window/AFK session coalescing for activity-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+activity-core = { path = "../core" }
+chrono = "0.4"
+serde_json = "1"

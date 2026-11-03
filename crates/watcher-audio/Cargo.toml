@@ -1,0 +1,7 @@
+[package]
+name = "watcher-audio"
+description = "Meeting audio watcher contract skeleton for activity-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

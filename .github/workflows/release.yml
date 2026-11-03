@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            package: activity-cli
+            bin: activity-daemon.exe
+            artifact: activity-daemon-windows-x86_64.exe
+          - os: ubuntu-latest
+            package: server
+            bin: server
+            artifact: activity-server-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p ${{ matrix.package }}
+
+      - name: Stage artifacts with sha256
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          sha256sum "dist/${{ matrix.artifact }}" > "dist/${{ matrix.artifact }}.sha256"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.artifact }}.sha256
