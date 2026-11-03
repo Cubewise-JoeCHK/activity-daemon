@@ -25,8 +25,9 @@ use crate::retention::{sweep, RetentionBudget};
 /// Grace period between the conferencing session ending and the auto
 /// recording stopping (seconds), default per issue #6.
 pub const DEFAULT_GRACE_STOP_S: u64 = 10;
-/// Environment override for the grace period (`audio.grace_stop_s` is not
-/// part of core's `AudioConfig` yet; reported as a core wish in #6).
+/// Test-only environment override for the grace period. Production reads
+/// `audio.grace_stop_s` from the config file exclusively (issue #7 moved
+/// the field into core's `AudioConfig`).
 pub const ENV_GRACE_STOP_S: &str = "ACTIVITY_AUDIO_GRACE_STOP_S";
 /// Environment override for the data dir (matches the CLI's `ACTIVITY_DB`
 /// convention of resolving data under the working directory otherwise).
@@ -62,14 +63,19 @@ pub fn resolve_data_dir(cfg: &Config) -> PathBuf {
         .unwrap_or_else(|| cfg.data_dir.clone())
 }
 
-/// Effective grace period: `ACTIVITY_AUDIO_GRACE_STOP_S` if it parses,
-/// otherwise [`DEFAULT_GRACE_STOP_S`].
-pub fn grace_stop_s() -> u64 {
-    std::env::var(ENV_GRACE_STOP_S)
+/// Effective grace period in seconds: `audio.grace_stop_s` from the core
+/// config (default [`DEFAULT_GRACE_STOP_S`]). In test builds only, the
+/// `ACTIVITY_AUDIO_GRACE_STOP_S` environment variable overrides the config.
+pub fn grace_stop_s(cfg: &Config) -> u64 {
+    #[cfg(test)]
+    if let Some(v) = std::env::var(ENV_GRACE_STOP_S)
         .ok()
-        .and_then(|v| v.trim().parse().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&v| v <= 3600)
-        .unwrap_or(DEFAULT_GRACE_STOP_S)
+    {
+        return v;
+    }
+    cfg.audio.grace_stop_s
 }
 
 /// Run the meeting-audio watcher until `shutdown` is set. **Blocking**;
@@ -119,9 +125,9 @@ pub fn run(cfg: &Config, db: &Db, shutdown: &AtomicBool) -> anyhow::Result<()> {
         }
     }
 
-    let grace_s = grace_stop_s();
+    let grace_s = grace_stop_s(cfg);
     log.info(&format!(
-        "auto-trigger grace period: {grace_s}s (override with {ENV_GRACE_STOP_S})"
+        "auto-trigger grace period: {grace_s}s (audio.grace_stop_s)"
     ));
     log.info(&format!(
         "control file channel: {} ({{\"action\":\"start\"|\"stop\",\"trigger\":\"cli\"}})",
@@ -737,4 +743,30 @@ fn make_detector(process_list: &[String], log: &Log) -> Box<dyn ConferenceWatche
 fn make_detector(_process_list: &[String], log: &Log) -> Box<dyn ConferenceWatcher> {
     log.warn("conferencing auto-trigger unavailable on this platform");
     Box::new(crate::detect::NullWatcher)
+}
+
+#[cfg(test)]
+mod grace_tests {
+    use super::*;
+
+    /// One sequential test: the env override is process-global, so the two
+    /// concerns must not race each other across parallel test threads.
+    #[test]
+    fn grace_comes_from_config_env_is_test_only_override() {
+        let mut cfg = Config::default();
+        assert_eq!(grace_stop_s(&cfg), 10);
+        cfg.audio.grace_stop_s = 42;
+        assert_eq!(grace_stop_s(&cfg), 42);
+
+        // Test builds honor the env override; production builds never see
+        // this branch (the read is #[cfg(test)]-gated).
+        std::env::set_var(ENV_GRACE_STOP_S, "7");
+        assert_eq!(grace_stop_s(&cfg), 7);
+        std::env::remove_var(ENV_GRACE_STOP_S);
+        assert_eq!(grace_stop_s(&cfg), 42);
+        // Out-of-range values are ignored.
+        std::env::set_var(ENV_GRACE_STOP_S, "99999");
+        assert_eq!(grace_stop_s(&cfg), 42);
+        std::env::remove_var(ENV_GRACE_STOP_S);
+    }
 }

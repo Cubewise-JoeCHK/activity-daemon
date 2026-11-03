@@ -21,6 +21,8 @@ pub struct Config {
     /// this layout and keeps its copy forever by default.
     pub data_dir: PathBuf,
     /// How often the window watcher polls the foreground window (seconds).
+    /// Design intent is 1 s so short interactions stay attributable
+    /// (issue #7 wired the default down from the earlier 5).
     pub poll_interval_s: u64,
     /// Input idle time after which the user counts as AFK (minutes).
     pub afk_threshold_min: u64,
@@ -38,6 +40,9 @@ pub struct Config {
 pub struct ScreenConfig {
     /// Seconds between frame captures (ADR: 5-10 s, content-hash deduped).
     pub interval_s: u64,
+    /// JPEG quality (1-100) for captured frames. Was hardcoded 70 in
+    /// watcher-screen until issue #7 lifted it into the config.
+    pub quality: u8,
     /// Rolling retention: oldest-first deletion beyond this age (days).
     pub max_age_days: u64,
     /// Rolling retention: total frame budget on the device (MB).
@@ -54,6 +59,10 @@ pub struct AudioConfig {
     /// Conferencing process names that may auto-trigger recording when they
     /// hold an active audio session (ADR rev 4 addendum).
     pub process_list: Vec<String>,
+    /// Grace period between the conferencing session ending and the auto
+    /// recording stopping (seconds). Was hardcoded 10 s in watcher-audio
+    /// until issue #7 lifted it into the config.
+    pub grace_stop_s: u64,
     /// Rolling retention: oldest-first deletion beyond this age (days).
     pub max_age_days: u64,
     /// Rolling retention: total audio budget on the device (MB).
@@ -76,7 +85,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             data_dir: PathBuf::from("data"),
-            poll_interval_s: 5,
+            poll_interval_s: 1,
             afk_threshold_min: 5,
             screen: ScreenConfig::default(),
             audio: AudioConfig::default(),
@@ -90,6 +99,7 @@ impl Default for ScreenConfig {
         // ADR rev 2: rolling budget default max 90 days / 20 GB.
         ScreenConfig {
             interval_s: 5,
+            quality: 70,
             max_age_days: 90,
             max_total_mb: 20 * 1024,
         }
@@ -107,6 +117,7 @@ impl Default for AudioConfig {
                 "Zoom.exe".to_string(),
                 "webex.exe".to_string(),
             ],
+            grace_stop_s: 10,
             max_age_days: 60,
             max_total_mb: 10 * 1024,
         }
@@ -152,12 +163,26 @@ mod tests {
         assert_eq!(cfg.screen.max_age_days, 90);
         assert_eq!(cfg.screen.max_total_mb, 20 * 1024);
         assert_eq!(cfg.data_dir, PathBuf::from("data"));
-        assert_eq!(cfg.poll_interval_s, 5);
+        assert_eq!(cfg.poll_interval_s, 1);
         assert_eq!(cfg.afk_threshold_min, 5);
         assert_eq!(cfg.sync.device_name, "laptop");
         assert!(cfg.sync.auto_update);
+        assert_eq!(cfg.screen.quality, 70);
+        assert_eq!(cfg.audio.grace_stop_s, 10);
         assert_eq!(cfg.audio.max_age_days, 60);
         assert_eq!(cfg.audio.max_total_mb, 10 * 1024);
+    }
+
+    #[test]
+    fn new_fields_carry_serde_defaults() {
+        // Old config files written before issue #7 lack screen.quality and
+        // audio.grace_stop_s; they must still parse with the defaults.
+        let cfg = Config::from_toml_str(
+            "[screen]\ninterval_s = 5\n\n[audio]\nhotkey = \"ctrl+shift+alt+m\"\n",
+        )
+        .expect("parse legacy config");
+        assert_eq!(cfg.screen.quality, 70);
+        assert_eq!(cfg.audio.grace_stop_s, 10);
     }
 
     #[test]

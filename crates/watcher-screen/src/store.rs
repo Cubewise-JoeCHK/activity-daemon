@@ -18,8 +18,9 @@ use sha2::{Digest, Sha256};
 
 use crate::capture::Frame;
 
-/// JPEG quality used while core's `ScreenConfig` has no `quality` field
-/// (default 70; see the #5 close comment for the follow-up wish).
+/// Default JPEG quality. Mirrors core's `ScreenConfig::default().quality`;
+/// the watcher reads the configured value (`screen.quality`), so this const
+/// only documents the default and backs the tests.
 pub const DEFAULT_JPEG_QUALITY: u8 = 70;
 
 /// Producer identity recorded on every `media` index row.
@@ -187,6 +188,16 @@ mod tests {
         let expected: String = full[..8].iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(sha16(data), expected);
         assert_eq!(sha16(data).len(), 16);
+    }
+
+    #[test]
+    fn default_quality_matches_core_config_default() {
+        // The watcher encodes with `screen.quality`; this const only mirrors
+        // core's default so the two cannot drift silently (issue #7).
+        assert_eq!(
+            activity_core::Config::default().screen.quality,
+            DEFAULT_JPEG_QUALITY
+        );
     }
 
     #[test]

@@ -7,7 +7,17 @@ name = "activity-cli"
 version = "0.1.0"
 dependencies = [
  "activity-core",
+ "activity-sync",
+ "anyhow",
+ "chrono",
  "clap",
+ "log",
+ "serde",
+ "serde_json",
+ "watcher-audio",
+ "watcher-screen",
+ "watcher-window",
+ "windows",
 ]
 
 [[package]]
@@ -1489,6 +1499,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections",
+ "windows-core",
+ "windows-future",
+ "windows-numerics",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core",
 ]
 
 [[package]]
