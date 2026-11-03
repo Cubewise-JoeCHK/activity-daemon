@@ -152,8 +152,13 @@ max_total_mb = {audio_mb}
 server_url = "{server_url}"
 # Device identity in the central store.
 device_name = "{device}"
-# Reserved for auto-update from GitHub Releases (#17).
+# Auto-update from GitHub Releases (#17): sha256-verified download, one
+# <exe>.old rollback copy, graceful restart. The manual `update` subcommand
+# works even when this is off (it only gates the automatic check).
 auto_update = {auto_update}
+# Seconds between automatic update checks (86400 = daily; the unauthenticated
+# GitHub API allows 60 requests/hour).
+update_interval_s = {update_interval}
 "#,
         data_dir = data_dir,
         poll = cfg.poll_interval_s,
@@ -170,6 +175,7 @@ auto_update = {auto_update}
         server_url = cfg.sync.server_url,
         device = cfg.sync.device_name,
         auto_update = cfg.sync.auto_update,
+        update_interval = cfg.sync.update_interval_s,
     )
 }
 
@@ -223,6 +229,7 @@ mod tests {
             "server_url",
             "device_name",
             "auto_update",
+            "update_interval_s",
         ] {
             assert!(text.contains(field), "template mentions {field}");
         }

@@ -20,7 +20,7 @@ need.
 | `watcher-screen` (crates/watcher-screen) | lib | rolling media retention planner (capture lands in #5) |
 | `watcher-audio` (crates/watcher-audio) | lib | meeting audio contract skeleton (#6) |
 | `server` (crates/server) | bin | WSL central ingestion endpoint (axum), deploy via Containerfile |
-| `activity-cli` (crates/cli) | bin | `activity-daemon` CLI: run / status / startup / record |
+| `activity-cli` (crates/cli) | bin | `activity-daemon` CLI: run / status / startup / record / update |
 
 ## Build
 
@@ -68,6 +68,62 @@ First `run` creates a fully commented config template with defaults at
 
 Server side (WSL hub, ingest endpoints, tailscale wiring): see
 [docs/sync.md](docs/sync.md).
+
+## Updates (GitHub Releases, issue #17)
+
+While the daemon runs, it checks
+`https://api.github.com/repos/Cubewise-JoeCHK/activity-daemon/releases/latest`
+for a newer release every `update_interval_s` (default 86400 s = daily) and
+self-updates. The check is unauthenticated (60 requests/hour per IP - a
+daily check is comfortably inside it) and failures (network down, 403 rate
+limit, malformed JSON, no releases yet) are logged and ignored: the daemon
+keeps running and retries after the interval.
+
+Config (`[sync]` in config.toml):
+
+```
+auto_update = true          # set false to disable the automatic check
+update_interval_s = 86400   # seconds between checks (daily)
+```
+
+`auto_update` only gates the automatic check - the manual `update`
+subcommand always works.
+
+What happens on a newer release (safety order matters):
+
+1. Download `activity-daemon-windows-x86_64.exe` + its `.sha256` companion
+   from the release into `%APPDATA%\activity-daemon\data\update\`
+   (`<tag>.exe.tmp`).
+2. Verify the sha256 (case-insensitive hex). On mismatch the download is
+   deleted and the update aborts - the old version keeps running.
+3. Rotate the binary: any previous `<exe>.old` is removed (exactly one
+   rollback copy exists between updates), the running exe is renamed to
+   `<exe>.old` (allowed on Windows while it runs), the download is renamed
+   over the exe path. If that last rename fails, `.old` is renamed back -
+   the daemon is never left without a working exe.
+4. Shut down gracefully (same path as Ctrl+C: workers join, the window
+   watcher flushes its open session) and relaunch - via the "ActivityDaemon"
+   Task Scheduler task when installed, otherwise the new exe is spawned
+   detached. The new version starts, finds no newer release, and the cycle
+   repeats on the next release.
+
+Manual commands: `activity-daemon update` (check now + apply; when the
+daemon is running it is asked to restart gracefully via the
+`data\update\restart.request` control file and relaunches within a second)
+and `activity-daemon update check` (report only: current version, latest
+release, whether it would apply).
+
+**Rollback**: stop the daemon (Ctrl+C or `startup uninstall`) and copy the
+old binary back over the new one - the rollback copy sits next to your exe
+(e.g. `C:\tools\activity-daemon.exe.old`):
+
+```
+copy /y C:\tools\activity-daemon.exe.old C:\tools\activity-daemon.exe
+```
+
+**SmartScreen note**: the release binaries are unsigned, so Windows
+SmartScreen may warn the first time a new binary runs ("More info" ->
+"Run anyway"). This also applies to manually restored `.old` copies.
 
 ## Docs
 

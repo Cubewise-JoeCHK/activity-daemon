@@ -77,8 +77,16 @@ pub struct SyncConfig {
     pub server_url: String,
     /// Device name used as identity in the central store.
     pub device_name: String,
-    /// Whether the client auto-updates from GitHub Releases (#17).
+    /// Whether the client auto-updates from GitHub Releases (#17): while
+    /// `run` is active the daemon checks `releases/latest` every
+    /// `update_interval_s` and self-updates (sha256-verified, one `.old`
+    /// rollback copy, graceful restart). The manual `update` subcommand
+    /// works regardless of this toggle - it only gates the automatic check.
     pub auto_update: bool,
+    /// Seconds between automatic update checks (#17). Default 86 400 s =
+    /// once a day, well inside the unauthenticated GitHub API rate limit
+    /// (60 requests/hour per IP).
+    pub update_interval_s: u64,
 }
 
 impl Default for Config {
@@ -130,6 +138,7 @@ impl Default for SyncConfig {
             server_url: "http://activity-hub:8080".to_string(),
             device_name: "windows-client".to_string(),
             auto_update: true,
+            update_interval_s: 86_400,
         }
     }
 }
@@ -190,6 +199,23 @@ mod tests {
         let text = toml::to_string(&Config::default()).expect("serialize");
         let parsed = Config::from_toml_str(&text).expect("parse");
         assert_eq!(parsed, Config::default());
+    }
+
+    #[test]
+    fn auto_update_fields_default_and_override() {
+        // Defaults: auto-update on, checked once a day (#17).
+        let cfg = Config::default();
+        assert!(cfg.sync.auto_update);
+        assert_eq!(cfg.sync.update_interval_s, 86_400);
+
+        // Both fields are overridable, and old config files without them
+        // still parse (serde defaults).
+        let cfg = Config::from_toml_str(
+            "[sync]\nserver_url = \"http://hub:8080\"\ndevice_name = \"laptop\"\nauto_update = false\nupdate_interval_s = 3600\n",
+        )
+        .expect("parse update config");
+        assert!(!cfg.sync.auto_update);
+        assert_eq!(cfg.sync.update_interval_s, 3600);
     }
 
     #[test]
