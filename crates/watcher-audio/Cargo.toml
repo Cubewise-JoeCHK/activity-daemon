@@ -1,7 +1,25 @@
 [package]
 name = "watcher-audio"
-description = "Meeting audio watcher contract skeleton for activity-daemon"
+description = "Meeting audio watcher: manual + conferencing auto-trigger recorder for activity-daemon"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+activity-core = { path = "../core" }
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.26"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
