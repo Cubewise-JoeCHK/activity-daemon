@@ -15,13 +15,15 @@
 # dir before the stage ends, hence the /out/ trick).
 
 # Stage 1: build only the server binary (package name: server).
-FROM rust:1-slim AS builder
+# Fully-qualified image names: podman on stock Ubuntu has no
+# unqualified-search registries configured.
+FROM docker.io/library/rust:1-slim AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p server
 
 # Stage 2: minimal runtime.
-FROM debian:stable-slim
+FROM docker.io/library/debian:stable-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
