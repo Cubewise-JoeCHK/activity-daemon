@@ -7,9 +7,11 @@ edition.workspace = true
 [dependencies]
 activity-core = { path = "../core" }
 axum = "0.8"
+http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "fs"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "fs", "io-util", "signal"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
