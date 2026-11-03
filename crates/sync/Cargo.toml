@@ -1,0 +1,15 @@
+[package]
+name = "activity-sync"
+description = "Client-side forwarder: pushes local events and media to the central hub"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+activity-core = { path = "../core" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# Small blocking HTTP client with rustls TLS and JSON support: the forwarder
+# is a plain loop (no async runtime needed) and must build on Windows + Linux.
+ureq = { version = "2", features = ["json"] }
