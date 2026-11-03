@@ -3,12 +3,14 @@
 //!
 //! The core stores raw event envelopes; it never inspects `data`. Plugins
 //! write through this crate, and later read through the query API like
-//! everyone else.
+//! everyone else. Media files are indexed as ordinary events in the `media`
+//! bucket (ADR convention); the files themselves stay owned by their
+//! producer plugin and the central archive.
 
 pub mod config;
 pub mod storage;
 
 pub use config::{AudioConfig, Config, ScreenConfig, SyncConfig};
 pub use storage::{
-    CoreError, Db, EventEnvelope, EventRow, BUCKET_AFK, BUCKET_MEDIA, BUCKET_WINDOW,
+    CoreError, Db, Event, EventEnvelope, EventRow, BUCKET_AFK, BUCKET_MEDIA, BUCKET_WINDOW,
 };
