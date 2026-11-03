@@ -160,16 +160,17 @@ mod end_to_end_tests {
     }
 
     fn test_config() -> Config {
+        // ..Default::default() keeps this robust against new core Config
+        // fields (e.g. data_dir).
         Config {
             // No real sleeping between scripted ticks.
             poll_interval_s: 0,
             afk_threshold_min: 5,
-            screen: Default::default(),
-            audio: Default::default(),
             sync: SyncConfig {
                 device_name: "test-laptop".to_string(),
                 ..Default::default()
             },
+            ..Default::default()
         }
     }
 
