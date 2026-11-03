@@ -54,12 +54,12 @@ fn now_rfc3339() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// Resolve the daemon data dir: `ACTIVITY_DATA_DIR` or the process working
-/// directory (consistent with the CLI's default `activity.db` location).
-pub fn data_dir() -> PathBuf {
+/// Resolve the daemon data dir: `ACTIVITY_DATA_DIR` overrides (tests and
+/// probes), otherwise core's `Config.data_dir` (ADR rev 5 layout root).
+pub fn resolve_data_dir(cfg: &Config) -> PathBuf {
     std::env::var_os(ENV_DATA_DIR)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| cfg.data_dir.clone())
 }
 
 /// Effective grace period: `ACTIVITY_AUDIO_GRACE_STOP_S` if it parses,
@@ -92,7 +92,7 @@ pub fn grace_stop_s() -> u64 {
 /// Subsystem errors are logged and absorbed; this function returns only
 /// when `shutdown` is set.
 pub fn run(cfg: &Config, db: &Db, shutdown: &AtomicBool) -> anyhow::Result<()> {
-    let data_dir = data_dir();
+    let data_dir = resolve_data_dir(cfg);
     let media_root = data_dir.join("media").join("audio");
     let control_path = data_dir.join("record.json");
     let log = Log::open(&data_dir.join("logs").join("audio.log"));

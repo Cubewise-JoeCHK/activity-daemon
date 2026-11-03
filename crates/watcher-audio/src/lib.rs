@@ -25,7 +25,9 @@
 //!   whose `media` index row is not yet synced are never pruned (ADR
 //!   rev 5); stale `*.part` crash leftovers are removed after a day.
 //! - Files are local-first under `{data_dir}/media/audio/` and sync to the
-//!   WSL hub within v0.1 (#18: file first, index row after).
+//!   WSL hub within v0.1 (#18: file first, index row after). The data dir
+//!   comes from core's `Config.data_dir`; the `ACTIVITY_DATA_DIR` env var
+//!   overrides it (tests and probes).
 //! - Consent/legal context for recording participants is the owner's
 //!   responsibility (ADR rev 4).
 //!
@@ -115,7 +117,7 @@ pub mod win_detector;
 mod win_hotkey;
 
 pub use daemon::{
-    data_dir, grace_stop_s, run, DEFAULT_GRACE_STOP_S, ENV_DATA_DIR, ENV_GRACE_STOP_S,
+    grace_stop_s, resolve_data_dir, run, DEFAULT_GRACE_STOP_S, ENV_DATA_DIR, ENV_GRACE_STOP_S,
 };
 pub use detect::{ConferenceHit, ConferenceWatcher, DetectionMode};
 pub use machine::{ActiveRecording, Source, StopReason, Transition, Trigger, TriggerMachine};
