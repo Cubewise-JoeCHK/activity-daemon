@@ -1,184 +1,200 @@
 //! Screen frame watcher for activity-daemon (issue #5).
 //!
-//! This crate currently implements the rolling-retention planner that
-//! bounds the local frame store (client-side rolling retention per
-//! docs/needs.md). The capture pipeline (Windows API JPEG capture every
-//! `screen.interval_s`, content-hash dedup via `sha16`, AFK/lock pause)
-//! arrives with #5 and will feed captured files into
-//! [`plan_deletions`] on a schedule.
+//! Captures the primary monitor as JPEG frames on a configurable interval
+//! (ADR: 5-10 s), **paused while the user is AFK or the workstation is
+//! locked** (no input means idle time grows past the AFK threshold), with
+//! content dedup (`sha16`: identical frames are not written at all) and a
+//! rolling retention budget of `screen.max_age_days` / `screen.max_total_mb`
+//! enforced by an hourly oldest-first sweep (ADR rev 2 defaults: 90 days /
+//! 20 GB).
 //!
-//! Rules (ADR rev 2): oldest-first auto-delete keeping a rolling budget of
-//! `max_age_days` and `max_total_mb`; both limits configurable; the planner
-//! never deletes everything while at least one in-budget file remains.
+//! # Layout (ADR media contract)
+//!
+//! ```text
+//! <data_dir>/media/frames/<YYYY>/<MM>/<DD>/<HHMMSS>_<sha16>.jpg
+//! ```
+//!
+//! Every written file gets one index row in the `media` bucket via core:
+//! `{ kind: "frame", path, bytes, sha16, producer: "watcher-screen" }`.
+//! Index rows are never deleted by the sweep - they are the historical
+//! record; the central hub is the keep-forever archive (docs/needs.md).
+//!
+//! # Data dir resolution
+//!
+//! The `ACTIVITY_DATA_DIR` environment variable, defaulting to the current
+//! directory - the same convention as the CLI's `ACTIVITY_DB`. (Wish-listed
+//! for core: an explicit `data_dir` config field.)
+//!
+//! # Daemon usage
+//!
+//! Blocking API for a daemon thread; stop it via a shared `AtomicBool`:
+//!
+//! ```no_run
+//! use std::sync::atomic::AtomicBool;
+//! use std::sync::Arc;
+//!
+//! let cfg = activity_core::Config::default();
+//! let db = activity_core::Db::open_db(std::path::Path::new("activity.db"))?;
+//! let shutdown = Arc::new(AtomicBool::new(false));
+//! let stop = Arc::clone(&shutdown);
+//! let worker = std::thread::spawn(move || watcher_screen::run(&cfg, &db, &stop));
+//! // ... later, on Ctrl-C or service stop:
+//! shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+//! worker.join().expect("screen watcher thread")?;
+//! # Ok::<(), anyhow::Error>(())
+//! ```
+//!
+//! Any capture failure logs a warning and continues; it never kills the
+//! daemon. The pipeline is hidden behind the [`FrameSource`] trait with a
+//! [`FakeFrameSource`] double, so encode, dedup, file layout, index rows
+//! and retention are tested on all platforms; only the GDI capture itself
+//! is Windows-only.
 
-/// Bytes per MB used by the budget math (1 MiB).
-pub const MB_BYTES: u64 = 1024 * 1024;
+pub mod capture;
+pub mod retention;
+pub mod store;
+pub mod watcher;
 
-/// One candidate file for retention planning.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FileInfo {
-    /// Path as stored on disk.
-    pub path: String,
-    /// Age of the file in days (now - modified time).
-    pub age_days: f64,
-    /// File size in bytes.
-    pub size_bytes: u64,
-}
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
-/// Retention budget: keep nothing older than `max_age_days` and keep the
-/// total under `max_total_mb`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RetentionBudget {
-    pub max_age_days: u64,
-    pub max_total_mb: u64,
-}
+use activity_core::{Config, Db};
+use chrono::Local;
+use log::{info, warn};
 
-/// Compute the deletion list enforcing the budget.
+#[cfg(windows)]
+pub use capture::gdi::GdiFrameSource;
+pub use capture::{FakeFrameSource, Frame, FrameSource};
+pub use retention::{
+    plan_deletions, sweep_frames, FileInfo, RetentionBudget, SweepReport, MB_BYTES, SWEEP_INTERVAL,
+};
+pub use store::{encode_jpeg, sha16, FrameStore, StoredFrame, DEFAULT_JPEG_QUALITY, PRODUCER};
+pub use watcher::{sleep_until, FrameStats, TickOutcome, Watcher};
+
+/// Resolve the data dir (media files live under `<data_dir>/media`).
 ///
-/// 1. Every file strictly older than `max_age_days` is deleted.
-/// 2. Then, oldest-first, files are deleted until the total size of the
-///    remaining files is within `max_total_mb` - except that at least one
-///    file is always kept if any in-age file exists (a single oversized
-///    file stays and can be handled by the age rule later).
-///
-/// The returned list is ordered oldest-first.
-pub fn plan_deletions(files: &[FileInfo], budget: &RetentionBudget) -> Vec<String> {
-    // Oldest-first view (stable sort keeps input order on equal ages).
-    let mut order: Vec<usize> = (0..files.len()).collect();
-    order.sort_by(|&a, &b| {
-        files[b]
-            .age_days
-            .partial_cmp(&files[a].age_days)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let budget_bytes = budget.max_total_mb.saturating_mul(MB_BYTES);
-    let mut deletions: Vec<usize> = Vec::new();
-    let mut kept: Vec<usize> = Vec::new();
-    for &i in &order {
-        if files[i].age_days > budget.max_age_days as f64 {
-            deletions.push(i);
-        } else {
-            kept.push(i);
-        }
-    }
-
-    let mut total: u64 = kept.iter().map(|&i| files[i].size_bytes).sum();
-    let mut next = 0;
-    while total > budget_bytes && kept.len() > next + 1 {
-        total -= files[kept[next]].size_bytes;
-        deletions.push(kept[next]);
-        next += 1;
-    }
-
-    deletions
-        .into_iter()
-        .map(|i| files[i].path.clone())
-        .collect()
+/// `ACTIVITY_DATA_DIR` environment variable, defaulting to the current
+/// directory so a daemon started next to `activity.db` keeps both together.
+pub fn data_dir() -> std::path::PathBuf {
+    std::env::var_os("ACTIVITY_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The production frame source: GDI primary-monitor capture on Windows.
+///
+/// Other platforms have no capture backend in v0.1; [`run`] reports this
+/// as an immediate error there.
+#[cfg(windows)]
+fn default_frame_source() -> anyhow::Result<Box<dyn FrameSource>> {
+    Ok(Box::new(capture::gdi::GdiFrameSource::new()))
+}
 
-    fn file(path: &str, age_days: f64, size_bytes: u64) -> FileInfo {
-        FileInfo {
-            path: path.to_string(),
-            age_days,
-            size_bytes,
+/// The production input-idle probe (seconds since last keyboard/mouse
+/// input). On Windows: `GetLastInputInfo`; the same probe covers the lock
+/// screen, because input idle keeps growing while the session is locked.
+/// Non-Windows reports 0 (never AFK) and `run` errors out anyway.
+#[cfg(windows)]
+fn input_idle_s() -> f64 {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+    // SAFETY: plain Win32 queries; GetLastInputInfo fills a caller-owned
+    // struct and GetTickCount takes no arguments.
+    unsafe {
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            ..Default::default()
+        };
+        if GetLastInputInfo(&mut info).as_bool() {
+            // u32 arithmetic makes tick-count wraparound harmless.
+            let idle_ms = GetTickCount().wrapping_sub(info.dwTime);
+            return idle_ms as f64 / 1000.0;
         }
     }
+    0.0
+}
 
-    fn mb(n: u64) -> u64 {
-        n * MB_BYTES
-    }
+#[cfg(not(windows))]
+fn default_frame_source() -> anyhow::Result<Box<dyn FrameSource>> {
+    anyhow::bail!("watcher-screen capture is only implemented on Windows (GDI); retention and the encode/dedup pipeline remain testable everywhere")
+}
 
-    #[test]
-    fn age_limit_deletes_every_expired_file_and_only_those() {
-        let files: Vec<FileInfo> = (1..=100)
-            .map(|d| file(&format!("f{d:03}.jpg"), d as f64, mb(1)))
-            .collect();
-        let budget = RetentionBudget {
-            max_age_days: 30,
-            max_total_mb: u64::MAX / MB_BYTES,
-        };
-        let deletions = plan_deletions(&files, &budget);
-        assert_eq!(deletions.len(), 70);
-        for path in &deletions {
-            let day: f64 = path[1..4].parse().expect("day from filename");
-            assert!(day > 30.0, "deleted file must be older than limit");
+#[cfg(not(windows))]
+fn input_idle_s() -> f64 {
+    0.0
+}
+
+/// Run the screen frame watcher until `shutdown` is set (blocking).
+///
+/// Daemon loop (one iteration per `screen.interval_s`):
+///
+/// 1. if input idle >= `afk_threshold_min`, skip this tick (AFK/lock pause);
+/// 2. capture the primary monitor via GDI;
+/// 3. JPEG-encode (quality [`DEFAULT_JPEG_QUALITY`]) and skip the write if
+///    the frame's `sha16` matches the previous frame;
+/// 4. otherwise write `media/frames/YYYY/MM/DD/HHMMSS_<sha16>.jpg` and
+///    insert the `media` index row via `Db::insert_event`;
+/// 5. once an hour (and once at startup), sweep old/oversized frames
+///    oldest-first within `screen.max_age_days` + `screen.max_total_mb`.
+///
+/// Returns when `shutdown` becomes true. Capture or storage failures log a
+/// warning and continue. Non-Windows platforms return an immediate error
+/// (no capture backend; see [`default_frame_source`]).
+pub fn run(cfg: &Config, db: &Db, shutdown: &AtomicBool) -> anyhow::Result<()> {
+    let media_root = data_dir().join("media");
+    let mut watcher = Watcher::new(
+        default_frame_source()?,
+        FrameStore::new(media_root.clone(), DEFAULT_JPEG_QUALITY),
+        cfg.afk_threshold_min.saturating_mul(60),
+    );
+    let budget = RetentionBudget {
+        max_age_days: cfg.screen.max_age_days,
+        max_total_mb: cfg.screen.max_total_mb,
+    };
+
+    info!(
+        "watcher-screen: interval {}s, quality {}, retention {}/{} MB, media root {}",
+        cfg.screen.interval_s,
+        DEFAULT_JPEG_QUALITY,
+        budget.max_age_days,
+        budget.max_total_mb,
+        media_root.display()
+    );
+
+    sweep_and_log(&media_root, &budget);
+    let mut last_sweep = Instant::now();
+    let interval = std::time::Duration::from_secs(cfg.screen.interval_s.max(1));
+
+    while !shutdown.load(Ordering::Relaxed) {
+        watcher.tick(Local::now(), input_idle_s(), db, &cfg.sync.device_name);
+
+        if last_sweep.elapsed() >= SWEEP_INTERVAL {
+            sweep_and_log(&media_root, &budget);
+            last_sweep = Instant::now();
         }
-        // Everything at or under the age limit survives (budget is huge).
-        for f in &files {
-            if f.age_days <= 30.0 {
-                assert!(!deletions.contains(&f.path));
-            }
+
+        sleep_until(shutdown, Instant::now() + interval);
+    }
+
+    let stats = watcher.stats();
+    info!(
+        "watcher-screen stopped: {} tick(s), {} written, {} deduped, {} AFK-skipped, {} failed",
+        stats.ticks, stats.written, stats.deduped, stats.afk_skipped, stats.failed
+    );
+    Ok(())
+}
+
+/// One retention pass; a failing sweep is logged and retried next hour.
+fn sweep_and_log(media_root: &std::path::Path, budget: &RetentionBudget) {
+    match sweep_frames(media_root, budget) {
+        Ok(report) if report.errors > 0 => {
+            warn!(
+                "retention sweep completed with {} error(s): deleted {}, scanned {}",
+                report.errors, report.deleted, report.scanned
+            );
         }
-    }
-
-    #[test]
-    fn size_limit_deletes_oldest_first_until_under_budget() {
-        let files: Vec<FileInfo> = (1..=100)
-            .map(|d| file(&format!("f{d:03}.jpg"), d as f64, mb(1)))
-            .collect();
-        let budget = RetentionBudget {
-            max_age_days: 365,
-            max_total_mb: 10,
-        };
-        let deletions = plan_deletions(&files, &budget);
-        assert_eq!(deletions.len(), 90);
-        // The 10 newest survive; kept total is within budget.
-        let kept_total: u64 = files
-            .iter()
-            .filter(|f| !deletions.contains(&f.path))
-            .map(|f| f.size_bytes)
-            .sum();
-        assert!(kept_total <= mb(10));
-        // Oldest-first ordering of the deletion list.
-        for pair in deletions.windows(2) {
-            let a: f64 = pair[0][1..4].parse().expect("day");
-            let b: f64 = pair[1][1..4].parse().expect("day");
-            assert!(a >= b, "deletion list must be oldest-first");
-        }
-    }
-
-    #[test]
-    fn under_budget_means_no_deletions() {
-        let files: Vec<FileInfo> = (0..5)
-            .map(|d| file(&format!("f{d}.jpg"), d as f64 + 1.0, mb(1)))
-            .collect();
-        let budget = RetentionBudget {
-            max_age_days: 365,
-            max_total_mb: 100,
-        };
-        assert!(plan_deletions(&files, &budget).is_empty());
-    }
-
-    #[test]
-    fn single_oversized_file_is_never_deleted_by_size_rule() {
-        let files = vec![file("only.jpg", 1.0, mb(500))];
-        let budget = RetentionBudget {
-            max_age_days: 365,
-            max_total_mb: 10,
-        };
-        assert!(plan_deletions(&files, &budget).is_empty());
-    }
-
-    #[test]
-    fn mixed_age_and_size_rules() {
-        let files = vec![
-            file("a.jpg", 400.0, mb(1)), // too old
-            file("b.jpg", 100.0, mb(8)), // in age, over size once a/b/c summed
-            file("c.jpg", 50.0, mb(8)),  // in age
-            file("d.jpg", 2.0, mb(2)),   // in age, newest
-        ];
-        let budget = RetentionBudget {
-            max_age_days: 365,
-            max_total_mb: 12,
-        };
-        let deletions = plan_deletions(&files, &budget);
-        // a is age-expired; then 8+8+2 = 18 MB > 12 MB, so b goes (oldest
-        // in-age first); 8+2 = 10 MB fits. d is never dropped (keep 1+).
-        assert_eq!(deletions, vec!["a.jpg".to_string(), "b.jpg".to_string()]);
+        Ok(_) => {}
+        Err(e) => warn!("retention sweep failed, will retry next hour: {e}"),
     }
 }
