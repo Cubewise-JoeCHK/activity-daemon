@@ -28,9 +28,13 @@ RUN cargo build --release -p server
 # Stage 2: minimal runtime - ubuntu:24.04 keeps glibc parity with the
 # ubuntu-latest release binary (activity-server-linux-x86_64, consumed by
 # the hub updater); a bookworm-built binary is forward-compatible here.
+# tzdata: chrono::Local resolves the TZ env var (e.g. TZ=Asia/Hong_Kong
+# in the deploy quadlet) against /usr/share/zoneinfo - without it the
+# server silently runs UTC and "today" / calendar day boundaries drift
+# by the owner's UTC offset.
 FROM docker.io/library/ubuntu:24.04
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/server /usr/local/bin/activity-server
 
