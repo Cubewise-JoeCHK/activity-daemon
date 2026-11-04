@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "activity-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "activity-core",
  "activity-sync",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "activity-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "activity-sync"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "activity-core",
  "log",
@@ -1030,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "activity-core",
  "axum",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "watcher-audio"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "activity-core",
  "anyhow",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "watcher-screen"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "activity-core",
  "anyhow",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "watcher-window"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "activity-core",
  "anyhow",
