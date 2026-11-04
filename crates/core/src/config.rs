@@ -32,6 +32,9 @@ pub struct Config {
     pub audio: AudioConfig,
     /// Sync / identity settings for the central hub (#18, #17).
     pub sync: SyncConfig,
+    /// Run-mode behavior (#30): console window visibility. Additive with
+    /// serde defaults, so config files written before #30 keep parsing.
+    pub run: RunConfig,
 }
 
 /// Screen frame capture and retention (#5).
@@ -69,6 +72,36 @@ pub struct AudioConfig {
     pub max_total_mb: u64,
 }
 
+/// Run-mode behavior (#30).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunConfig {
+    /// When `run` hides its own console window on Windows (#30):
+    /// - `auto` (default): hide when the parent process is NOT a visible
+    ///   terminal (cmd.exe / powershell.exe / pwsh.exe / WindowsTerminal.exe
+    ///   keep the console visible; anything else - explorer, the Startup
+    ///   folder, the Task Scheduler - hides it),
+    /// - `always`: always hide, even in a developer terminal,
+    /// - `never`: never hide; a console window stays visible.
+    ///
+    /// Non-Windows platforms ignore this (no console window is shown).
+    pub hide_console: HideConsole,
+}
+
+/// When `run` hides its console window (#30). Lowercase serde spelling
+/// matches the config file: `"auto" | "always" | "never"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HideConsole {
+    /// Hide unless the parent process is a visible terminal (default).
+    #[default]
+    Auto,
+    /// Always hide the console window.
+    Always,
+    /// Never hide the console window.
+    Never,
+}
+
 /// Sync and identity (#18 sync, #17 auto-update).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -98,6 +131,7 @@ impl Default for Config {
             screen: ScreenConfig::default(),
             audio: AudioConfig::default(),
             sync: SyncConfig::default(),
+            run: RunConfig::default(),
         }
     }
 }
@@ -128,6 +162,16 @@ impl Default for AudioConfig {
             grace_stop_s: 10,
             max_age_days: 60,
             max_total_mb: 10 * 1024,
+        }
+    }
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        // #30: the daemon must never show a console window on a normal
+        // machine; `auto` keeps it visible only under developer terminals.
+        RunConfig {
+            hide_console: HideConsole::Auto,
         }
     }
 }
@@ -222,6 +266,26 @@ mod tests {
     fn data_dir_can_be_overridden() {
         let cfg = Config::from_toml_str("data_dir = \"D:\\\\archive\"\n").expect("parse");
         assert_eq!(cfg.data_dir, PathBuf::from("D:\\archive"));
+    }
+
+    #[test]
+    fn run_hide_console_defaults_and_overrides() {
+        // #30: default is auto; legacy config files without a [run] section
+        // still parse (serde defaults).
+        let cfg = Config::default();
+        assert_eq!(cfg.run.hide_console, HideConsole::Auto);
+
+        let cfg =
+            Config::from_toml_str("[run]\nhide_console = \"never\"\n").expect("parse run config");
+        assert_eq!(cfg.run.hide_console, HideConsole::Never);
+
+        let cfg =
+            Config::from_toml_str("[run]\nhide_console = \"always\"\n").expect("parse run config");
+        assert_eq!(cfg.run.hide_console, HideConsole::Always);
+
+        // Unknown values are a config error (typos must not silently disable
+        // or enable the window hiding).
+        assert!(Config::from_toml_str("[run]\nhide_console = \"sometimes\"\n").is_err());
     }
 
     #[test]

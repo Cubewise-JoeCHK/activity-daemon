@@ -10,7 +10,7 @@
 pub mod config;
 pub mod storage;
 
-pub use config::{AudioConfig, Config, ScreenConfig, SyncConfig};
+pub use config::{AudioConfig, Config, HideConsole, RunConfig, ScreenConfig, SyncConfig};
 pub use storage::{
     CoreError, Db, Event, EventEnvelope, EventRow, BUCKET_AFK, BUCKET_MEDIA, BUCKET_WINDOW,
 };

@@ -22,6 +22,12 @@
 //!   applied update - or a restart request written by a manual `update` -
 //!   runs the same graceful shutdown (workers join, session flush) and then
 //!   relaunches the updated exe.
+//! - Windowless + tray (#30): `run` hides its own console window per
+//!   `run.hide_console` (auto = hide unless the parent is a visible
+//!   terminal) and a Windows tray thread shows health (active / recording /
+//!   heartbeat stale) with an Update now / Quit menu. Quit sets the same
+//!   [`SHUTDOWN`] flag; Update now sets a one-shot flag the main loop
+//!   consumes through the same update path as the manual `update` command.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,9 +39,11 @@ use activity_sync::SyncSettings;
 use anyhow::{Context, Result};
 
 use crate::config;
+use crate::console;
 use crate::heartbeat;
 use crate::lock::{DaemonLock, LockOutcome};
 use crate::logging::FileLogger;
+use crate::tray;
 use crate::update;
 use crate::usage_log;
 
@@ -63,13 +71,17 @@ pub(crate) enum ExitAction {
 /// `run` subcommand entry point.
 pub fn cmd_run(config_override: Option<&Path>) -> Result<()> {
     let resolved = config::resolve(config_override)?;
+    let cfg = resolved.config;
+    // Issue #30: hide the console window before anything else (auto mode
+    // keeps it visible under cmd/powershell/pwsh/Windows Terminal). The
+    // one-line template notice still goes to daemon.log below.
+    console::apply_hide_console(cfg.run.hide_console);
     if resolved.created {
         println!(
             "no config found - wrote a template with defaults to {}",
             resolved.path.display()
         );
     }
-    let cfg = resolved.config;
     let data_dir = cfg.data_dir.clone();
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
@@ -141,6 +153,14 @@ fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<ExitAction
     let handles = spawn_workers(cfg, data_dir);
     let heartbeat_handle = heartbeat::spawn_writer(data_dir, &SHUTDOWN);
     install_ctrl_handler();
+    // Issue #30: presence without a console - the tray thread reports
+    // health and offers Update now / Quit. A tray failure never blocks the
+    // daemon (logged, skipped).
+    let _tray = tray::spawn_tray(
+        data_dir.to_path_buf(),
+        cfg.sync.device_name.clone(),
+        &SHUTDOWN,
+    );
 
     println!(
         "daemon running: {} worker thread(s), data dir {}, Ctrl+C to stop",
@@ -167,6 +187,12 @@ fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<ExitAction
     if failed > 0 {
         log::warn!("{failed} worker thread(s) panicked during shutdown");
     }
+    // Issue #30: remove the tray icon before the process exits (else a
+    // ghost icon lingers until the next mouse-over). The tray thread sees
+    // the shutdown flag within one timer tick, so this short grace covers
+    // the message round-trip.
+    tray::teardown_window();
+    std::thread::sleep(Duration::from_millis(300));
     log::info!("activity-daemon stopped cleanly");
     Ok(exit_action)
 }
@@ -175,6 +201,8 @@ fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<ExitAction
 /// - Ctrl+C sets [`SHUTDOWN`] (plain stop), or
 /// - a manual `update` wrote `update/restart.request` (graceful restart on
 ///   the already-swapped exe), or
+/// - the tray menu's `Update now` requested a check (#30) and it applied an
+///   update (same code path as the manual command), or
 /// - `sync.auto_update` is on and a due GitHub Releases check applied an
 ///   update (graceful restart on the new exe).
 ///
@@ -195,6 +223,16 @@ fn wait_for_shutdown_or_update(cfg: &activity_core::Config, data_dir: &Path) -> 
                 update::RESTART_REQUEST_FILE
             );
             return ExitAction::Restart;
+        }
+        // The tray menu's `Update now`: same update path as the manual
+        // command / the scheduled check, just triggered from the tray.
+        if tray::take_update_request() {
+            log::info!("tray menu: update requested");
+            match check_for_update(data_dir) {
+                Ok(true) => return ExitAction::Restart,
+                Ok(false) => {}
+                Err(e) => log::warn!("tray update check failed (continuing): {e:#}"),
+            }
         }
         if cfg.sync.auto_update && last_check.elapsed() >= check_interval {
             last_check = Instant::now();

@@ -57,10 +57,14 @@ First `run` creates a fully commented config template with defaults at
   from the heartbeat, current foreground app, active time today (window
   sessions since local midnight, AFK excluded), unsynced event count,
   db size, frames/audio bytes vs their rolling budgets.
-- **`startup install`** registers a hidden Task Scheduler task
-  "ActivityDaemon" (logon trigger, restart on failure 3x/1 min, working
-  dir = data dir) and starts it; `startup status` / `startup uninstall`
-  manage it; `startup install --dry-run` prints the task XML.
+- **`startup install`** registers autostart with a no-admin fallback chain
+  (issue #29): the hidden Task Scheduler task "ActivityDaemon" (logon
+  trigger, restart on failure 3x/1 min, working dir = data dir), then a
+  minimal task XML when the scheduler rejects the rich settings, then a
+  Startup-folder `activity-daemon.vbs` when `schtasks` is blocked
+  (e.g. "Access is denied." under corporate policy). It prints which
+  mechanism won and its trade-off; `startup status` / `startup uninstall`
+  manage all of them; `startup install --dry-run` previews everything.
 - **`record start` / `record stop`**: manual mic-only recording for
   in-person meetings (writes the `record.json` control file the audio
   watcher consumes; see watcher-audio crate docs). The global hotkey
@@ -125,6 +129,59 @@ copy /y C:\tools\activity-daemon.exe.old C:\tools\activity-daemon.exe
 SmartScreen may warn the first time a new binary runs ("More info" ->
 "Run anyway"). This also applies to manually restored `.old` copies.
 
+## Startup methods (autostart fallback chain, issue #29)
+
+On a real second machine, `schtasks /create /f /tn ActivityDaemon /xml ...`
+returned **"Access is denied."** - corporate GPO/EDR restrictions and
+standard (non-admin) user accounts both block task creation. `startup
+install` therefore walks a fallback chain, and **every step needs no admin**:
+
+1. **Full task XML** - the preferred mechanism: hidden task "ActivityDaemon"
+   with a logon trigger and `RestartOnFailure` (3 retries / 1 minute), so a
+   crashed daemon is restarted automatically.
+2. **Minimal task XML** - when the scheduler (or a policy) rejects the rich
+   settings: the same logon trigger and least-privilege principal without
+   `Hidden` and `RestartOnFailure`. Trade-off: no crash auto-restart.
+3. **Startup-folder fallback** - when `schtasks` refuses twice:
+   `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\activity-daemon.vbs`
+   launches the daemon windowless at logon
+   (`Wscript.Shell.Run """<exe>"" run", 0, False` - no console flash).
+   Trade-off: no crash auto-restart - a crashed daemon stays down until the
+   next logon.
+
+`install` prints which mechanism was installed and its trade-off.
+`startup status` checks both artifacts (the scheduled task and the Startup
+folder) and reports the effective mechanism. `startup uninstall` removes
+the task and both fallback files (including a legacy
+`activity-daemon.cmd` from older installs).
+
+## Tray icon and windowless run (issue #30)
+
+The daemon must never show a console window. On Windows, `run` hides its
+own console window and shows its presence as a tray icon (bottom-right)
+instead:
+
+- **Console hiding** follows `run.hide_console` in config.toml:
+  - `auto` (default): hide unless the daemon was started from a visible
+    developer terminal (cmd / powershell / pwsh / Windows Terminal keep the
+    console for you; explorer, the Startup-folder fallback, the Task
+    Scheduler and detached relaunches hide it),
+  - `always`: always hide the console window,
+  - `never`: never hide it (useful when debugging).
+  Non-Windows platforms ignore this setting.
+- **Tray icon** (Windows; the process would otherwise be invisible):
+  - tooltip reflects health: `activity-daemon: active`,
+    `activity-daemon: recording` (while the meeting-audio watcher is
+    recording), or `activity-daemon: heartbeat stale` (no fresh heartbeat
+    file - refreshed every second),
+  - right-click menu: **Update now** (runs the same update path as the
+    manual `update` command; the daemon restarts gracefully onto the new
+    version) and **Quit** (the same graceful shutdown as Ctrl+C - workers
+    join, the open window session flushes). Left-click is a no-op for now
+    (a pause switch stays with issue #14).
+  - the tray never blocks the daemon: if it cannot start (e.g. Explorer is
+    not running), the reason is logged and `run` continues without it.
+
 ## Usage log (per-feature counts, issue #27)
 
 Every **user-initiated** action writes one event into the `usage` bucket
@@ -149,6 +206,8 @@ today / 7d / 30d / all-time from the local store (`--json` for machines);
 | `startup` | `uninstall` | `startup uninstall` (non-dry-run; the `startup status` query does NOT log) |
 | `update` | `apply` | manual `update` only - the automatic scheduled check NEVER logs |
 | `update` | `check` | manual `update check` only - never the scheduled check |
+| `tray` | `update-now` | the tray menu's `Update now` (issue #30) |
+| `tray` | `quit` | the tray menu's `Quit` (issue #30) |
 | `usage` | `view` | the `usage` report itself (honest meta-signal) |
 
 Instrumentation is fire-and-forget: a usage-insert failure prints a warning
