@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::usage_log;
+
 /// Scheduled task name.
 pub const TASK_NAME: &str = "ActivityDaemon";
 /// File the generated task XML is staged to before `schtasks /create /xml`.
@@ -34,11 +36,29 @@ pub fn cmd_startup(
 ) -> Result<()> {
     let resolved = crate::config::resolve(config_override)?;
     let data_dir = resolved.config.data_dir;
-    match action {
+    let result = match action {
         StartupAction::Install => install(&data_dir, dry_run),
         StartupAction::Uninstall => uninstall(dry_run),
         StartupAction::Status => task_status(dry_run),
+    };
+    // Issue #27: only a real (non-dry-run) install/uninstall counts as
+    // usage; the `status` query does NOT log. Fire-and-forget.
+    if !dry_run && result.is_ok() {
+        let logged_action = match action {
+            StartupAction::Install => Some(usage_log::ACTION_INSTALL),
+            StartupAction::Uninstall => Some(usage_log::ACTION_UNINSTALL),
+            StartupAction::Status => None,
+        };
+        if let Some(logged_action) = logged_action {
+            usage_log::record(
+                &data_dir,
+                &resolved.config.sync.device_name,
+                usage_log::FEATURE_STARTUP,
+                logged_action,
+            );
+        }
     }
+    result
 }
 
 /// Generate the Task Scheduler task XML.

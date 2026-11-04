@@ -20,7 +20,7 @@ need.
 | `watcher-screen` (crates/watcher-screen) | lib | rolling media retention planner (capture lands in #5) |
 | `watcher-audio` (crates/watcher-audio) | lib | meeting audio contract skeleton (#6) |
 | `server` (crates/server) | bin | WSL central ingestion endpoint (axum), deploy via Containerfile |
-| `activity-cli` (crates/cli) | bin | `activity-daemon` CLI: run / status / startup / record / update |
+| `activity-cli` (crates/cli) | bin | `activity-daemon` CLI: run / status / startup / record / update / usage |
 
 ## Build
 
@@ -124,6 +124,35 @@ copy /y C:\tools\activity-daemon.exe.old C:\tools\activity-daemon.exe
 **SmartScreen note**: the release binaries are unsigned, so Windows
 SmartScreen may warn the first time a new binary runs ("More info" ->
 "Run anyway"). This also applies to manually restored `.old` copies.
+
+## Usage log (per-feature counts, issue #27)
+
+Every **user-initiated** action writes one event into the `usage` bucket
+through the normal core insert (`data = {"feature": ..., "action": ...}`,
+`duration_s = 0`, `device = sync.device_name`). The rows live in the
+local-first SQLite store like any event and reach the WSL hub through the
+regular sync forwarder, so server-side aggregation stays possible later.
+Automatic features (auto-update scheduled checks, sync, capture, retention)
+NEVER log - otherwise they would fake usage.
+
+`activity-daemon usage` prints per feature+action counts over
+today / 7d / 30d / all-time from the local store (`--json` for machines);
+"today" starts at local midnight. The taxonomy is fixed and documented:
+
+| feature | action | logged when |
+|---|---|---|
+| `daemon` | `start` | every daemon boot (`run`) |
+| `status` | `view` | every `status` invocation |
+| `meeting-recording` | `manual-start` | `record start` |
+| `meeting-recording` | `manual-stop` | `record stop` |
+| `startup` | `install` | `startup install` (non-dry-run) |
+| `startup` | `uninstall` | `startup uninstall` (non-dry-run; the `startup status` query does NOT log) |
+| `update` | `apply` | manual `update` only - the automatic scheduled check NEVER logs |
+| `update` | `check` | manual `update check` only - never the scheduled check |
+| `usage` | `view` | the `usage` report itself (honest meta-signal) |
+
+Instrumentation is fire-and-forget: a usage-insert failure prints a warning
+and never fails the command you actually ran.
 
 ## Docs
 

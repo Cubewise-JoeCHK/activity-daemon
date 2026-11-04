@@ -22,6 +22,7 @@ use chrono::{DateTime, Local, SecondsFormat, TimeZone};
 use serde::Serialize;
 
 use crate::heartbeat::{self, HeartbeatState};
+use crate::usage_log;
 
 /// Lookback for the "current foreground" probe.
 const FOREGROUND_LOOKBACK_DAYS: i64 = 30;
@@ -35,6 +36,14 @@ pub fn cmd_status(json: bool, config_override: Option<&Path>) -> Result<()> {
     } else {
         print!("{}", render_human(&report));
     }
+    // Issue #27: every status invocation counts as {status, view}; the
+    // usage insert is fire-and-forget and never fails the status command.
+    usage_log::record(
+        &resolved.config.data_dir,
+        &resolved.config.sync.device_name,
+        usage_log::FEATURE_STATUS,
+        usage_log::ACTION_VIEW,
+    );
     Ok(())
 }
 
