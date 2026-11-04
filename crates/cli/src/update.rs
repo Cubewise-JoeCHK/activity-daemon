@@ -44,6 +44,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::startup::TASK_NAME;
+use crate::usage_log;
 
 /// GitHub API endpoint for the latest published release (drafts and
 /// pre-releases are excluded by the API itself).
@@ -739,10 +740,22 @@ pub fn cmd_update(action: Option<UpdateAction>, config_override: Option<&Path>) 
     let data_dir = resolved.config.data_dir;
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
-    match action {
-        Some(UpdateAction::Check) => check_only(&data_dir),
-        None => apply_now(&data_dir),
+    let (result, logged_action) = match action {
+        Some(UpdateAction::Check) => (check_only(&data_dir), usage_log::ACTION_CHECK),
+        None => (apply_now(&data_dir), usage_log::ACTION_APPLY),
+    };
+    // Issue #27: only the MANUAL update paths log ({update, check|apply});
+    // the automatic scheduled check in the run loop never reaches this
+    // function and never logs. Fire-and-forget.
+    if result.is_ok() {
+        usage_log::record(
+            &data_dir,
+            &resolved.config.sync.device_name,
+            usage_log::FEATURE_UPDATE,
+            logged_action,
+        );
     }
+    result
 }
 
 /// `update check`: report only; never touches files. `sync.auto_update`

@@ -13,6 +13,9 @@
 //! - `update` / `update check` - self-update from GitHub Releases (issue
 //!   #17): sha256-verified download, `<exe>.old` rollback copy, graceful
 //!   restart and relaunch.
+//! - `usage` - per-feature usage counts over today / 7d / 30d / all-time
+//!   (issue #27); every user-initiated action above logs one `usage` event
+//!   (fire-and-forget), automatic features never log.
 //!
 //! Global flag: `--config <path>` (default `%APPDATA%\activity-daemon\config.toml`;
 //! a missing file is created as a commented template with defaults).
@@ -26,6 +29,7 @@ mod run;
 mod startup;
 mod status;
 mod update;
+mod usage_log;
 
 use std::path::PathBuf;
 
@@ -79,6 +83,14 @@ enum Command {
         #[command(subcommand)]
         action: Option<update::UpdateAction>,
     },
+    /// Per-feature usage counts (today / 7d / 30d / all-time) from the local
+    /// store (issue #27). Usage events also sync to the WSL hub via the
+    /// normal forwarder, so server-side aggregation stays possible later.
+    Usage {
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -106,6 +118,7 @@ fn main() {
             }
         },
         Command::Update { action } => update::cmd_update(action, cli.config.as_deref()),
+        Command::Usage { json } => usage_log::cmd_usage(json, cli.config.as_deref()),
     };
     if let Err(e) = result {
         eprintln!("error: {e:?}");
@@ -144,5 +157,16 @@ mod tests {
             cli.config.as_deref(),
             Some(std::path::Path::new("D:\\cfg\\config.toml"))
         );
+    }
+
+    /// `usage` parses with and without `--json`.
+    #[test]
+    fn usage_subcommand_parsing() {
+        let cli = Cli::try_parse_from(["activity-daemon", "usage"]).expect("parse usage");
+        assert!(matches!(cli.command, Command::Usage { json: false }));
+
+        let cli =
+            Cli::try_parse_from(["activity-daemon", "usage", "--json"]).expect("parse usage json");
+        assert!(matches!(cli.command, Command::Usage { json: true }));
     }
 }

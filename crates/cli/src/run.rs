@@ -37,6 +37,7 @@ use crate::heartbeat;
 use crate::lock::{DaemonLock, LockOutcome};
 use crate::logging::FileLogger;
 use crate::update;
+use crate::usage_log;
 
 /// The process-wide daemon shutdown flag. One daemon per process (the
 /// single-instance lock enforces it), so a static is the simplest correct
@@ -119,6 +120,23 @@ fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<ExitAction
         cfg.sync.auto_update,
         cfg.sync.update_interval_s
     );
+
+    // Issue #27: every boot is a user-initiated {daemon, start} usage event.
+    // Opening here also pre-creates the WAL db before the four workers race
+    // for it; any failure is logged and never blocks the boot.
+    match open_db_with_retry(&data_dir.join("activity.db")) {
+        Ok(db) => {
+            usage_log::log_usage_quiet(usage_log::FEATURE_DAEMON, usage_log::ACTION_START, || {
+                usage_log::log_usage(
+                    &db,
+                    usage_log::FEATURE_DAEMON,
+                    usage_log::ACTION_START,
+                    &cfg.sync.device_name,
+                )
+            })
+        }
+        Err(e) => log::warn!("usage log: cannot open db for the daemon start event: {e:#}"),
+    }
 
     let handles = spawn_workers(cfg, data_dir);
     let heartbeat_handle = heartbeat::spawn_writer(data_dir, &SHUTDOWN);

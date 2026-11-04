@@ -16,13 +16,30 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use watcher_audio::control::{to_json, ControlAction};
 
+use crate::usage_log;
+
 /// `record` subcommand entry point.
 pub fn cmd_record(action: RecordAction, config_override: Option<&Path>) -> Result<()> {
     let resolved = crate::config::resolve(config_override)?;
     let data_dir = resolved.config.data_dir;
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
-    write_control_file(&data_dir, action)
+    let result = write_control_file(&data_dir, action);
+    // Issue #27: a successful manual start/stop counts as
+    // {meeting-recording, manual-start|manual-stop}; fire-and-forget.
+    if result.is_ok() {
+        let act = match action {
+            RecordAction::Start => usage_log::ACTION_MANUAL_START,
+            RecordAction::Stop => usage_log::ACTION_MANUAL_STOP,
+        };
+        usage_log::record(
+            &data_dir,
+            &resolved.config.sync.device_name,
+            usage_log::FEATURE_MEETING_RECORDING,
+            act,
+        );
+    }
+    result
 }
 
 /// What the CLI should write (mirrors the clap subcommand).
