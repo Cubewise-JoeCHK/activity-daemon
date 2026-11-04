@@ -42,12 +42,19 @@
 //!
 //! Storage: core `Db` at `ACTIVITY_DB` (default `./data/activity.db`), media
 //! root at `ACTIVITY_DATA/media` (default `./data/media`).
+//!
+//! Web UI (read-only, `web` module): `GET /` serves the embedded Graphite
+//! UI (machine status + behaviour calendar), backed by `GET /api/machines`
+//! and `GET /api/calendar`. `/api` reads follow the `/health` precedent:
+//! open, tailnet-only, no token (writes stay guarded).
 
+pub mod web;
 pub mod whois;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use activity_core::{CoreError, Db, EventEnvelope};
 use axum::extract::{ConnectInfo, Extension, Path as AxumPath, State};
@@ -75,6 +82,9 @@ pub struct AppState {
     db: Arc<Mutex<Db>>,
     media_dir: PathBuf,
     auth: AuthConfig,
+    /// When this state was constructed (= hub process start in production);
+    /// surfaces as `hub.uptime_s` in the web UI's machine view.
+    started_at: Instant,
 }
 
 /// Authentication configuration (see crate docs for the modes).
@@ -147,6 +157,7 @@ impl AppState {
             db: Arc::new(Mutex::new(Db::open_db(db_path)?)),
             media_dir,
             auth,
+            started_at: Instant::now(),
         })
     }
 }
@@ -165,6 +176,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(guarded)
+        .merge(web::web_router())
         .with_state(state)
 }
 

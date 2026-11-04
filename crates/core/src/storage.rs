@@ -125,6 +125,18 @@ pub struct Event {
     pub device: String,
 }
 
+/// Per-device summary for hub-side status views: how many events a device
+/// has contributed and when the hub last heard from it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceOverview {
+    pub device: String,
+    pub events_total: i64,
+    /// `ts_start` of the most recently ARRIVED row (`MAX(id)`): when the hub
+    /// last heard from this device. This is arrival recency, not the newest
+    /// event instant - batches can carry older events.
+    pub last_seen: Option<String>,
+}
+
 impl EventEnvelope {
     /// Validate the envelope: bucket non-empty, timestamp parses as RFC3339
     /// with a timezone offset, duration finite, and `data` is valid JSON.
@@ -299,16 +311,51 @@ impl Db {
         from_ts: Option<&str>,
         to_ts: Option<&str>,
     ) -> Result<Vec<Event>> {
-        validate_bucket(bucket)?;
+        self.query_events_in(Some(bucket), None, from_ts, to_ts)
+    }
+
+    /// Generalized instant-window query: like [`Db::query_events`], but
+    /// bucket and device are both optional filters (`None` = all buckets /
+    /// all devices). This is the read path for the hub's web APIs, where a
+    /// calendar wants "one device, all buckets" and a machine summary wants
+    /// "everything since midnight".
+    pub fn query_events_in(
+        &self,
+        bucket: Option<&str>,
+        device: Option<&str>,
+        from_ts: Option<&str>,
+        to_ts: Option<&str>,
+    ) -> Result<Vec<Event>> {
+        if let Some(bucket) = bucket {
+            validate_bucket(bucket)?;
+        }
         let from = from_ts.map(parse_rfc3339).transpose()?;
         let to = to_ts.map(parse_rfc3339).transpose()?;
-        let mut stmt = self.conn.prepare(
-            "SELECT id, bucket, ts_start, duration_s, data, device, synced
-             FROM events WHERE bucket = ?1
-             ORDER BY ts_start ASC, id ASC",
-        )?;
+        let mut sql = String::from(
+            "SELECT id, bucket, ts_start, duration_s, data, device, synced FROM events",
+        );
+        let mut clauses: Vec<&str> = Vec::new();
+        if bucket.is_some() {
+            clauses.push("bucket = ?");
+        }
+        if device.is_some() {
+            clauses.push("device = ?");
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY ts_start ASC, id ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<String> = Vec::new();
+        if let Some(bucket) = bucket {
+            bind.push(bucket.to_string());
+        }
+        if let Some(device) = device {
+            bind.push(device.to_string());
+        }
         let mut hits: Vec<(DateTime<FixedOffset>, Event)> = Vec::new();
-        for row in stmt.query_map(params![bucket], map_row)? {
+        for row in stmt.query_map(params_from_iter(bind.iter()), map_row)? {
             let row = row?;
             let ts = parse_rfc3339(&row.ts_start)?;
             if from.is_some_and(|f| ts < f) || to.is_some_and(|t| ts > t) {
@@ -321,6 +368,92 @@ impl Db {
         // keep the insertion order above).
         hits.sort_by_key(|(ts, _)| *ts);
         Ok(hits.into_iter().map(|(_, event)| event).collect())
+    }
+
+    /// Most recently arrived events, newest first, optionally narrowed to
+    /// one device. Ordered by insertion (`id`) - the honest "what did the
+    /// hub learn lately" order for a feed - not by event timestamp, which
+    /// batches can carry out of order.
+    pub fn latest_events(&self, device: Option<&str>, limit: u32) -> Result<Vec<Event>> {
+        let sql = match device {
+            Some(_) => {
+                "SELECT id, bucket, ts_start, duration_s, data, device, synced
+                 FROM events WHERE device = ?1 ORDER BY id DESC LIMIT ?2"
+            }
+            None => {
+                "SELECT id, bucket, ts_start, duration_s, data, device, synced
+                 FROM events ORDER BY id DESC LIMIT ?1"
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = Vec::new();
+        match device {
+            Some(device) => {
+                for row in stmt.query_map(params![device, limit], map_row)? {
+                    rows.push(Event::try_from(&row?)?);
+                }
+            }
+            None => {
+                for row in stmt.query_map(params![limit], map_row)? {
+                    rows.push(Event::try_from(&row?)?);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Count events contributed by `device` whose timestamp instant is at or
+    /// after `from_ts` (inclusive; RFC3339 with offset). Timestamps are
+    /// compared as parsed instants - a device legitimately mixes offsets
+    /// (window events carry the local offset, media index rows are UTC), so
+    /// this cannot be a lexical SQL comparison.
+    pub fn count_device_events_since(&self, device: &str, from_ts: &str) -> Result<i64> {
+        let from = parse_rfc3339(from_ts)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ts_start FROM events WHERE device = ?1")?;
+        let mut count = 0i64;
+        for ts in stmt.query_map(params![device], |r| r.get::<_, String>(0))? {
+            if parse_rfc3339(&ts?)? >= from {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Per-device summaries for hub status views: total events and the last
+    /// arrival per device (see [`DeviceOverview::last_seen`]).
+    pub fn device_overview(&self) -> Result<Vec<DeviceOverview>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT device, COUNT(*), MAX(id) FROM events GROUP BY device ORDER BY device",
+        )?;
+        let mut rows: Vec<(String, i64, i64)> = Vec::new();
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })? {
+            rows.push(row?);
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for (device, events_total, max_id) in rows {
+            let last_seen = self
+                .conn
+                .query_row(
+                    "SELECT ts_start FROM events WHERE id = ?1",
+                    params![max_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+            out.push(DeviceOverview {
+                device,
+                events_total,
+                last_seen,
+            });
+        }
+        Ok(out)
     }
 
     /// Mark the given row ids as synced (after successful forwarding to the
@@ -372,6 +505,26 @@ impl Db {
             .prepare("SELECT bucket, COUNT(*) FROM events GROUP BY bucket ORDER BY bucket")?;
         let mut out = Vec::new();
         for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Event counts grouped by `(device, bucket)`: the per-device profile
+    /// view for the hub's web UI (cheap aggregate over the
+    /// `(device, ts_start)` index).
+    pub fn counts_by_device_bucket(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT device, bucket, COUNT(*) FROM events GROUP BY device, bucket ORDER BY device, bucket",
+        )?;
+        let mut out = Vec::new();
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })? {
             out.push(row?);
         }
         Ok(out)
@@ -783,6 +936,191 @@ mod tests {
             .query_events(BUCKET_WINDOW, None, Some("2026-11-04T09:00:00"))
             .expect_err("bound without offset rejected");
         assert!(matches!(err, CoreError::Validation(_)));
+    }
+
+    fn insert_for(db: &Db, bucket: &str, device: &str, ts: &str, duration_s: f64) -> i64 {
+        let env = EventEnvelope {
+            bucket: bucket.to_string(),
+            timestamp: ts.to_string(),
+            duration_s,
+            data: serde_json::json!({"marker": ts}),
+        };
+        db.insert_event(&env, device).expect("insert")
+    }
+
+    #[test]
+    fn query_events_in_filters_by_device_and_bucket() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-a",
+            "2026-11-04T09:00:00+08:00",
+            1.0,
+        );
+        insert_for(&db, BUCKET_AFK, "dev-a", "2026-11-04T10:00:00+08:00", 2.0);
+        insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-b",
+            "2026-11-04T11:00:00+08:00",
+            3.0,
+        );
+
+        // device only, all buckets, instant-ordered
+        let a = db
+            .query_events_in(None, Some("dev-a"), None, None)
+            .expect("device query");
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].bucket, BUCKET_WINDOW);
+        assert_eq!(a[1].bucket, BUCKET_AFK);
+
+        // device + bucket + from bound (instant compare across offsets):
+        // 00:30Z excludes nothing here except demonstrating the bound - the
+        // dev-a window event is 09:00+08 = 01:00Z, after the bound
+        let hit = db
+            .query_events_in(
+                Some(BUCKET_WINDOW),
+                Some("dev-a"),
+                Some("2026-11-04T00:30:00Z"),
+                None,
+            )
+            .expect("device+bucket+bound");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].data["marker"], "2026-11-04T09:00:00+08:00");
+
+        // the same bound AFTER the event (02:30Z > 01:00Z) filters it out
+        let none = db
+            .query_events_in(
+                Some(BUCKET_WINDOW),
+                Some("dev-a"),
+                Some("2026-11-04T02:30:00Z"),
+                None,
+            )
+            .expect("bound after event");
+        assert_eq!(none.len(), 0);
+
+        // no filters = everything, ordered by instant
+        let all = db
+            .query_events_in(None, None, None, None)
+            .expect("unfiltered");
+        assert_eq!(all.len(), 3);
+
+        // empty bucket string stays rejected
+        assert!(matches!(
+            db.query_events_in(Some(""), None, None, None),
+            Err(CoreError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn latest_events_arrival_order_newest_first() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // arrival order deliberately disagrees with event-timestamp order
+        insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-a",
+            "2026-11-01T09:00:00+08:00",
+            1.0,
+        ); // id 1
+        insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-b",
+            "2026-11-02T09:00:00+08:00",
+            2.0,
+        ); // id 2
+        insert_for(&db, BUCKET_AFK, "dev-a", "2026-10-30T09:00:00+08:00", 3.0); // id 3
+
+        let feed = db.latest_events(Some("dev-a"), 10).expect("device feed");
+        let markers: Vec<&str> = feed
+            .iter()
+            .map(|e| e.data["marker"].as_str().expect("marker"))
+            .collect();
+        assert_eq!(
+            markers,
+            vec!["2026-10-30T09:00:00+08:00", "2026-11-01T09:00:00+08:00"]
+        );
+
+        let all = db.latest_events(None, 2).expect("global feed");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].device, "dev-a"); // id 3 arrived last
+        assert_eq!(all[1].device, "dev-b");
+
+        let one = db.latest_events(None, 1).expect("limit feed");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].device, "dev-a");
+    }
+
+    #[test]
+    fn count_device_events_since_compares_instants_across_offsets() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // local-midnight boundary written in Z: 2026-11-03T16:00:00Z == 2026-11-04T00:00:00+08:00
+        let midnight = "2026-11-03T16:00:00Z";
+        insert_for(&db, BUCKET_WINDOW, "dev-a", "2026-11-03T15:00:00Z", 1.0); // before: 23:00+08
+        insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-a",
+            "2026-11-04T01:00:00+08:00",
+            2.0,
+        ); // after
+        insert_for(&db, BUCKET_MEDIA, "dev-a", "2026-11-04T02:00:00Z", 0.0); // after (UTC row)
+        insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-b",
+            "2026-11-05T09:00:00+08:00",
+            4.0,
+        ); // other device
+
+        let count = db
+            .count_device_events_since("dev-a", midnight)
+            .expect("count");
+        assert_eq!(count, 2); // the +08:00 event and the UTC media row, not dev-b
+
+        let all_time = db
+            .count_device_events_since("dev-a", "2020-01-01T00:00:00Z")
+            .expect("count all");
+        assert_eq!(all_time, 3);
+    }
+
+    #[test]
+    fn device_overview_counts_and_last_arrival() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        assert!(db.device_overview().expect("empty").is_empty());
+
+        insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-b",
+            "2026-11-05T09:00:00+08:00",
+            4.0,
+        ); // arrived first
+        insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-a",
+            "2026-11-01T09:00:00+08:00",
+            1.0,
+        );
+        insert_for(&db, BUCKET_AFK, "dev-a", "2026-10-30T09:00:00+08:00", 2.0); // dev-a's last arrival
+
+        let overview = db.device_overview().expect("overview");
+        assert_eq!(overview.len(), 2);
+        assert_eq!(overview[0].device, "dev-a"); // ordered by device name
+        assert_eq!(overview[0].events_total, 2);
+        assert_eq!(
+            overview[0].last_seen.as_deref(),
+            Some("2026-10-30T09:00:00+08:00") // MAX(id), not newest instant
+        );
+        assert_eq!(overview[1].device, "dev-b");
+        assert_eq!(overview[1].events_total, 1);
+        assert_eq!(
+            overview[1].last_seen.as_deref(),
+            Some("2026-11-05T09:00:00+08:00")
+        );
     }
 
     #[test]

@@ -17,9 +17,9 @@ need.
 |---|---|---|
 | `activity-core` (crates/core) | lib | SQLite event store (WAL, rusqlite bundled) + TOML config |
 | `watcher-window` (crates/watcher-window) | lib | window/AFK session coalescing (Windows hooks land in #4) |
-| `watcher-screen` (crates/watcher-screen) | lib | rolling media retention planner (capture lands in #5) |
+| `watcher-screen` (crates/watcher-screen) | lib | per-monitor JPEG frame capture (content deduped) + rolling retention planner (#5) |
 | `watcher-audio` (crates/watcher-audio) | lib | meeting audio contract skeleton (#6) |
-| `server` (crates/server) | bin | WSL central ingestion endpoint (axum), deploy via Containerfile |
+| `server` (crates/server) | bin | WSL central ingestion endpoint + read-only web UI (axum), deploy via Containerfile |
 | `activity-cli` (crates/cli) | bin | `activity-daemon` CLI: run / status / startup / record / update / usage |
 | `activity-update` (crates/update) | lib | shared release check + sha256 verification for both updaters (#17, #32) |
 | `activity-server-update` (crates/server-update) | bin | `activity-server-update`: hub auto-updater on the WSL host (check / apply / watch / install / status / rollback, #32) |
@@ -55,6 +55,14 @@ First `run` creates a fully commented config template with defaults at
   retention budgets), `heartbeat` (liveness, rewritten every 5 s),
   `daemon.lock` (single instance), `daemon.log` (+ `logs\audio.log`).
   Stop with Ctrl+C; the window watcher flushes its open session.
+- **Multi-monitor**: `screen.monitors` picks what the frame watcher
+  captures - `all` (default, one frame per connected monitor) or
+  `primary` (the v0.1 behavior). Frame files carry their monitor in the
+  name (`media\frames\<Y>\<M>\<D>\<HHMMSS>_<monitor>_<sha16>.jpg`) and
+  each monitor dedups against its own previous frame, so a static
+  secondary screen costs nothing while it is unchanged. All monitors
+  share the `screen.max_total_mb` budget: with two similar screens the
+  same budget holds roughly half the history - raise it to compensate.
 - **`status`** (`--json` for machines): daemon running/stale/not-running
   from the heartbeat, current foreground app, active time today (window
   sessions since local midnight, AFK excluded), unsynced event count,
@@ -74,6 +82,43 @@ First `run` creates a fully commented config template with defaults at
 
 Server side (WSL hub, ingest endpoints, tailscale wiring): see
 [docs/sync.md](docs/sync.md).
+
+## Server web UI (read-only)
+
+The hub ships a small web UI - open `http://<hub>:8080/` from any tailnet
+device. The design is "Graphite" (a Teams-shaped mono light theme, winner of
+a design contest; the mockup lives next to the repo in the workspace's
+`design-contest/` folder). Assets are embedded in the binary at compile
+time (`crates/server/assets/`) - nothing is fetched from outside the
+tailnet, and the container image stays self-contained.
+
+- **Machine view** (`#machine`): one card per reporting device - presence
+  derived from event recency (active < 2 min, away < 1 h, otherwise
+  offline), active time today, foreground app, a latest-arrivals feed with
+  per-bucket tags, plus hub facts (version, uptime, stored media bytes).
+  The hub has no client heartbeat file, so "last seen" = the newest event
+  arrival per device.
+- **Calendar view** (`#calendar`): Teams-style work-week grid of window
+  sessions + AFK spans (07:00-21:00, now-line, mini month with activity
+  dots). Shading classifies apps presentation-only (code/terminals dark,
+  meetings, browsers, comms); the authoritative classifier is the planned
+  v0.2 config-driven rules engine, which will replace the heuristics.
+- **JSON APIs** (read-only, same open precedent as `GET /health`; writes
+  stay token-guarded):
+  - `GET /api/machines` - per-device summary + the 30 newest events each.
+  - `GET /api/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&device=...]` - day
+    bucketed sessions/AFK, empty days included, range cap 62 days; without
+    `device` the busiest device in the range wins. AFK spans come from the
+    `state: "active"` events (start + duration); the `state: "afk"`
+    markers are ignored.
+
+Day boundaries ("today", calendar bucketing) use the server's local
+timezone - a single-owner setup shares one timezone, and window events
+already carry the local offset. The UI auto-refreshes every 30 s; the
+refresh button forces it. New core queries used by the endpoints:
+`device_overview`, `query_events_in`, `latest_events`,
+`count_device_events_since`, `counts_by_device_bucket` (all instant-safe
+across mixed UTC/local offsets).
 
 ## Updates (GitHub Releases, issue #17)
 
@@ -198,10 +243,10 @@ instead:
   - `never`: never hide it (useful when debugging).
   Non-Windows platforms ignore this setting.
 - **Tray icon** (Windows; the process would otherwise be invisible):
-  - tooltip reflects health: `activity-daemon: active`,
-    `activity-daemon: recording` (while the meeting-audio watcher is
-    recording), or `activity-daemon: heartbeat stale` (no fresh heartbeat
-    file - refreshed every second),
+  - tooltip reflects version + health: `activity-daemon v0.1.2: active`,
+    `activity-daemon v0.1.2: recording` (while the meeting-audio watcher is
+    recording), or `activity-daemon v0.1.2: heartbeat stale` (no fresh
+    heartbeat file - refreshed every second),
   - right-click menu: **Update now** (runs the same update path as the
     manual `update` command; the daemon restarts gracefully onto the new
     version) and **Quit** (the same graceful shutdown as Ctrl+C - workers
