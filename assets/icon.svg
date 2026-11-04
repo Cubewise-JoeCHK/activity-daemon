@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- activity-daemon: the quiet watchful eye.
+       Master glyph for light backgrounds. Stroke 34 (6.6% of 512) with
+       round caps/joins; iris ring r=76; pupil r=28 carries the state color. -->
+  <g fill="none" stroke="#1F2937" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M60 256 A266 266 0 0 1 452 256 A266 266 0 0 1 60 256 Z"/>
+    <circle cx="256" cy="256" r="76"/>
+  </g>
+  <circle cx="256" cy="256" r="28" fill="#0D9488"/>
+</svg>

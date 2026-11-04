@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1536 512">
+  <!-- activity-daemon horizontal logo for dark backgrounds (light wordmark). -->
+  <g transform="translate(36 36) scale(0.859)">
+    <rect x="8" y="8" width="496" height="496" rx="72" fill="#0F172A"/>
+    <g transform="translate(256 256) scale(0.85) translate(-256 -256)">
+      <g fill="none" stroke="#F3F4F6" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M60 256 A266 266 0 0 1 452 256 A266 266 0 0 1 60 256 Z"/>
+        <circle cx="256" cy="256" r="76"/>
+      </g>
+      <circle cx="256" cy="256" r="28" fill="#2DD4BF"/>
+    </g>
+  </g>
+  <text x="520" y="300" font-family="Cascadia Mono, Consolas, monospace" font-weight="700"
+        font-size="116" fill="#F3F4F6">activity-daemon</text>
+</svg>
