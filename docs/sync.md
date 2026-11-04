@@ -59,7 +59,74 @@ Smoke test from WSL:
 
 ```sh
 curl -s http://127.0.0.1:8080/health
-# {"ok":true,"status":"ok","events_count":0}
+# {"ok":true,"status":"ok","version":"0.1.2","events_count":0}
+```
+
+## Updates: the hub updates itself (issue #32)
+
+`activity-server-update` runs on the WSL **host** (a container cannot swap
+its own image) and keeps the hub current from GitHub Releases - the same
+sha256-verified trust chain as the Windows client (#17), without compiling
+on the hub. Release checking, tag comparison and sha256 verification are
+shared with the client via the `activity-update` crate.
+
+```
+cargo build --release -p activity-server-update   # anywhere, then copy the
+# target/release/activity-server-update binary to the WSL box
+```
+
+First run **adopts** the manually deployed container (the one from the
+build/run steps above): it reads the running version from `/health` (or the
+image's `org.opencontainers.image.version` label), and - finding no newer
+release - records the container's run arguments and image id as its state
+(`~/.local/state/activity-server/state.json`). After that it knows how to
+recreate the container and what to roll back to.
+
+```sh
+activity-server-update check        # report only: running vs latest release
+activity-server-update              # apply now (same as `apply`)
+activity-server-update install      # systemd user service: daily checks
+activity-server-update status       # service + saved state + running version
+activity-server-update rollback     # start the saved rollback image again
+activity-server-update uninstall    # remove the service
+```
+
+What `apply` does on a newer release, in safety order:
+
+1. Download `activity-server-linux-x86_64` + `.sha256` from the release;
+   verify the digest - a mismatch deletes the download and aborts (the old
+   container keeps running).
+2. Build a **thin image** from the verified binary (no compilation on the
+   hub), tagged `activity-server:<tag>` + `activity-server:latest`, labeled
+   with the release tag.
+3. Smoke test the image: `podman run --rm --network none <image> --version`
+   must report the release version before anything is swapped.
+4. Swap: `podman stop` (the server drains SIGTERM gracefully) -> `rm` ->
+   `run -d` with the args re-derived from the inspect state (ports, binds,
+   `ACTIVITY_*` env) plus `--restart=on-failure` - containers deployed
+   before #32 gain crash/restart resilience on their first update.
+5. Health gate: `/health` must answer within 20 s, else the previous image
+   is started again automatically. The swap failure paths likewise restore
+   the previous image id.
+
+`install` writes one systemd **user** unit
+(`~/.config/systemd/user/activity-server-update.service`, `watch` loop,
+`Restart=on-failure`, linger enabled). Trade-offs it prints:
+systemd must be enabled inside WSL (`wsl.conf`: `[boot] systemd=true`); the
+updater only runs while the WSL VM runs; logs land in
+`journalctl --user -u activity-server-update`.
+
+The saved state (run args + rollback image id) also makes the `watch` loop
+**self-healing**: if the container ever vanishes mid-swap (e.g. a
+`systemctl stop` that lands between the `stop` and `run` steps), the next
+tick recreates it from the rollback image.
+
+Manual rollback, without the updater:
+
+```sh
+podman stop activity-server && podman rm activity-server
+podman run -d --name activity-server -p 0.0.0.0:8080:8080 \
+  -v /srv/activity:/data activity-server:v0.1.2     # any earlier tag/id
 ```
 
 ### Auth: mount the tailscaled socket (whois mode)
@@ -106,7 +173,8 @@ persists.
 
 ## HTTP API
 
-- `GET /health` -> `{"ok": true, "status": "ok", "events_count": n}`
+- `GET /health` -> `{"ok": true, "status": "ok", "version": "...", "events_count": n}`
+  (`version` feeds the hub updater, issue #32)
 - `POST /ingest/events`
   - body: `{"device": "...", "events": [{"bucket", "timestamp" (RFC3339 with
     offset), "duration_s", "data"} ...]}`
@@ -172,8 +240,14 @@ curl -s http://activity-hub:8080/ingest/events \
 
 ## Build notes
 
-- Server image: multi-stage `Containerfile` (rust:1-slim builder ->
-  debian:stable-slim runtime), `EXPOSE 8080`, data volume `/data`.
+- Server image: multi-stage `Containerfile` (pinned rust:1-slim-bookworm
+  builder -> ubuntu:24.04 runtime), `EXPOSE 8080`, data volume `/data`.
+  The runtime base keeps glibc parity with the `ubuntu-latest` release
+  binary the hub updater consumes (issue #32); the pinned builder
+  guarantees a source-built binary never demands a newer glibc than the
+  runtime.
+- The server handles SIGINT (Ctrl+C) and SIGTERM (`podman stop`) with the
+  same graceful drain, so an update swap never cuts in-flight requests.
 - `activity-sync` uses `ureq` (small blocking client, rustls TLS, JSON
   support): the forwarder is a plain loop, not a service, so no async
   runtime is pulled in on the client.

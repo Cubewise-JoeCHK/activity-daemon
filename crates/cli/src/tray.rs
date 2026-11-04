@@ -5,9 +5,10 @@
 //!
 //! - A message-only window + `Shell_NotifyIconW` on a dedicated thread with
 //!   its own Win32 message loop (the `windows` crate; no new dependencies).
-//! - Tooltip = health: `active` / `recording` (the latest `meeting-audio`
-//!   event says a recording is running) / `heartbeat stale` (no or stale
-//!   heartbeat file - refreshed every second).
+//! - Tooltip = version + health: `activity-daemon v0.1.2: active` /
+//!   `recording` (the latest `meeting-audio` event says a recording is
+//!   running) / `heartbeat stale` (no or stale heartbeat file - refreshed
+//!   every second).
 //! - Right-click menu: `Update now` (a one-shot flag the run loop consumes -
 //!   the same update path as the manual `update` command) and `Quit` (sets
 //!   the same [`SHUTDOWN`] flag as Ctrl+C - graceful worker join). Left
@@ -69,15 +70,21 @@ pub fn tray_state(recording: bool, heartbeat_stale: bool) -> TrayState {
     }
 }
 
-/// Tooltip text for a tray state (kept short: the Shell tooltip budget is
-/// 127 characters).
+/// The daemon version the tray reports (`CARGO_PKG_VERSION` of the CLI
+/// crate, the same string `--version` prints).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn tray_tooltip(state: TrayState) -> &'static str {
-    match state {
-        TrayState::Active => "activity-daemon: active",
-        TrayState::Recording => "activity-daemon: recording",
-        TrayState::HeartbeatStale => "activity-daemon: heartbeat stale",
-    }
+pub const TRAY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Tooltip text for a tray state, carrying the daemon version (kept short:
+/// the Shell tooltip budget is 127 characters).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn tray_tooltip(state: TrayState, version: &str) -> String {
+    let label = match state {
+        TrayState::Active => "active",
+        TrayState::Recording => "recording",
+        TrayState::HeartbeatStale => "heartbeat stale",
+    };
+    format!("activity-daemon v{version}: {label}")
 }
 
 /// Whether the latest `meeting-audio` event (events ordered oldest-first,
@@ -347,7 +354,8 @@ mod win_impl {
     use super::{
         latest_meeting_audio_is_recording, tray_state, tray_tooltip, MenuCommand, TrayCtx,
         TrayState, MENU_QUIT, MENU_UPDATE_NOW, TIMER_ID, TIMER_INTERVAL_MS, TRAY_CTX, TRAY_HWND,
-        TRAY_ICON_ICO, TRAY_ICON_ID, TRAY_UPDATE_REQUEST, WM_TRAY_CALLBACK, WM_TRAY_TEARDOWN,
+        TRAY_ICON_ICO, TRAY_ICON_ID, TRAY_UPDATE_REQUEST, TRAY_VERSION, WM_TRAY_CALLBACK,
+        WM_TRAY_TEARDOWN,
     };
     use crate::heartbeat::{self, HeartbeatState};
     use crate::usage_log;
@@ -433,7 +441,10 @@ mod win_impl {
         // Initial tooltip + version 3 semantics (the callback lParam carries
         // the mouse message), then the once-per-second health timer.
         nid.uFlags |= NIF_TIP;
-        set_tip(&mut nid, tray_tooltip(tray_state(false, false)));
+        set_tip(
+            &mut nid,
+            &tray_tooltip(tray_state(false, false), TRAY_VERSION),
+        );
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
             nid.Anonymous.uVersion = 3;
@@ -655,14 +666,14 @@ mod win_impl {
             return;
         }
         ctx.last_state = Some(state);
-        log::info!("tray: {}", tray_tooltip(state));
+        log::info!("tray: {}", tray_tooltip(state, TRAY_VERSION));
         let value = TRAY_HWND.load(Ordering::SeqCst);
         if value == 0 {
             return;
         }
         let mut nid = base_notify_icon_data(HWND(value as *mut core::ffi::c_void));
         nid.uFlags |= NIF_TIP;
-        set_tip(&mut nid, tray_tooltip(state));
+        set_tip(&mut nid, &tray_tooltip(state, TRAY_VERSION));
         // SAFETY: nid references our own icon (hWnd/uID); no pointers kept.
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -752,22 +763,32 @@ mod tests {
         // Recording wins over a stale heartbeat.
         assert_eq!(tray_state(true, true), TrayState::Recording);
 
-        assert_eq!(tray_tooltip(TrayState::Active), "activity-daemon: active");
         assert_eq!(
-            tray_tooltip(TrayState::Recording),
-            "activity-daemon: recording"
+            tray_tooltip(TrayState::Active, "1.2.3"),
+            "activity-daemon v1.2.3: active"
         );
         assert_eq!(
-            tray_tooltip(TrayState::HeartbeatStale),
-            "activity-daemon: heartbeat stale"
+            tray_tooltip(TrayState::Recording, "1.2.3"),
+            "activity-daemon v1.2.3: recording"
         );
+        assert_eq!(
+            tray_tooltip(TrayState::HeartbeatStale, "1.2.3"),
+            "activity-daemon v1.2.3: heartbeat stale"
+        );
+        // The production tooltip reports the CLI crate version (what
+        // `--version` prints).
+        assert_eq!(TRAY_VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(!TRAY_VERSION.is_empty());
         // Shell tooltip budget is 127 characters.
         for state in [
             TrayState::Active,
             TrayState::Recording,
             TrayState::HeartbeatStale,
         ] {
-            assert!(tray_tooltip(state).chars().count() < 128);
+            assert!(
+                tray_tooltip(state, TRAY_VERSION).chars().count() < 128,
+                "tooltip must fit the Shell budget: {state:?}"
+            );
         }
     }
 

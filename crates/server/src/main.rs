@@ -21,6 +21,14 @@ fn env_or(name: &str, default: &str) -> String {
 }
 
 fn main() {
+    // `--version`: print and exit (no clap here - this is the only flag).
+    // The hub updater's smoke test (issue #32) runs the new image with it
+    // before swapping the container.
+    if std::env::args().any(|a| a == "--version") {
+        println!("activity-server {}", server::VERSION);
+        return;
+    }
+
     let port: u16 = env_or("ACTIVITY_PORT", "8080").parse().unwrap_or_else(|_| {
         eprintln!("ACTIVITY_PORT is not a valid port number, using 8080");
         8080
@@ -67,15 +75,55 @@ fn main() {
                 eprintln!("failed to bind {addr}: {e}");
                 std::process::exit(1);
             });
-        println!("activity-daemon central hub listening on http://{addr}");
+        println!(
+            "activity-daemon central hub listening on http://{addr} (version {})",
+            server::VERSION
+        );
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
     });
+}
+
+/// Resolve when the process is asked to stop: Ctrl+C (SIGINT) everywhere,
+/// plus SIGTERM on unix - `podman stop` sends SIGTERM, so the hub update
+/// swap (issue #32) drains in-flight requests gracefully instead of
+/// running into the runtime's SIGKILL timeout.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("cannot install the SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// SIGTERM must resolve the shutdown future (the podman stop path).
+    #[tokio::test]
+    async fn sigterm_resolves_the_shutdown_signal() {
+        use std::process::Command;
+        use std::time::Duration;
+        tokio::spawn(async {
+            let pid = std::process::id().to_string();
+            let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        });
+        tokio::time::timeout(Duration::from_secs(10), shutdown_signal())
+            .await
+            .expect("SIGTERM must resolve the shutdown future within 10 s");
+    }
 }

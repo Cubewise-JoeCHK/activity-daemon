@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>activity-daemon · hub</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <symbol id="i-chevl" viewBox="0 0 16 16"><path d="M10.5 3 6 8l4.5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chevr" viewBox="0 0 16 16"><path d="M5.5 3 10 8l-4.5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
+    <symbol id="i-pulse" viewBox="0 0 20 20"><path d="M2 11h3l2-5 3 9 2.5-6 1.5 2h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-cal" viewBox="0 0 20 20"><rect x="2.5" y="4" width="15" height="13.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M2.5 8.5h15M6.5 2.5v3M13.5 2.5v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
+    <symbol id="i-sync" viewBox="0 0 20 20"><path d="M16.5 8A6.5 6.5 0 0 0 4.8 6.2M3.5 12a6.5 6.5 0 0 0 11.7 1.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M16.8 3.5v4.5h-4.5M3.2 16.5V12h4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  </defs>
+</svg>
+
+<div class="app">
+  <!-- ================= top command bar ================= -->
+  <header class="topbar">
+    <div class="tb-brand">activity-daemon&thinsp;·&thinsp;hub</div>
+    <div class="search">
+      <svg><use href="#i-search"/></svg>
+      <input id="device-filter" placeholder="Filter machines" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="tb-right">
+      <button class="tb-btn" id="refresh-btn" title="Refresh now"><svg><use href="#i-sync"/></svg></button>
+      <div class="avatar" title="single-owner hub · tailnet only">JC</div>
+    </div>
+  </header>
+
+  <div class="content">
+    <!-- ================= activity rail ================= -->
+    <nav class="rail">
+      <div class="rail-item" id="rail-machine" title="Machine status (Ctrl+1)">
+        <svg><use href="#i-pulse"/></svg><span class="lbl">Machine</span>
+      </div>
+      <div class="rail-item" id="rail-cal" title="Behaviour calendar (Ctrl+2)">
+        <svg><use href="#i-cal"/></svg><span class="lbl">Calendar</span>
+      </div>
+      <div class="rail-bottom">
+        <div class="rail-avatar" title="single-owner hub">JC<span class="presence"></span></div>
+      </div>
+    </nav>
+
+    <!-- ================= VIEW: MACHINE ================= -->
+    <section class="view" id="view-machine">
+      <aside class="pane">
+        <div class="pane-head"><h1>Machines</h1></div>
+        <div class="hub-card" id="hub-card"><div class="empty">Loading…</div></div>
+        <div class="list" id="device-list"></div>
+      </aside>
+
+      <main class="main">
+        <div class="chat-head">
+          <div class="chat-title">
+            <b id="chat-name">…</b>
+            <span id="chat-sub"></span>
+          </div>
+          <div class="tools">
+            <button class="icon-btn" id="machine-refresh" title="Refresh"><svg><use href="#i-sync"/></svg></button>
+          </div>
+        </div>
+        <div class="chat-scroll" id="machine-main"><div class="empty">Loading…</div></div>
+      </main>
+
+      <aside class="profile" id="profile-pane"></aside>
+    </section>
+
+    <!-- ================= VIEW: CALENDAR ================= -->
+    <section class="view" id="view-cal">
+      <aside class="pane">
+        <div class="pane-head">
+          <h1>Calendar</h1>
+          <div class="mini-nav">
+            <button class="icon-btn sm" id="month-prev" title="Previous month"><svg><use href="#i-chevl"/></svg></button>
+            <button class="icon-btn sm" id="month-next" title="Next month"><svg><use href="#i-chevr"/></svg></button>
+          </div>
+        </div>
+        <div class="mini-cal" id="mini-month"></div>
+        <div class="legend">
+          <div class="lg-title">Shading</div>
+          <div class="lg-row"><span class="sw deep"></span>Code &amp; terminals</div>
+          <div class="lg-row"><span class="sw meet"></span>Meetings &amp; calls</div>
+          <div class="lg-row"><span class="sw res"></span>Browsers</div>
+          <div class="lg-row"><span class="sw com"></span>Comms &amp; mail</div>
+          <div class="lg-row"><span class="sw other"></span>Other apps</div>
+          <div class="lg-row"><span class="sw afk"></span>AFK / away</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="cal-head">
+          <div class="cal-title"><b id="cal-title">…</b><span id="cal-sub"></span></div>
+          <div class="cal-nav">
+            <button class="icon-btn" id="week-prev" title="Previous week"><svg><use href="#i-chevl"/></svg></button>
+            <button class="seg-btn" id="week-today">Today</button>
+            <button class="icon-btn" id="week-next" title="Next week"><svg><use href="#i-chevr"/></svg></button>
+          </div>
+          <div class="cal-device" id="cal-device"></div>
+        </div>
+        <div class="cal-body">
+          <div class="cal-grid-wrap" id="week-grid"><div class="empty">Loading…</div></div>
+        </div>
+      </main>
+    </section>
+  </div>
+</div>
+
+<div class="error-banner" id="error-banner" hidden></div>
+<script src="/assets/app.js"></script>
+</body>
+</html>

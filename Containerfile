@@ -16,14 +16,19 @@
 
 # Stage 1: build only the server binary (package name: server).
 # Fully-qualified image names: podman on stock Ubuntu has no
-# unqualified-search registries configured.
-FROM docker.io/library/rust:1-slim AS builder
+# unqualified-search registries configured. The builder is pinned to
+# bookworm so the produced binary never demands a newer glibc than the
+# runtime base below (issue #32: release binaries are built on
+# ubuntu-latest and must run in this image too).
+FROM docker.io/library/rust:1-slim-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p server
 
-# Stage 2: minimal runtime.
-FROM docker.io/library/debian:stable-slim
+# Stage 2: minimal runtime - ubuntu:24.04 keeps glibc parity with the
+# ubuntu-latest release binary (activity-server-linux-x86_64, consumed by
+# the hub updater); a bookworm-built binary is forward-compatible here.
+FROM docker.io/library/ubuntu:24.04
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

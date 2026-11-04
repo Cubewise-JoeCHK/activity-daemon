@@ -425,4 +425,40 @@ mod tests {
         assert!(survivor.parent().expect("day dir").exists());
         let _ = fs::remove_dir_all(media);
     }
+
+    #[test]
+    fn sweep_handles_monitor_named_and_legacy_frame_names() {
+        // Multi-monitor capture writes `HHMMSS_<monitor>_<sha16>.jpg`
+        // names; pre-multi-monitor files lack the monitor part. The sweep
+        // is name-agnostic: the shared budget covers both, oldest-first.
+        let media = temp_dir("sweep-monitors");
+        let day = media.join("frames").join("2026").join("11").join("04");
+        let old_display1 = day.join("090000_DISPLAY1_1111111111111111.jpg");
+        let old_legacy = day.join("090000_2222222222222222.jpg");
+        let fresh_display2 = day.join("100000_DISPLAY2_3333333333333333.jpg");
+        write_frame(&old_display1, 5 * MB_BYTES as usize, 100.0);
+        write_frame(&old_legacy, 2 * MB_BYTES as usize, 100.0);
+        write_frame(&fresh_display2, 5 * MB_BYTES as usize, 1.0);
+
+        let budget = RetentionBudget {
+            max_age_days: 90,
+            max_total_mb: 20 * 1024,
+        };
+        let report = sweep_frames(&media, &budget).expect("sweep");
+
+        // Only the two age-expired files go, monitor-labeled or not.
+        assert_eq!(
+            report,
+            SweepReport {
+                scanned: 3,
+                deleted: 2,
+                freed_bytes: 7 * MB_BYTES,
+                errors: 0,
+            }
+        );
+        assert!(!old_display1.exists());
+        assert!(!old_legacy.exists());
+        assert!(fresh_display2.exists());
+        let _ = fs::remove_dir_all(media);
+    }
 }

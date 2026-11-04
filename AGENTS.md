@@ -41,6 +41,14 @@ Follow `docs/process.md`: pick issue -> branch `issue-N-slug` -> implement +
 tests -> windows CI green (fmt / clippy -D warnings / test) -> merge ->
 close the issue with a summary comment.
 
+**Merge immediately once green.** The moment the local gates pass
+(fmt / clippy -D warnings / tests) - or GitHub CI is green for a pushed
+branch - merge the branch into the default branch right away. Do NOT leave
+finished, verified work sitting on a side branch awaiting approval: this is
+a single-owner repo, there is no review step, and dangling branches are
+lost work waiting to happen. Local gates green = authorized to merge.
+Pushing and releases stay with the owner unless they ask.
+
 ## Toolchain on the owner's Windows machine
 
 Tools are portable and NOT on PATH. Start EVERY shell command with this

@@ -109,6 +109,8 @@ async fn health_reports_ok_and_event_count() {
     let v = body_json(res).await;
     assert_eq!(v["ok"], true);
     assert_eq!(v["status"], "ok");
+    // Version feeds the hub updater (#32): matches the workspace version.
+    assert_eq!(v["version"], server::VERSION);
     assert_eq!(v["events_count"], 0);
 
     // seed one event through the API, count follows

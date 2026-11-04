@@ -2,7 +2,9 @@
 //! (ADR revisions 3/5/6).
 //!
 //! Endpoints:
-//! - `GET  /health` - `{"ok": true, "status": "ok", "events_count": n}`.
+//! - `GET  /health` -
+//!   `{"ok": true, "status": "ok", "version": "...", "events_count": n}`
+//!   (the `version` field feeds the hub updater, issue #32).
 //! - `POST /ingest/events` - body
 //!   `{"device": "...", "events": [{bucket, timestamp, duration_s, data}]}`
 //!   (RFC3339 timestamp with offset). Each event is validated through core's
@@ -40,12 +42,19 @@
 //!
 //! Storage: core `Db` at `ACTIVITY_DB` (default `./data/activity.db`), media
 //! root at `ACTIVITY_DATA/media` (default `./data/media`).
+//!
+//! Web UI (read-only, `web` module): `GET /` serves the embedded Graphite
+//! UI (machine status + behaviour calendar), backed by `GET /api/machines`
+//! and `GET /api/calendar`. `/api` reads follow the `/health` precedent:
+//! open, tailnet-only, no token (writes stay guarded).
 
+pub mod web;
 pub mod whois;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use activity_core::{CoreError, Db, EventEnvelope};
 use axum::extract::{ConnectInfo, Extension, Path as AxumPath, State};
@@ -62,12 +71,20 @@ use crate::whois::device_for_ip;
 /// Path of the tailscaled local API socket inside the container/host.
 pub const TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 
+/// Server (workspace) version, reported by `/health` and `--version` so the
+/// hub updater (issue #32) can compare the running release against the
+/// latest GitHub release.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Shared server state.
 #[derive(Clone)]
 pub struct AppState {
     db: Arc<Mutex<Db>>,
     media_dir: PathBuf,
     auth: AuthConfig,
+    /// When this state was constructed (= hub process start in production);
+    /// surfaces as `hub.uptime_s` in the web UI's machine view.
+    started_at: Instant,
 }
 
 /// Authentication configuration (see crate docs for the modes).
@@ -140,6 +157,7 @@ impl AppState {
             db: Arc::new(Mutex::new(Db::open_db(db_path)?)),
             media_dir,
             auth,
+            started_at: Instant::now(),
         })
     }
 }
@@ -158,6 +176,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(guarded)
+        .merge(web::web_router())
         .with_state(state)
 }
 
@@ -186,7 +205,12 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         let db = state.db.lock().expect("db lock");
         db.event_count().unwrap_or(0)
     };
-    Json(json!({ "ok": true, "status": "ok", "events_count": events_count }))
+    Json(json!({
+        "ok": true,
+        "status": "ok",
+        "version": VERSION,
+        "events_count": events_count
+    }))
 }
 
 // ------------------------------------------------------------- auth / device
