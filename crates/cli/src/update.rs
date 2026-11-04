@@ -1,13 +1,12 @@
 //! `activity-daemon update` (issue #17): self-update from GitHub Releases.
 //!
-//! While the daemon runs (config `[sync] auto_update`, checked every
-//! `sync.update_interval_s`, default daily) or on demand via
-//! `activity-daemon update`, the CLI:
+//! Release checking, tag comparison and sha256 verification live in the
+//! shared [`activity_update`] crate (issue #32 - the hub updater uses the
+//! same contract). This module is the Windows client application of it:
 //!
-//! 1. `GET https://api.github.com/repos/Cubewise-JoeCHK/activity-daemon/releases/latest`
-//!    unauthenticated (`User-Agent: activity-daemon/<version>`, `Accept:
-//!    application/vnd.github+json`; 60 req/h limit - a daily check is
-//!    comfortably inside it).
+//! 1. Fetches the latest release through `activity_update` (unauthenticated
+//!    `releases/latest`; 60 req/h limit - a daily check is comfortably
+//!    inside it).
 //! 2. Compares the release tag with the running version (semver, optional
 //!    leading `v`; `<=` current = no-op; malformed tag = warn + skip).
 //! 3. Downloads the `activity-daemon-windows-x86_64.exe` asset plus its
@@ -36,20 +35,20 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use semver::{BuildMetadata, Version};
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use activity_update::{
+    decide_update, sanitize_tag, select_asset_pair, verify_sha256, Asset, AssetDownloader,
+    ReleaseFetcher, ReleaseInfo, SelectedAssets, UpdateDecision,
+};
+// Re-exported: the run loop constructs the real fetcher/downloader via
+// `update::GitHubFetcher` / `update::HttpDownloader`.
+pub use activity_update::{GitHubFetcher, HttpDownloader};
+use anyhow::{bail, Context, Result};
+use semver::Version;
 
 use crate::startup::TASK_NAME;
 use crate::usage_log;
 
-/// GitHub API endpoint for the latest published release (drafts and
-/// pre-releases are excluded by the API itself).
-pub const RELEASE_API_URL: &str =
-    "https://api.github.com/repos/Cubewise-JoeCHK/activity-daemon/releases/latest";
 /// Asset name the release workflow uploads for the Windows x86_64 cli exe.
 pub const WINDOWS_EXE_ASSET: &str = "activity-daemon-windows-x86_64.exe";
 /// Update work directory below the data dir.
@@ -61,330 +60,35 @@ pub const RESTART_REQUEST_FILE: &str = "restart.request";
 /// Suffix of the rollback copy kept next to the exe.
 pub const OLD_SUFFIX: &str = ".old";
 
-/// Connection timeout shared by the API client and the downloader.
-const CONNECT_TIMEOUT_S: u64 = 10;
-/// Whole-request timeout for the small `releases/latest` JSON call.
-const API_REQUEST_TIMEOUT_S: u64 = 30;
-/// Whole-request timeout for exe downloads (a few MB over slow links).
-const DOWNLOAD_TIMEOUT_S: u64 = 600;
-
 /// Guard so two updates can never be in flight in one process (within the
 /// daemon the check runs on the main loop thread only; the guard also
 /// covers a future second entry point).
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
-/// User-Agent for all GitHub requests (API + asset downloads).
-pub fn user_agent() -> String {
-    format!("activity-daemon/{}", env!("CARGO_PKG_VERSION"))
-}
-
-/// The running crate version as semver.
+/// The running cli crate version as semver.
 pub fn current_version() -> Version {
-    Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is valid semver")
-}
-
-// ---------------------------------------------------------------------------
-// Release metadata: trait, GitHub implementation, parsing
-// ---------------------------------------------------------------------------
-
-/// One downloadable release asset.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Asset {
-    pub name: String,
-    pub url: String,
-}
-
-/// The latest published release, as the updater sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReleaseInfo {
-    /// Release tag, e.g. `v0.2.0`.
-    pub tag: String,
-    pub assets: Vec<Asset>,
-}
-
-/// Source of release metadata. The real implementation talks to the GitHub
-/// API; tests inject fakes (all network is behind this trait).
-pub trait ReleaseFetcher {
-    fn fetch_latest(&self) -> Result<ReleaseInfo>;
-}
-
-/// Moves bytes from a URL into a local file; see [`ReleaseFetcher`].
-pub trait AssetDownloader {
-    /// Download `url` into `dest` (created/overwritten); returns the byte
-    /// count. Errors on HTTP failure or an empty response body.
-    fn download_to(&self, url: &str, dest: &Path) -> Result<u64>;
-}
-
-/// `releases/latest` JSON wire format (only the fields we need).
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    assets: Vec<GitHubAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-/// Parse the `releases/latest` JSON body into a [`ReleaseInfo`].
-pub fn parse_release_json(body: &str) -> Result<ReleaseInfo> {
-    let raw: GitHubRelease = serde_json::from_str(body)
-        .with_context(|| format!("malformed release JSON: {}", clip(body)))?;
-    Ok(ReleaseInfo {
-        tag: raw.tag_name,
-        assets: raw
-            .assets
-            .into_iter()
-            .map(|a| Asset {
-                name: a.name,
-                url: a.browser_download_url,
-            })
-            .collect(),
-    })
-}
-
-/// Trim + clip a (possibly huge) body for log/error lines.
-fn clip(s: &str) -> String {
-    s.trim().chars().take(200).collect()
-}
-
-fn http_error(e: ureq::Error, what: &str) -> anyhow::Error {
-    match e {
-        // 403 = unauthenticated rate limit, 404 = no releases published yet.
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            if code == 404 {
-                anyhow!("{what}: HTTP 404 (no releases published yet)")
-            } else {
-                anyhow!("{what}: HTTP {code}: {}", clip(&body))
-            }
-        }
-        ureq::Error::Transport(t) => anyhow!("{what}: transport error: {t}"),
-    }
-}
-
-/// Real [`ReleaseFetcher`]: the unauthenticated `releases/latest` call.
-pub struct GitHubFetcher {
-    agent: ureq::Agent,
-}
-
-impl GitHubFetcher {
-    pub fn new() -> GitHubFetcher {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(CONNECT_TIMEOUT_S))
-            .timeout(Duration::from_secs(API_REQUEST_TIMEOUT_S))
-            .build();
-        GitHubFetcher { agent }
-    }
-}
-
-impl Default for GitHubFetcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ReleaseFetcher for GitHubFetcher {
-    fn fetch_latest(&self) -> Result<ReleaseInfo> {
-        let resp = self
-            .agent
-            .get(RELEASE_API_URL)
-            .set("User-Agent", &user_agent())
-            .set("Accept", "application/vnd.github+json")
-            .call()
-            .map_err(|e| http_error(e, "cannot fetch the latest release"))?;
-        let body = resp
-            .into_string()
-            .context("cannot read the release API response body")?;
-        parse_release_json(&body)
-    }
-}
-
-/// Real [`AssetDownloader`]: streaming GET into the destination file.
-pub struct HttpDownloader {
-    agent: ureq::Agent,
-}
-
-impl HttpDownloader {
-    pub fn new() -> HttpDownloader {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(CONNECT_TIMEOUT_S))
-            .timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_S))
-            .build();
-        HttpDownloader { agent }
-    }
-}
-
-impl Default for HttpDownloader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AssetDownloader for HttpDownloader {
-    fn download_to(&self, url: &str, dest: &Path) -> Result<u64> {
-        let mut reader = self
-            .agent
-            .get(url)
-            .set("User-Agent", &user_agent())
-            .call()
-            .map_err(|e| http_error(e, "cannot download the asset"))?
-            .into_reader();
-        let mut file = std::fs::File::create(dest)
-            .with_context(|| format!("cannot create {}", dest.display()))?;
-        let bytes = std::io::copy(&mut reader, &mut file)
-            .with_context(|| format!("cannot write {}", dest.display()))?;
-        if bytes == 0 {
-            bail!(
-                "downloaded {} but the response body is empty",
-                dest.display()
-            );
-        }
-        Ok(bytes)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Version compare + asset selection
-// ---------------------------------------------------------------------------
-
-/// Outcome of comparing the latest release tag with the running version.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpdateDecision {
-    /// Remote tag parses to `<=` the running version.
-    UpToDate,
-    /// Remote tag is not valid semver (with optional leading `v`): skipped.
-    MalformedTag(String),
-    /// Remote tag parses to a strictly higher version.
-    Available(Version),
-}
-
-/// Strip an optional leading `v`/`V` and surrounding whitespace, then parse
-/// the rest as semver.
-pub fn parse_tag(tag: &str) -> Result<Version> {
-    let t = tag.trim();
-    let t = t.strip_prefix(['v', 'V']).unwrap_or(t);
-    Version::parse(t).with_context(|| format!("malformed release tag {tag:?}"))
-}
-
-/// Spec precedence comparison: build metadata ignored. (`Version`'s own
-/// `Ord` includes build metadata as a final tiebreaker to stay consistent
-/// with its derived `Eq`, which would order `0.1.0+build.7 > 0.1.0` - not
-/// what semver precedence says. Pre-release ordering itself is spec-correct
-/// in the crate: a pre-release orders below its release.)
-fn is_newer_than(current: &Version, remote: &Version) -> bool {
-    fn precedence(v: &Version) -> Version {
-        Version {
-            major: v.major,
-            minor: v.minor,
-            patch: v.patch,
-            pre: v.pre.clone(),
-            build: BuildMetadata::EMPTY,
-        }
-    }
-    precedence(remote) > precedence(current)
-}
-
-/// Compare the running version against the release tag (build metadata is
-/// ignored and pre-releases order below their release, per semver).
-pub fn decide_update(current: &Version, tag: &str) -> UpdateDecision {
-    match parse_tag(tag) {
-        Ok(remote) if is_newer_than(current, &remote) => UpdateDecision::Available(remote),
-        Ok(_) => UpdateDecision::UpToDate,
-        Err(_) => UpdateDecision::MalformedTag(tag.to_string()),
-    }
-}
-
-/// The Windows x86_64 cli exe asset and its `.sha256` companion.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectedAssets {
-    pub exe: Asset,
-    pub sha256: Asset,
+    activity_update::current_version()
 }
 
 /// Find the exe asset + sha256 companion by the exact names the release
 /// workflow uploads (`activity-daemon-windows-x86_64.exe[.sha256]`), with a
 /// tolerant fallback should the artifact ever be renamed. Linux server
-/// assets are not selected here.
+/// assets are not selected here (see the hub updater, issue #32).
 pub fn select_assets(assets: &[Asset]) -> Result<SelectedAssets> {
-    let exe = assets
-        .iter()
-        .find(|a| a.name == WINDOWS_EXE_ASSET)
-        .or_else(|| {
-            assets
-                .iter()
-                .find(|a| a.name.ends_with(".exe") && a.name.contains("windows-x86_64"))
-        })
-        .context("no Windows x86_64 exe asset in the release")?
-        .clone();
-    let sha_name = format!("{}.sha256", exe.name);
-    let sha256 = assets
-        .iter()
-        .find(|a| a.name == sha_name)
-        .with_context(|| format!("no {sha_name} companion asset in the release"))?
-        .clone();
-    Ok(SelectedAssets { exe, sha256 })
-}
-
-// ---------------------------------------------------------------------------
-// sha256 verification
-// ---------------------------------------------------------------------------
-
-/// Lowercase hex sha256 of a file (streamed).
-pub fn file_sha256_hex(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("cannot open {} for hashing", path.display()))?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .with_context(|| format!("cannot read {} for hashing", path.display()))?;
-    Ok(hex(&hasher.finalize()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+    if let Ok(pair) = select_asset_pair(assets, WINDOWS_EXE_ASSET) {
+        return Ok(pair);
     }
-    out
-}
-
-/// Verify a file against a `sha256sum`-style digest line (the digest is the
-/// first whitespace token; hex compare is case-insensitive).
-pub fn verify_sha256(path: &Path, digest_line: &str) -> Result<()> {
-    let expected = digest_line
-        .split_whitespace()
-        .next()
-        .context("the .sha256 file is empty")?
-        .to_ascii_lowercase();
-    let actual = file_sha256_hex(path)?;
-    if actual != expected {
-        bail!(
-            "sha256 mismatch for {}: expected {expected}, got {actual}",
-            path.display()
-        );
-    }
-    Ok(())
+    // Tolerant fallback: any windows-x86_64 exe with its `.sha256` companion.
+    let fallback = assets
+        .iter()
+        .find(|a| a.name.ends_with(".exe") && a.name.contains("windows-x86_64"))
+        .context("no Windows x86_64 exe asset in the release")?;
+    select_asset_pair(assets, &fallback.name)
 }
 
 // ---------------------------------------------------------------------------
 // The swap: download -> verify -> rotate exe/.old
 // ---------------------------------------------------------------------------
-
-/// Tag -> safe file name stem (tags are `vX.Y.Z` in practice; anything
-/// outside `[A-Za-z0-9._-]` is replaced with `_`).
-fn sanitize_tag(tag: &str) -> String {
-    tag.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
 
 /// Rollback copy path: `<exe>.old`.
 pub fn old_path(exe: &Path) -> PathBuf {
@@ -551,9 +255,9 @@ impl<'a> Updater<'a> {
         // error; non-empty is enforced by the downloader).
         let bytes = self
             .downloader
-            .download_to(&selected.exe.url, &exe_tmp)
-            .with_context(|| format!("download of {} failed", selected.exe.name))?;
-        log::info!("downloaded {} ({} bytes)", selected.exe.name, bytes);
+            .download_to(&selected.asset.url, &exe_tmp)
+            .with_context(|| format!("download of {} failed", selected.asset.name))?;
+        log::info!("downloaded {} ({} bytes)", selected.asset.name, bytes);
         // (b) download the digest and verify the exe against it.
         self.downloader
             .download_to(&selected.sha256.url, &sha_tmp)
@@ -569,7 +273,7 @@ impl<'a> Updater<'a> {
             );
             bail!("{e}; the old version keeps running");
         }
-        log::info!("sha256 verified for {}", selected.exe.name);
+        log::info!("sha256 verified for {}", selected.asset.name);
 
         // (c)-(e) rotate exe/.old with restore-on-failure.
         swap_in_place(&self.exe, &exe_tmp).context("swapping the updated exe into place")?;
@@ -815,6 +519,7 @@ fn apply_now(data_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use activity_update::{file_sha256_hex, parse_release_json, user_agent};
     use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard};
 
@@ -904,29 +609,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_release_json_maps_tag_and_assets() {
-        let info = parse_release_json(SAMPLE_RELEASE_JSON).expect("parse sample");
-        assert_eq!(info.tag, "v0.2.0");
-        assert_eq!(info.assets.len(), 4);
-        assert_eq!(info.assets[0].name, WINDOWS_EXE_ASSET);
-        assert_eq!(
-            info.assets[0].url,
-            "https://example.test/dl/activity-daemon-windows-x86_64.exe"
-        );
-        assert_eq!(
-            info.assets[1].url,
-            "https://example.test/dl/activity-daemon-windows-x86_64.exe.sha256"
-        );
-        // Malformed JSON (wrong types) must be an error, not a panic.
-        assert!(parse_release_json("{\"tag_name\": 12}").is_err());
-        assert!(parse_release_json("not json at all").is_err());
-    }
-
-    #[test]
     fn select_assets_finds_the_windows_pair_and_ignores_linux() {
         let info = parse_release_json(SAMPLE_RELEASE_JSON).expect("parse sample");
         let sel = select_assets(&info.assets).expect("select");
-        assert_eq!(sel.exe.name, WINDOWS_EXE_ASSET);
+        assert_eq!(sel.asset.name, WINDOWS_EXE_ASSET);
         assert_eq!(sel.sha256.name, format!("{WINDOWS_EXE_ASSET}.sha256"));
 
         // No assets / missing sha256 companion -> errors.
@@ -938,92 +624,30 @@ mod tests {
         assert!(select_assets(&exe_only).is_err());
     }
 
+    /// The tolerant fallback still finds the pair when the artifact is
+    /// renamed (no exact `activity-daemon-windows-x86_64.exe` asset).
     #[test]
-    fn parse_tag_strips_v_and_whitespace() {
-        assert_eq!(
-            parse_tag("v1.2.3").expect("v prefix"),
-            Version::parse("1.2.3").expect("plain")
-        );
-        assert_eq!(
-            parse_tag("  V2.0.0 ").expect("V prefix + spaces"),
-            Version::parse("2.0.0").expect("plain")
-        );
-        assert_eq!(
-            parse_tag("0.2.0-alpha.1").expect("bare semver"),
-            Version::parse("0.2.0-alpha.1").expect("plain")
-        );
-        assert!(parse_tag("v1.2").is_err(), "missing patch");
-        assert!(parse_tag("latest").is_err());
-    }
-
-    #[test]
-    fn decide_update_semver_and_prerelease_edges() {
-        let cur = Version::parse("0.1.0").expect("current");
-        // Strictly newer -> available.
-        assert_eq!(
-            decide_update(&cur, "v0.2.0"),
-            UpdateDecision::Available(Version::parse("0.2.0").expect("remote"))
-        );
-        assert_eq!(
-            decide_update(&cur, "0.2.0-alpha.1"),
-            UpdateDecision::Available(Version::parse("0.2.0-alpha.1").expect("remote"))
-        );
-        // Equal or older -> up to date.
-        assert_eq!(decide_update(&cur, "v0.1.0"), UpdateDecision::UpToDate);
-        assert_eq!(decide_update(&cur, "0.0.9"), UpdateDecision::UpToDate);
-        // Build metadata is ignored: 0.1.0+build == 0.1.0.
-        assert_eq!(
-            decide_update(&cur, "v0.1.0+build.7"),
-            UpdateDecision::UpToDate
-        );
-        // Pre-release of the current version orders below it.
-        assert_eq!(decide_update(&cur, "v0.1.0-rc.1"), UpdateDecision::UpToDate);
-        // Malformed tags are reported, never guessed.
-        assert_eq!(
-            decide_update(&cur, "not-a-version"),
-            UpdateDecision::MalformedTag("not-a-version".to_string())
-        );
-        assert_eq!(
-            decide_update(&cur, "v1.2"),
-            UpdateDecision::MalformedTag("v1.2".to_string())
-        );
-    }
-
-    #[test]
-    fn sha256_verify_ok_mismatch_and_case_insensitive() {
-        let dir = temp_dir("sha");
-        let file = dir.join("blob.bin");
-        std::fs::write(&file, b"new exe bytes").expect("write blob");
-        let digest = file_sha256_hex(&file).expect("hash");
-        assert_eq!(digest.len(), 64);
-        // sha256sum-style line: digest is the first whitespace token.
-        verify_sha256(&file, &format!("{digest}  blob.bin\n")).expect("digest line ok");
-        // Case-insensitive hex compare.
-        verify_sha256(&file, &digest.to_uppercase()).expect("uppercase ok");
-        // Mismatch -> error.
-        let err = verify_sha256(&file, "deadbeef").expect_err("mismatch must fail");
-        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
-        // Canonical empty-file digest (independent constant).
-        let empty = dir.join("empty.bin");
-        std::fs::write(&empty, b"").expect("write empty");
-        assert_eq!(
-            file_sha256_hex(&empty).expect("hash empty"),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        // Empty digest line -> error.
-        assert!(verify_sha256(&file, "   \n").is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn sanitize_tag_and_old_path() {
-        assert_eq!(sanitize_tag("v0.2.0"), "v0.2.0");
-        assert_eq!(sanitize_tag("v0.2.0-beta.1+build"), "v0.2.0-beta.1_build");
-        let exe = Path::new("somewhere").join("activity-daemon.exe");
-        assert_eq!(
-            old_path(&exe),
-            exe.with_file_name("activity-daemon.exe.old")
-        );
+    fn select_assets_fallback_finds_a_renamed_windows_exe() {
+        let info = parse_release_json(SAMPLE_RELEASE_JSON).expect("parse sample");
+        let renamed = vec![
+            Asset {
+                name: "activity-daemon-windows-x86_64-v2.exe".to_string(),
+                url: "https://example.test/dl/renamed.exe".to_string(),
+            },
+            Asset {
+                name: "activity-daemon-windows-x86_64-v2.exe.sha256".to_string(),
+                url: "https://example.test/dl/renamed.exe.sha256".to_string(),
+            },
+        ];
+        let sel = select_assets(&renamed).expect("fallback select");
+        assert_eq!(sel.asset.name, "activity-daemon-windows-x86_64-v2.exe");
+        // The Linux server pair alone is never selected.
+        let linux_only: Vec<Asset> = info
+            .assets
+            .into_iter()
+            .filter(|a| a.name.contains("linux"))
+            .collect();
+        assert!(select_assets(&linux_only).is_err());
     }
 
     #[test]
@@ -1081,7 +705,11 @@ mod tests {
         std::fs::write(&exe, b"old-exe-bytes").expect("write old exe");
 
         let new_body = "new-exe-bytes";
-        let digest_hex = hex(&Sha256::digest(new_body));
+        // Digest via the shared helper (the sha2 dependency now lives in
+        // activity-update only).
+        let body_file = dir.join("new-body-reference.bin");
+        std::fs::write(&body_file, new_body).expect("write reference body");
+        let digest_hex = file_sha256_hex(&body_file).expect("hash reference");
         let release = release_with_default_assets("v0.2.0", "fake://exe", "fake://sha");
         let fetcher = FakeFetcher {
             release: Some(release),

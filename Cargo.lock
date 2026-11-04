@@ -8,6 +8,7 @@ version = "0.1.2"
 dependencies = [
  "activity-core",
  "activity-sync",
+ "activity-update",
  "anyhow",
  "chrono",
  "clap",
@@ -15,8 +16,6 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sha2",
- "ureq",
  "watcher-audio",
  "watcher-screen",
  "watcher-window",
@@ -35,11 +34,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "activity-server-update"
+version = "0.1.2"
+dependencies = [
+ "activity-update",
+ "anyhow",
+ "chrono",
+ "clap",
+ "log",
+ "semver",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "activity-sync"
 version = "0.1.2"
 dependencies = [
  "activity-core",
  "log",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+]
+
+[[package]]
+name = "activity-update"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

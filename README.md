@@ -21,6 +21,8 @@ need.
 | `watcher-audio` (crates/watcher-audio) | lib | meeting audio contract skeleton (#6) |
 | `server` (crates/server) | bin | WSL central ingestion endpoint (axum), deploy via Containerfile |
 | `activity-cli` (crates/cli) | bin | `activity-daemon` CLI: run / status / startup / record / update / usage |
+| `activity-update` (crates/update) | lib | shared release check + sha256 verification for both updaters (#17, #32) |
+| `activity-server-update` (crates/server-update) | bin | `activity-server-update`: hub auto-updater on the WSL host (check / apply / watch / install / status / rollback, #32) |
 
 ## Build
 
@@ -128,6 +130,32 @@ copy /y C:\tools\activity-daemon.exe.old C:\tools\activity-daemon.exe
 **SmartScreen note**: the release binaries are unsigned, so Windows
 SmartScreen may warn the first time a new binary runs ("More info" ->
 "Run anyway"). This also applies to manually restored `.old` copies.
+
+## Hub updates (`activity-server-update`, issue #32)
+
+The WSL hub updates itself the same way, from the same releases: a small
+updater binary runs **on the WSL host** (a container cannot swap its own
+image), checks `releases/latest` daily, downloads the sha256-verified
+`activity-server-linux-x86_64` asset, builds a thin image from it (no
+compilation on the hub), smoke tests `--version`, swaps the container with
+its original run args plus `--restart=on-failure`, and health-gates the
+result with automatic rollback to the previous image. `install` sets up a
+systemd **user** service (daily `watch` loop, linger); the watch tick also
+self-heals a container that vanished mid-swap from the saved state.
+
+```
+activity-server-update check       # report only
+activity-server-update             # apply now
+activity-server-update install     # systemd user service, daily checks
+activity-server-update status      # service, saved state, running version
+activity-server-update rollback    # back to the saved rollback image
+```
+
+The current running version is reported by `/health` (`version` field) and
+stamped as `org.opencontainers.image.version` on every updater-built
+image; the server drains SIGTERM so `podman stop` mid-update is graceful.
+Full runbook (adoption of a manual deployment, manual rollback): see
+[docs/sync.md](docs/sync.md).
 
 ## Startup methods (autostart fallback chain, issue #29)
 

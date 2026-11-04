@@ -2,7 +2,9 @@
 //! (ADR revisions 3/5/6).
 //!
 //! Endpoints:
-//! - `GET  /health` - `{"ok": true, "status": "ok", "events_count": n}`.
+//! - `GET  /health` -
+//!   `{"ok": true, "status": "ok", "version": "...", "events_count": n}`
+//!   (the `version` field feeds the hub updater, issue #32).
 //! - `POST /ingest/events` - body
 //!   `{"device": "...", "events": [{bucket, timestamp, duration_s, data}]}`
 //!   (RFC3339 timestamp with offset). Each event is validated through core's
@@ -61,6 +63,11 @@ use crate::whois::device_for_ip;
 
 /// Path of the tailscaled local API socket inside the container/host.
 pub const TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
+
+/// Server (workspace) version, reported by `/health` and `--version` so the
+/// hub updater (issue #32) can compare the running release against the
+/// latest GitHub release.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Shared server state.
 #[derive(Clone)]
@@ -186,7 +193,12 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         let db = state.db.lock().expect("db lock");
         db.event_count().unwrap_or(0)
     };
-    Json(json!({ "ok": true, "status": "ok", "events_count": events_count }))
+    Json(json!({
+        "ok": true,
+        "status": "ok",
+        "version": VERSION,
+        "events_count": events_count
+    }))
 }
 
 // ------------------------------------------------------------- auth / device

@@ -23,6 +23,9 @@ need; the owner queries when filling a timesheet or reflecting.
   leaves the owner's tailnet. No third-party services, ever.
 - The WSL box is the central data hub: the central store, all AI activity
   and all analysis happen there.
+- Hub upkeep is not a chore: hub software stays current and the container
+  comes back after a crash without the owner SSH-ing in to babysit it
+  (same self-update contract as the clients; issue #32).
 
 ## Media
 
