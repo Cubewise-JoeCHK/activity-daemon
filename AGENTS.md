@@ -49,6 +49,16 @@ a single-owner repo, there is no review step, and dangling branches are
 lost work waiting to happen. Local gates green = authorized to merge.
 Pushing and releases stay with the owner unless they ask.
 
+Branch mechanics on GitHub: `main` is a protected ref - it must not contain
+merge commits and normally wants PRs - but the owner identity bypasses the
+rules on push. Merge locally with `--ff-only` when possible (linear
+history, no merge commit, no bypass noise); a `--no-ff` merge commit or a
+direct push gets through with "Bypassed rule violations" warnings, which is
+accepted when the owner asked for the merge. Releases are tag-driven:
+bump the workspace version in a `chore:` commit, push `main`, then push an
+annotated `vX.Y.Z` tag - the Release workflow builds and publishes the
+artifacts, and CI must be green on the same push.
+
 ## Toolchain on the owner's Windows machine
 
 Tools are portable and NOT on PATH. Start EVERY shell command with this
