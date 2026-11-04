@@ -46,10 +46,28 @@ pub struct ScreenConfig {
     /// JPEG quality (1-100) for captured frames. Was hardcoded 70 in
     /// watcher-screen until issue #7 lifted it into the config.
     pub quality: u8,
+    /// Which monitors the frame watcher captures:
+    /// - `all` (default): every connected monitor, one frame each,
+    /// - `primary`: only the primary monitor (the v0.1 behavior).
+    pub monitors: ScreenMonitors,
     /// Rolling retention: oldest-first deletion beyond this age (days).
     pub max_age_days: u64,
-    /// Rolling retention: total frame budget on the device (MB).
+    /// Rolling retention: total frame budget on the device (MB). Shared by
+    /// all captured monitors.
     pub max_total_mb: u64,
+}
+
+/// Which monitors the screen watcher captures. Lowercase serde spelling
+/// matches the config file: `"all" | "primary"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenMonitors {
+    /// Capture every connected monitor, one frame each (default). Single
+    /// monitor setups behave exactly like `primary`.
+    #[default]
+    All,
+    /// Capture only the primary monitor (the v0.1 behavior).
+    Primary,
 }
 
 /// Meeting audio capture (#6).
@@ -142,6 +160,7 @@ impl Default for ScreenConfig {
         ScreenConfig {
             interval_s: 5,
             quality: 70,
+            monitors: ScreenMonitors::All,
             max_age_days: 90,
             max_total_mb: 20 * 1024,
         }
@@ -229,13 +248,16 @@ mod tests {
     #[test]
     fn new_fields_carry_serde_defaults() {
         // Old config files written before issue #7 lack screen.quality and
-        // audio.grace_stop_s; they must still parse with the defaults.
+        // audio.grace_stop_s; they must still parse with the defaults. The
+        // same holds for configs written before multi-monitor support:
+        // without a screen.monitors line they parse to the default.
         let cfg = Config::from_toml_str(
             "[screen]\ninterval_s = 5\n\n[audio]\nhotkey = \"ctrl+shift+alt+m\"\n",
         )
         .expect("parse legacy config");
         assert_eq!(cfg.screen.quality, 70);
         assert_eq!(cfg.audio.grace_stop_s, 10);
+        assert_eq!(cfg.screen.monitors, ScreenMonitors::All);
     }
 
     #[test]
@@ -286,6 +308,26 @@ mod tests {
         // Unknown values are a config error (typos must not silently disable
         // or enable the window hiding).
         assert!(Config::from_toml_str("[run]\nhide_console = \"sometimes\"\n").is_err());
+    }
+
+    #[test]
+    fn screen_monitors_default_and_overrides() {
+        // Multi-monitor capture: default is all monitors; `primary` selects
+        // the legacy v0.1 behavior. Legacy config files without the field
+        // parse to the default (covered in new_fields_carry_serde_defaults).
+        let cfg = Config::default();
+        assert_eq!(cfg.screen.monitors, ScreenMonitors::All);
+
+        let cfg =
+            Config::from_toml_str("[screen]\nmonitors = \"primary\"\n").expect("parse screen");
+        assert_eq!(cfg.screen.monitors, ScreenMonitors::Primary);
+
+        let cfg = Config::from_toml_str("[screen]\nmonitors = \"all\"\n").expect("parse screen");
+        assert_eq!(cfg.screen.monitors, ScreenMonitors::All);
+
+        // Unknown values are a config error (a typo must not silently limit
+        // capture to one monitor).
+        assert!(Config::from_toml_str("[screen]\nmonitors = \"both\"\n").is_err());
     }
 
     #[test]

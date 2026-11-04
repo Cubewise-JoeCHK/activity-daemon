@@ -129,9 +129,15 @@ afk_threshold_min = {afk}
 interval_s = {screen_interval}
 # JPEG quality 1-100 for captured frames.
 quality = {quality}
+# Which monitors to capture (frames are named per monitor):
+#   all     = every connected monitor, one frame each
+#   primary = only the main monitor
+# All monitors share the retention budget below, so a second screen
+# roughly halves how much history fits in it.
+monitors = "{monitors}"
 # Rolling retention: drop frames older than this (days).
 max_age_days = {screen_days}
-# Rolling retention: total frame budget (MB).
+# Rolling retention: total frame budget (MB), shared by all monitors.
 max_total_mb = {screen_mb}
 
 [audio]
@@ -174,6 +180,10 @@ hide_console = "{hide_console}"
         afk = cfg.afk_threshold_min,
         screen_interval = cfg.screen.interval_s,
         quality = cfg.screen.quality,
+        monitors = match cfg.screen.monitors {
+            activity_core::ScreenMonitors::All => "all",
+            activity_core::ScreenMonitors::Primary => "primary",
+        },
         screen_days = cfg.screen.max_age_days,
         screen_mb = cfg.screen.max_total_mb,
         hotkey = cfg.audio.hotkey,
@@ -235,6 +245,7 @@ mod tests {
             "afk_threshold_min",
             "interval_s",
             "quality",
+            "monitors",
             "grace_stop_s",
             "hotkey",
             "process_list",

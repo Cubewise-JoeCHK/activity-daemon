@@ -31,6 +31,9 @@ need; the owner queries when filling a timesheet or reflecting.
 
 - Screen frames and meeting audio are wanted; the owner accepts the image
   volume.
+- The owner works across multiple monitors; screen frames must cover every
+  screen actually in use, not just the primary one. Monitors share the
+  client-side retention budget.
 - Client-side rolling retention bounds device disk use; the central hub is
   the keep-forever archive (cap configurable).
 - Meeting audio triggering: manual trigger (hotkey / CLI) for in-person

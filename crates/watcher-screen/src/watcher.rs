@@ -1,6 +1,7 @@
 //! The watcher tick: AFK pause -> capture -> dedup/store, with counters
-//! (issue #5). One [`Watcher::tick`] is one capture attempt; the daemon
-//! loop in [`crate::run`] simply calls it every `screen.interval_s`.
+//! (issue #5). One [`Watcher::tick`] is one capture attempt covering every
+//! selected monitor; the daemon loop in [`crate::run`] simply calls it
+//! every `screen.interval_s`.
 
 use std::time::Duration;
 
@@ -12,17 +13,19 @@ use crate::capture::FrameSource;
 use crate::store::{FrameStore, StoredFrame};
 
 /// Cumulative counters for the screen watcher (skipped vs written).
+/// Counters aggregate across monitors: one tick with two new frames
+/// counts `written += 2`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrameStats {
     /// Ticks processed (capture attempts + AFK-skipped ticks).
     pub ticks: u64,
-    /// Frames written to disk and indexed.
+    /// Frames written to disk and indexed (all monitors summed).
     pub written: u64,
-    /// Ticks skipped: frame identical to the previous one (sha16 dedup).
+    /// Frames skipped: identical to that monitor's previous frame.
     pub deduped: u64,
     /// Ticks skipped: user AFK (input idle >= threshold).
     pub afk_skipped: u64,
-    /// Ticks where capture or storage failed (daemon keeps running).
+    /// Per-monitor capture/storage failures (daemon keeps running).
     pub failed: u64,
 }
 
@@ -33,16 +36,16 @@ impl FrameStats {
     }
 }
 
-/// What one tick did.
+/// What one captured monitor did within a tick.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TickOutcome {
     /// New frame written and indexed.
     Written(StoredFrame),
-    /// Frame identical to the previous one; nothing written.
+    /// Frame identical to that monitor's previous one; nothing written.
     Deduped,
-    /// User is AFK; capture skipped this tick.
+    /// User is AFK; capture skipped this tick (whole tick, all monitors).
     AfkPaused,
-    /// Capture or storage failed this tick; the daemon continues.
+    /// Capture or storage failed; the daemon continues.
     Failed(String),
 }
 
@@ -74,15 +77,17 @@ impl<S: FrameSource> Watcher<S> {
         &self.store
     }
 
-    /// One capture tick. Infallible: failures become [`TickOutcome::Failed`]
-    /// plus a warning - never an error that could stop the daemon.
+    /// One capture tick over every selected monitor. Infallible: failures
+    /// become [`TickOutcome::Failed`] entries plus a warning - never an
+    /// error that could stop the daemon. AFK yields `vec![AfkPaused]`;
+    /// otherwise the vec holds one outcome per captured monitor.
     pub fn tick(
         &mut self,
         at: DateTime<Local>,
         input_idle_s: f64,
         db: &Db,
         device: &str,
-    ) -> TickOutcome {
+    ) -> Vec<TickOutcome> {
         self.stats.ticks += 1;
         if input_idle_s >= self.afk_threshold_s {
             self.stats.afk_skipped += 1;
@@ -90,34 +95,44 @@ impl<S: FrameSource> Watcher<S> {
                 "AFK for {input_idle_s:.0}s (>= {}s): skipping capture",
                 self.afk_threshold_s
             );
-            return TickOutcome::AfkPaused;
+            return vec![TickOutcome::AfkPaused];
         }
 
-        let frame = match self.source.capture() {
-            Ok(frame) => frame,
+        let captured = match self.source.capture() {
+            Ok(frames) => frames,
             Err(e) => {
                 self.stats.failed += 1;
                 warn!("screen capture failed, continuing: {e:#}");
-                return TickOutcome::Failed(e.to_string());
+                return vec![TickOutcome::Failed(e.to_string())];
             }
         };
 
-        match self.store.store_frame(&frame, at, db, device) {
-            Ok(Some(stored)) => {
-                self.stats.written += 1;
-                TickOutcome::Written(stored)
-            }
-            Ok(None) => {
-                self.stats.deduped += 1;
-                debug!("duplicate frame (same sha16): nothing written");
-                TickOutcome::Deduped
-            }
-            Err(e) => {
-                self.stats.failed += 1;
-                warn!("frame storage failed, continuing: {e:#}");
-                TickOutcome::Failed(e.to_string())
+        let mut outcomes = Vec::with_capacity(captured.len());
+        for mf in captured {
+            match self
+                .store
+                .store_frame(&mf.monitor, &mf.frame, at, db, device)
+            {
+                Ok(Some(stored)) => {
+                    self.stats.written += 1;
+                    outcomes.push(TickOutcome::Written(stored));
+                }
+                Ok(None) => {
+                    self.stats.deduped += 1;
+                    debug!(
+                        "duplicate frame on {} (same sha16): nothing written",
+                        mf.monitor
+                    );
+                    outcomes.push(TickOutcome::Deduped);
+                }
+                Err(e) => {
+                    self.stats.failed += 1;
+                    warn!("frame storage failed, continuing: {e:#}");
+                    outcomes.push(TickOutcome::Failed(e.to_string()));
+                }
             }
         }
+        outcomes
     }
 }
 
@@ -176,8 +191,8 @@ mod tests {
     #[test]
     fn afk_tick_skips_capture_entirely() {
         let mut w = watcher("afk", FakeFrameSource::new(4, 4), 300);
-        let outcome = w.tick(at(), 400.0, &Db::open_in_memory().expect("db"), "dev");
-        assert_eq!(outcome, TickOutcome::AfkPaused);
+        let outcomes = w.tick(at(), 400.0, &Db::open_in_memory().expect("db"), "dev");
+        assert_eq!(outcomes, vec![TickOutcome::AfkPaused]);
         assert_eq!(w.source.calls(), 0, "AFK must not even poll the source");
         let stats = w.stats();
         assert_eq!((stats.afk_skipped, stats.written), (1, 0));
@@ -188,9 +203,9 @@ mod tests {
     fn active_tick_writes_frame_and_indexes_it() {
         let db = Db::open_in_memory().expect("db");
         let mut w = watcher("active", FakeFrameSource::new(4, 4), 300);
-        let outcome = w.tick(at(), 0.0, &db, "dev");
-        let TickOutcome::Written(stored) = outcome else {
-            panic!("expected a written frame, got {outcome:?}");
+        let outcomes = w.tick(at(), 0.0, &db, "dev");
+        let [TickOutcome::Written(stored)] = outcomes.as_slice() else {
+            panic!("expected one written frame, got {outcomes:?}");
         };
         assert_eq!(stored.sha16.len(), 16);
         assert!(stored.bytes > 0);
@@ -201,7 +216,7 @@ mod tests {
             .join("2026")
             .join("11")
             .join("04")
-            .join(format!("091500_{}.jpg", stored.sha16));
+            .join(format!("091500_DISPLAY1_{}.jpg", stored.sha16));
         assert!(full.exists(), "frame file must exist at {}", full.display());
         assert_eq!(db.event_count().expect("count"), 1);
         assert_eq!(w.stats().written, 1);
@@ -213,12 +228,12 @@ mod tests {
         let source = FakeFrameSource::new(4, 4);
         let mut w = watcher("dedup", source, 300);
         assert!(matches!(
-            w.tick(at(), 0.0, &db, "dev"),
-            TickOutcome::Written(_)
+            w.tick(at(), 0.0, &db, "dev").as_slice(),
+            [TickOutcome::Written(_)]
         ));
         // Next capture returns the byte-identical previous frame.
         w.source.repeat_last();
-        assert_eq!(w.tick(at(), 0.0, &db, "dev"), TickOutcome::Deduped);
+        assert_eq!(w.tick(at(), 0.0, &db, "dev"), vec![TickOutcome::Deduped]);
         let stats = w.stats();
         assert_eq!((stats.written, stats.deduped), (1, 1));
     }
@@ -230,20 +245,85 @@ mod tests {
         source.fail_next();
         let mut w = watcher("failure", source, 300);
 
-        let outcome = w.tick(at(), 0.0, &db, "dev");
+        let outcomes = w.tick(at(), 0.0, &db, "dev");
         assert_eq!(
-            outcome,
-            TickOutcome::Failed("synthetic capture failure".to_string())
+            outcomes,
+            vec![TickOutcome::Failed("synthetic capture failure".to_string())]
         );
         assert_eq!(w.stats().failed, 1);
         assert_eq!(db.event_count().expect("count"), 0);
 
         // The daemon keeps running: the next tick writes normally.
         assert!(matches!(
-            w.tick(at(), 0.0, &db, "dev"),
-            TickOutcome::Written(_)
+            w.tick(at(), 0.0, &db, "dev").as_slice(),
+            [TickOutcome::Written(_)]
         ));
         assert_eq!(w.stats().written, 1);
+    }
+
+    #[test]
+    fn multi_monitor_tick_writes_one_frame_per_monitor() {
+        let db = Db::open_in_memory().expect("db");
+        let source = FakeFrameSource::with_monitors(["DISPLAY1", "DISPLAY2"], 4, 4);
+        let mut w = watcher("multi", source, 300);
+
+        let outcomes = w.tick(at(), 0.0, &db, "dev");
+        assert_eq!(outcomes.len(), 2, "one outcome per monitor");
+        let mut labels = Vec::new();
+        for outcome in &outcomes {
+            let TickOutcome::Written(stored) = outcome else {
+                panic!("expected a written frame, got {outcome:?}");
+            };
+            labels.push(stored.monitor.clone());
+        }
+        labels.sort();
+        assert_eq!(labels, ["DISPLAY1", "DISPLAY2"]);
+
+        // Two files, two index rows, distinct paths (labels keep them
+        // apart even within the same second).
+        assert_eq!(db.event_count().expect("count"), 2);
+        let frames_dir = w
+            .store()
+            .media_root()
+            .join("frames")
+            .join("2026")
+            .join("11")
+            .join("04");
+        let names: Vec<String> = std::fs::read_dir(&frames_dir)
+            .expect("day dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(
+            names
+                .iter()
+                .all(|n| n.starts_with("091500_DISPLAY1_") || n.starts_with("091500_DISPLAY2_")),
+            "both file names must carry their monitor: {names:?}"
+        );
+        assert_eq!(w.stats().written, 2);
+        assert_eq!(w.stats().ticks, 1);
+    }
+
+    #[test]
+    fn multi_monitor_repeat_last_dedups_every_monitor() {
+        let db = Db::open_in_memory().expect("db");
+        let source = FakeFrameSource::with_monitors(["DISPLAY1", "DISPLAY2"], 4, 4);
+        let mut w = watcher("multi-dedup", source, 300);
+
+        assert!(matches!(
+            w.tick(at(), 0.0, &db, "dev").as_slice(),
+            [TickOutcome::Written(_), TickOutcome::Written(_)]
+        ));
+        // Both monitors replay their own previous frame: both deduped.
+        w.source.repeat_last();
+        assert_eq!(
+            w.tick(at(), 0.0, &db, "dev"),
+            vec![TickOutcome::Deduped, TickOutcome::Deduped]
+        );
+        assert_eq!(db.event_count().expect("count"), 2, "nothing new written");
+        let stats = w.stats();
+        assert_eq!((stats.written, stats.deduped), (2, 2));
     }
 
     #[test]

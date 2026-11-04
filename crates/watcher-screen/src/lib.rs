@@ -1,23 +1,26 @@
 //! Screen frame watcher for activity-daemon (issue #5).
 //!
-//! Captures the primary monitor as JPEG frames on a configurable interval
-//! (ADR: 5-10 s), **paused while the user is AFK or the workstation is
-//! locked** (no input means idle time grows past the AFK threshold), with
-//! content dedup (`sha16`: identical frames are not written at all) and a
-//! rolling retention budget of `screen.max_age_days` / `screen.max_total_mb`
-//! enforced by an hourly oldest-first sweep (ADR rev 2 defaults: 90 days /
-//! 20 GB).
+//! Captures every connected monitor (`screen.monitors = "all"`, default;
+//! `"primary"` keeps the v0.1 behavior) as JPEG frames on a configurable
+//! interval (ADR: 5-10 s), **paused while the user is AFK or the
+//! workstation is locked** (no input means idle time grows past the AFK
+//! threshold), with content dedup (`sha16`: a frame identical to its
+//! monitor's previous frame is not written at all) and a rolling retention
+//! budget of `screen.max_age_days` / `screen.max_total_mb` shared by all
+//! monitors and enforced by an hourly oldest-first sweep (ADR rev 2
+//! defaults: 90 days / 20 GB).
 //!
 //! # Layout (ADR media contract)
 //!
 //! ```text
-//! <data_dir>/media/frames/<YYYY>/<MM>/<DD>/<HHMMSS>_<sha16>.jpg
+//! <data_dir>/media/frames/<YYYY>/<MM>/<DD>/<HHMMSS>_<monitor>_<sha16>.jpg
 //! ```
 //!
 //! Every written file gets one index row in the `media` bucket via core:
-//! `{ kind: "frame", path, bytes, sha16, producer: "watcher-screen" }`.
-//! Index rows are never deleted by the sweep - they are the historical
-//! record; the central hub is the keep-forever archive (docs/needs.md).
+//! `{ kind: "frame", path, bytes, sha16, monitor,
+//! producer: "watcher-screen" }`. Index rows are never deleted by the
+//! sweep - they are the historical record; the central hub is the
+//! keep-forever archive (docs/needs.md).
 //!
 //! # Data dir resolution
 //!
@@ -58,17 +61,20 @@ pub mod watcher;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use activity_core::{Config, Db};
+use activity_core::{Config, Db, ScreenMonitors};
 use chrono::Local;
 use log::{info, warn};
 
 #[cfg(windows)]
 pub use capture::gdi::GdiFrameSource;
-pub use capture::{FakeFrameSource, Frame, FrameSource};
+pub use capture::{FakeFrameSource, Frame, FrameSource, MonitorFrame};
 pub use retention::{
     plan_deletions, sweep_frames, FileInfo, RetentionBudget, SweepReport, MB_BYTES, SWEEP_INTERVAL,
 };
-pub use store::{encode_jpeg, sha16, FrameStore, StoredFrame, DEFAULT_JPEG_QUALITY, PRODUCER};
+pub use store::{
+    encode_jpeg, sanitize_monitor_label, sha16, FrameStore, StoredFrame, DEFAULT_JPEG_QUALITY,
+    PRODUCER,
+};
 pub use watcher::{sleep_until, FrameStats, TickOutcome, Watcher};
 
 /// Resolve the data dir (media files live under `<data_dir>/media`).
@@ -81,13 +87,18 @@ pub fn data_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
-/// The production frame source: GDI primary-monitor capture on Windows.
+/// The production frame source: GDI per-monitor capture on Windows.
+/// `primary_only` selects the legacy v0.1 behavior (`monitors = "primary"`).
 ///
 /// Other platforms have no capture backend in v0.1; [`run`] reports this
 /// as an immediate error there.
 #[cfg(windows)]
-fn default_frame_source() -> anyhow::Result<Box<dyn FrameSource>> {
-    Ok(Box::new(capture::gdi::GdiFrameSource::new()))
+fn default_frame_source(primary_only: bool) -> anyhow::Result<Box<dyn FrameSource>> {
+    Ok(Box::new(if primary_only {
+        capture::gdi::GdiFrameSource::primary_only()
+    } else {
+        capture::gdi::GdiFrameSource::new()
+    }))
 }
 
 /// The production input-idle probe (seconds since last keyboard/mouse
@@ -116,7 +127,7 @@ fn input_idle_s() -> f64 {
 }
 
 #[cfg(not(windows))]
-fn default_frame_source() -> anyhow::Result<Box<dyn FrameSource>> {
+fn default_frame_source(_primary_only: bool) -> anyhow::Result<Box<dyn FrameSource>> {
     anyhow::bail!("watcher-screen capture is only implemented on Windows (GDI); retention and the encode/dedup pipeline remain testable everywhere")
 }
 
@@ -130,23 +141,26 @@ fn input_idle_s() -> f64 {
 /// Daemon loop (one iteration per `screen.interval_s`):
 ///
 /// 1. if input idle >= `afk_threshold_min`, skip this tick (AFK/lock pause);
-/// 2. capture the primary monitor via GDI;
-/// 3. JPEG-encode (quality `screen.quality`, default
+/// 2. capture every selected monitor via GDI (`screen.monitors`: `all`,
+///    one frame each, or `primary` only);
+/// 3. JPEG-encode each frame (quality `screen.quality`, default
 ///    [`DEFAULT_JPEG_QUALITY`]) and skip the write if the frame's `sha16`
-///    matches the previous frame;
-/// 4. otherwise write `media/frames/YYYY/MM/DD/HHMMSS_<sha16>.jpg` and
-///    insert the `media` index row via `Db::insert_event`;
+///    matches that monitor's previous frame;
+/// 4. otherwise write
+///    `media/frames/YYYY/MM/DD/HHMMSS_<monitor>_<sha16>.jpg` and insert
+///    the `media` index row via `Db::insert_event`;
 /// 5. once an hour (and once at startup), sweep old/oversized frames
 ///    oldest-first within `screen.max_age_days` + `screen.max_total_mb`.
 ///
 /// Returns when `shutdown` becomes true. Capture or storage failures log a
-/// warning and continue. Non-Windows platforms return an immediate error
-/// (no capture backend; see [`default_frame_source`]).
+/// warning and continue (a single monitor may be skipped for a tick).
+/// Non-Windows platforms return an immediate error (no capture backend;
+/// see [`default_frame_source`]).
 pub fn run(cfg: &Config, db: &Db, shutdown: &AtomicBool) -> anyhow::Result<()> {
     let media_root = data_dir().join("media");
     let quality = cfg.screen.quality;
     let mut watcher = Watcher::new(
-        default_frame_source()?,
+        default_frame_source(cfg.screen.monitors == ScreenMonitors::Primary)?,
         FrameStore::new(media_root.clone(), quality),
         cfg.afk_threshold_min.saturating_mul(60),
     );
@@ -156,9 +170,10 @@ pub fn run(cfg: &Config, db: &Db, shutdown: &AtomicBool) -> anyhow::Result<()> {
     };
 
     info!(
-        "watcher-screen: interval {}s, quality {}, retention {}/{} MB, media root {}",
+        "watcher-screen: interval {}s, quality {}, monitors {:?}, retention {}/{} MB, media root {}",
         cfg.screen.interval_s,
         quality,
+        cfg.screen.monitors,
         budget.max_age_days,
         budget.max_total_mb,
         media_root.display()
