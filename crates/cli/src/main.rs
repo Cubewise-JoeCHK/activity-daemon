@@ -3,11 +3,17 @@
 //! - `run` - the daemon: four worker threads (window, screen, audio, sync),
 //!   each with its own core `Db` connection, one shared shutdown flag,
 //!   single-instance lock, heartbeat and `daemon.log` in the data dir;
-//!   optional auto-update from GitHub Releases (issue #17).
+//!   optional auto-update from GitHub Releases (issue #17). Windows only
+//!   (issue #30): the console window is hidden per `run.hide_console`
+//!   (default auto) and a system tray icon shows health (active / recording
+//!   / heartbeat stale) with an Update now / Quit menu.
 //! - `status` - heartbeat liveness, current foreground, today active time,
 //!   sync backlog, storage usage vs budgets; `--json` for machines.
-//! - `startup install|uninstall|status` - Windows Task Scheduler autostart
-//!   (logon trigger, restart on failure, hidden); `--dry-run` previews.
+//! - `startup install|uninstall|status` - Windows autostart via a no-admin
+//!   fallback chain (issues #7, #29): full Task Scheduler XML -> minimal
+//!   task XML -> Startup-folder `activity-daemon.vbs` (windowless);
+//!   `status` reports which mechanism is effective, `uninstall` removes
+//!   all of them; `--dry-run` previews.
 //! - `record start|stop` - manual mic-only recording via the watcher-audio
 //!   `record.json` control file (atomic write, `trigger: "cli"`).
 //! - `update` / `update check` - self-update from GitHub Releases (issue
@@ -21,6 +27,7 @@
 //! a missing file is created as a commented template with defaults).
 
 mod config;
+mod console;
 mod heartbeat;
 mod lock;
 mod logging;
@@ -28,6 +35,7 @@ mod record;
 mod run;
 mod startup;
 mod status;
+mod tray;
 mod update;
 mod usage_log;
 
@@ -62,7 +70,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Manage autostart via the Windows Task Scheduler (task "ActivityDaemon").
+    /// Manage autostart (task "ActivityDaemon" with a Startup-folder
+    /// fallback when the Task Scheduler refuses; issue #29).
     Startup {
         #[command(subcommand)]
         action: startup::StartupAction,

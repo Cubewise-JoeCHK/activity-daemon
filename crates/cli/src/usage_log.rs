@@ -35,6 +35,9 @@ pub const FEATURE_STATUS: &str = "status";
 pub const FEATURE_MEETING_RECORDING: &str = "meeting-recording";
 pub const FEATURE_STARTUP: &str = "startup";
 pub const FEATURE_UPDATE: &str = "update";
+/// Issue #30 tray menu events (Windows-only; see the actions below).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const FEATURE_TRAY: &str = "tray";
 pub const FEATURE_USAGE: &str = "usage";
 
 pub const ACTION_START: &str = "start";
@@ -45,6 +48,13 @@ pub const ACTION_INSTALL: &str = "install";
 pub const ACTION_UNINSTALL: &str = "uninstall";
 pub const ACTION_APPLY: &str = "apply";
 pub const ACTION_CHECK: &str = "check";
+// Issue #30 tray menu actions (user-initiated, so they log). The tray is
+// Windows-only; on other platforms these exist for the pinned taxonomy test
+// (the bin target would otherwise flag them as dead code).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const ACTION_UPDATE_NOW: &str = "update-now";
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const ACTION_QUIT: &str = "quit";
 
 /// Insert one usage event (bucket `usage`, `{"feature", "action"}`,
 /// duration 0) for `device`. Timestamped now (RFC3339 with the local
@@ -323,6 +333,7 @@ mod tests {
         assert_eq!(FEATURE_MEETING_RECORDING, "meeting-recording");
         assert_eq!(FEATURE_STARTUP, "startup");
         assert_eq!(FEATURE_UPDATE, "update");
+        assert_eq!(FEATURE_TRAY, "tray");
         assert_eq!(FEATURE_USAGE, "usage");
         assert_eq!(ACTION_START, "start");
         assert_eq!(ACTION_VIEW, "view");
@@ -332,6 +343,8 @@ mod tests {
         assert_eq!(ACTION_UNINSTALL, "uninstall");
         assert_eq!(ACTION_APPLY, "apply");
         assert_eq!(ACTION_CHECK, "check");
+        assert_eq!(ACTION_UPDATE_NOW, "update-now");
+        assert_eq!(ACTION_QUIT, "quit");
     }
 
     #[test]

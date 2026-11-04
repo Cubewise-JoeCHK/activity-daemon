@@ -697,9 +697,11 @@ fn schtasks_run() -> Result<()> {
     bail!("schtasks is only available on Windows: /run /tn {TASK_NAME}")
 }
 
-/// Spawn `exe run` detached so it survives this process exiting.
+/// Spawn `exe run` detached so it survives this process exiting. Also used
+/// by the #29 Startup-folder fallback to start the daemon right after
+/// install (windowless, no console flash).
 #[cfg(windows)]
-fn spawn_detached(exe: &Path) -> Result<()> {
+pub(crate) fn spawn_detached(exe: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
     // DETACHED_PROCESS: no inherited console window; CREATE_NEW_PROCESS_GROUP:
     // the child does not receive this console's ctrl events.
@@ -714,7 +716,7 @@ fn spawn_detached(exe: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn spawn_detached(exe: &Path) -> Result<()> {
+pub(crate) fn spawn_detached(exe: &Path) -> Result<()> {
     // A POSIX orphan keeps running after the parent exits; no console to detach.
     std::process::Command::new(exe)
         .arg("run")

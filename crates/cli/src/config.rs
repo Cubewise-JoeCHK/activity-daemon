@@ -159,6 +159,15 @@ auto_update = {auto_update}
 # Seconds between automatic update checks (86400 = daily; the unauthenticated
 # GitHub API allows 60 requests/hour).
 update_interval_s = {update_interval}
+
+[run]
+# Windows only (#30): when `run` hides its own console window. The daemon
+# normally lives in the system tray, so a console window would only flash.
+#   auto   = hide unless started from a visible terminal (cmd / powershell /
+#            pwsh / Windows Terminal keep the console for the developer)
+#   always = hide the console window in every case
+#   never  = keep the console window visible
+hide_console = "{hide_console}"
 "#,
         data_dir = data_dir,
         poll = cfg.poll_interval_s,
@@ -176,6 +185,11 @@ update_interval_s = {update_interval}
         device = cfg.sync.device_name,
         auto_update = cfg.sync.auto_update,
         update_interval = cfg.sync.update_interval_s,
+        hide_console = match cfg.run.hide_console {
+            activity_core::HideConsole::Auto => "auto",
+            activity_core::HideConsole::Always => "always",
+            activity_core::HideConsole::Never => "never",
+        },
     )
 }
 
@@ -230,6 +244,7 @@ mod tests {
             "device_name",
             "auto_update",
             "update_interval_s",
+            "hide_console",
         ] {
             assert!(text.contains(field), "template mentions {field}");
         }
