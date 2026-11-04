@@ -9,6 +9,11 @@
 //!   `recording` (the latest `meeting-audio` event says a recording is
 //!   running) / `heartbeat stale` (no or stale heartbeat file - refreshed
 //!   every second).
+//! - Icon = the same health as a color, from the repo icon set (issue #35):
+//!   the eye's pupil is teal when active, red when recording, amber when
+//!   the heartbeat is stale (assets/README.md). The taskbar theme picks the
+//!   dark- or light-bg variant once at startup; the size follows the
+//!   system small-icon metric.
 //! - Right-click menu: `Update now` (a one-shot flag the run loop consumes -
 //!   the same update path as the manual `update` command) and `Quit` (sets
 //!   the same [`SHUTDOWN`] flag as Ctrl+C - graceful worker join). Left
@@ -18,15 +23,19 @@
 //!   take the daemon down (spawn failures are logged and skipped).
 //!
 //! Pure logic ([`TrayState`], [`tray_state`], [`tray_tooltip`],
-//! [`latest_meeting_audio_is_recording`], the embedded ICO bytes) is
-//! cfg-free and unit-tested on every platform; every Win32 call is
-//! cfg(windows) so the ubuntu CI leg stays green.
+//! [`latest_meeting_audio_is_recording`], the embedded PNG set and its
+//! helpers) is cfg-free and unit-tested on every platform; every Win32 call
+//! is cfg(windows) so the ubuntu CI leg stays green.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use activity_core::Event;
+
+/// Decoded icon handle for the tray slots (null on decode failure).
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::HICON;
 
 /// One-shot `Update now` request from the tray menu; the run loop consumes
 /// it with [`take_update_request`] and runs the same update path as a
@@ -100,129 +109,91 @@ pub fn latest_meeting_audio_is_recording(events: &[Event]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Embedded minimal icon: a 16x16 blue dot on a transparent background,
-// built at compile time as a fully valid single-image ICO (BITMAPINFOHEADER
-// + 32-bit BGRA pixels + AND mask). Header bytes are validated by a test on
-// every platform; Windows decodes it with CreateIconFromResourceEx.
+// Embedded state icons (issue #35). The repo icon set (assets/README.md) is
+// a watchful-eye glyph whose pupil color carries the tray health state -
+// teal active, red recording, amber stale - in a dark-bg and a light-bg
+// variant per taskbar theme. The 16/20/24/32 px PNGs are embedded verbatim;
+// at tray startup the size closest to the system small-icon metric is
+// decoded with CreateIconFromResourceEx, which takes a PNG payload verbatim
+// (the Vista+ RT_ICON resource format) - still the old zero-dependency
+// decode path, just fed the new art.
 // ---------------------------------------------------------------------------
 
-const ICO_WIDTH: usize = 16;
-const ICO_HEIGHT: usize = 16;
-/// BITMAPINFOHEADER byte length (the ICO image starts with exactly this).
-const BMP_HEADER_LEN: usize = 40;
-/// 32-bit BGRA pixel data length (bottom-up rows).
-const PIXELS_LEN: usize = ICO_WIDTH * ICO_HEIGHT * 4;
-/// 1bpp AND-mask row stride: rows padded to 32-bit boundaries (16 px -> 4 B).
-const AND_MASK_STRIDE: usize = ICO_WIDTH.div_ceil(32) * 4;
-const AND_MASK_LEN: usize = AND_MASK_STRIDE * ICO_HEIGHT;
-/// One BMP image inside the ICO (header + pixels + AND mask).
-const IMAGE_LEN: usize = BMP_HEADER_LEN + PIXELS_LEN + AND_MASK_LEN;
-const ICON_DIR_LEN: usize = 6;
-const ICON_ENTRY_LEN: usize = 16;
-const IMAGE_OFFSET: usize = ICON_DIR_LEN + ICON_ENTRY_LEN;
-/// Total embedded ICO size (6 + 16 + 1128 = 1150 bytes).
+/// PNG sizes present in the asset set (assets/tray/*-{16,20,24,32}.png).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const TRAY_ICON_ICO_LEN: usize = IMAGE_OFFSET + IMAGE_LEN;
+const TRAY_SIZES: [usize; 4] = [16, 20, 24, 32];
 
-const fn u16_le(value: u16) -> [u8; 2] {
-    [value as u8, (value >> 8) as u8]
-}
-
-const fn u32_le(value: u32) -> [u8; 4] {
+/// The dark-bg tray PNGs, `[state][size]`: Active / Recording /
+/// HeartbeatStale x 16/20/24/32 px.
+#[cfg_attr(not(windows), allow(dead_code))]
+const TRAY_PNG_DARK: [[&[u8]; 4]; 3] = [
     [
-        value as u8,
-        (value >> 8) as u8,
-        (value >> 16) as u8,
-        (value >> 24) as u8,
-    ]
-}
+        include_bytes!("../../../assets/tray/dark-bg/active-16.png"),
+        include_bytes!("../../../assets/tray/dark-bg/active-20.png"),
+        include_bytes!("../../../assets/tray/dark-bg/active-24.png"),
+        include_bytes!("../../../assets/tray/dark-bg/active-32.png"),
+    ],
+    [
+        include_bytes!("../../../assets/tray/dark-bg/recording-16.png"),
+        include_bytes!("../../../assets/tray/dark-bg/recording-20.png"),
+        include_bytes!("../../../assets/tray/dark-bg/recording-24.png"),
+        include_bytes!("../../../assets/tray/dark-bg/recording-32.png"),
+    ],
+    [
+        include_bytes!("../../../assets/tray/dark-bg/stale-16.png"),
+        include_bytes!("../../../assets/tray/dark-bg/stale-20.png"),
+        include_bytes!("../../../assets/tray/dark-bg/stale-24.png"),
+        include_bytes!("../../../assets/tray/dark-bg/stale-32.png"),
+    ],
+];
 
-/// Build the ICO bytes at compile time. Dot color is RGB(0, 120, 215) (the
-/// Windows accent blue), radius ~5.5 px, fully transparent elsewhere.
-const fn build_tray_ico() -> [u8; TRAY_ICON_ICO_LEN] {
-    let mut b = [0u8; TRAY_ICON_ICO_LEN];
-
-    // ICONDIR: reserved = 0, type = 1 (icon), one image.
-    b[2] = 1;
-    b[4] = 1;
-
-    // ICONDIRENTRY: 16x16, no palette, 1 plane, 32bpp, size + offset.
-    b[6] = ICO_WIDTH as u8;
-    b[7] = ICO_HEIGHT as u8;
-    let entry_planes = u16_le(1);
-    b[10] = entry_planes[0];
-    b[11] = entry_planes[1];
-    let entry_bpp = u16_le(32);
-    b[12] = entry_bpp[0];
-    b[13] = entry_bpp[1];
-    let size = u32_le(IMAGE_LEN as u32);
-    b[14] = size[0];
-    b[15] = size[1];
-    b[16] = size[2];
-    b[17] = size[3];
-    let offset = u32_le(IMAGE_OFFSET as u32);
-    b[18] = offset[0];
-    b[19] = offset[1];
-    b[20] = offset[2];
-    b[21] = offset[3];
-
-    // BITMAPINFOHEADER. In the ICO format biHeight counts XOR (pixel) rows
-    // plus AND (mask) rows, so it is 2 * height.
-    let p = IMAGE_OFFSET;
-    let hdr = u32_le(BMP_HEADER_LEN as u32);
-    b[p] = hdr[0];
-    b[p + 1] = hdr[1];
-    b[p + 2] = hdr[2];
-    b[p + 3] = hdr[3];
-    let w = u32_le(ICO_WIDTH as u32);
-    b[p + 4] = w[0];
-    b[p + 5] = w[1];
-    b[p + 6] = w[2];
-    b[p + 7] = w[3];
-    let h = u32_le((2 * ICO_HEIGHT) as u32);
-    b[p + 8] = h[0];
-    b[p + 9] = h[1];
-    b[p + 10] = h[2];
-    b[p + 11] = h[3];
-    let planes = u16_le(1);
-    b[p + 12] = planes[0];
-    b[p + 13] = planes[1];
-    let bpp = u16_le(32);
-    b[p + 14] = bpp[0];
-    b[p + 15] = bpp[1];
-    // Everything else (compression BI_RGB, palette size, biSizeImage, ...)
-    // stays zero.
-
-    // Pixel data, bottom-up BGRA. A pixel belongs to the dot when it sits
-    // within radius^2 = 30 of the screen-space center (8, 8).
-    let pixels = p + BMP_HEADER_LEN;
-    let mut y = 0usize;
-    while y < ICO_HEIGHT {
-        let mut x = 0usize;
-        while x < ICO_WIDTH {
-            let dx = x as i64 - 8;
-            let dy = y as i64 - 8;
-            if dx * dx + dy * dy <= 30 {
-                // Screen row y lives at image row (height-1-y) (bottom-up).
-                let o = pixels + (ICO_HEIGHT - 1 - y) * (ICO_WIDTH * 4) + x * 4;
-                b[o] = 215; // blue
-                b[o + 1] = 120; // green
-                b[o + 2] = 0; // red
-                b[o + 3] = 255; // opaque
-            }
-            x += 1;
-        }
-        y += 1;
-    }
-
-    // AND mask stays all zero: with 32-bit RGBA the alpha channel carries
-    // transparency; a zeroed mask means "draw the pixel as-is".
-    b
-}
-
-/// The embedded tray icon (a fully valid 1150-byte ICO file image).
+/// The light-bg tray PNGs, same layout as [`TRAY_PNG_DARK`].
 #[cfg_attr(not(windows), allow(dead_code))]
-pub static TRAY_ICON_ICO: [u8; TRAY_ICON_ICO_LEN] = build_tray_ico();
+const TRAY_PNG_LIGHT: [[&[u8]; 4]; 3] = [
+    [
+        include_bytes!("../../../assets/tray/light-bg/active-16.png"),
+        include_bytes!("../../../assets/tray/light-bg/active-20.png"),
+        include_bytes!("../../../assets/tray/light-bg/active-24.png"),
+        include_bytes!("../../../assets/tray/light-bg/active-32.png"),
+    ],
+    [
+        include_bytes!("../../../assets/tray/light-bg/recording-16.png"),
+        include_bytes!("../../../assets/tray/light-bg/recording-20.png"),
+        include_bytes!("../../../assets/tray/light-bg/recording-24.png"),
+        include_bytes!("../../../assets/tray/light-bg/recording-32.png"),
+    ],
+    [
+        include_bytes!("../../../assets/tray/light-bg/stale-16.png"),
+        include_bytes!("../../../assets/tray/light-bg/stale-20.png"),
+        include_bytes!("../../../assets/tray/light-bg/stale-24.png"),
+        include_bytes!("../../../assets/tray/light-bg/stale-32.png"),
+    ],
+];
+
+/// Icon array slot for a tray state (the tray keeps one decoded icon per
+/// state and swaps between them on transitions).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn state_index(state: TrayState) -> usize {
+    match state {
+        TrayState::Active => 0,
+        TrayState::Recording => 1,
+        TrayState::HeartbeatStale => 2,
+    }
+}
+
+/// Asset-set size closest to `metric` (ties pick the smaller side: the
+/// shell scales a small icon up more gracefully than it scales a big one
+/// down).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn nearest_tray_size(metric: usize) -> usize {
+    let mut best = TRAY_SIZES[0];
+    for size in TRAY_SIZES {
+        if metric.abs_diff(size) < metric.abs_diff(best) {
+            best = size;
+        }
+    }
+    best
+}
 
 // ---------------------------------------------------------------------------
 // Windows implementation
@@ -267,6 +238,9 @@ struct TrayCtx {
     /// each thread opens its own; recording-state reads never block them).
     db: Option<activity_core::Db>,
     last_state: Option<TrayState>,
+    /// One decoded icon per state (slot = [`state_index`]); the refresh
+    /// swaps the icon together with the tooltip on a state transition.
+    icons: [HICON; 3],
 }
 
 #[cfg(windows)]
@@ -337,25 +311,26 @@ mod win_impl {
     use anyhow::anyhow;
     use chrono::{Local, SecondsFormat};
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
         NIM_SETVERSION, NOTIFYICONDATAW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-        DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer,
-        PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
+        DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
+        KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
         TrackPopupMenu, TranslateMessage, HICON, HWND_MESSAGE, LR_DEFAULTCOLOR, MF_STRING, MSG,
-        TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CREATE, WM_DESTROY, WM_NULL,
-        WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+        SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CREATE,
+        WM_DESTROY, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
     };
 
     use super::{
-        latest_meeting_audio_is_recording, tray_state, tray_tooltip, MenuCommand, TrayCtx,
-        TrayState, MENU_QUIT, MENU_UPDATE_NOW, TIMER_ID, TIMER_INTERVAL_MS, TRAY_CTX, TRAY_HWND,
-        TRAY_ICON_ICO, TRAY_ICON_ID, TRAY_UPDATE_REQUEST, TRAY_VERSION, WM_TRAY_CALLBACK,
-        WM_TRAY_TEARDOWN,
+        latest_meeting_audio_is_recording, nearest_tray_size, state_index, tray_state,
+        tray_tooltip, MenuCommand, TrayCtx, TrayState, MENU_QUIT, MENU_UPDATE_NOW, TIMER_ID,
+        TIMER_INTERVAL_MS, TRAY_CTX, TRAY_HWND, TRAY_ICON_ID, TRAY_PNG_DARK, TRAY_PNG_LIGHT,
+        TRAY_SIZES, TRAY_UPDATE_REQUEST, TRAY_VERSION, WM_TRAY_CALLBACK, WM_TRAY_TEARDOWN,
     };
     use crate::heartbeat::{self, HeartbeatState};
     use crate::usage_log;
@@ -376,6 +351,10 @@ mod win_impl {
             log::warn!("tray: cannot open activity.db; tooltip falls back to the heartbeat signal");
         }
 
+        // One decoded icon per state (theme + small-icon metric picked here,
+        // once; a theme/DPI change applies on the next daemon start).
+        let icons = tray_icon_handles();
+
         TRAY_CTX.with(|cell| {
             *cell.borrow_mut() = Some(TrayCtx {
                 data_dir,
@@ -383,15 +362,16 @@ mod win_impl {
                 shutdown,
                 db,
                 last_state: None,
+                icons,
             })
         });
 
-        let result = pump_messages();
+        let result = pump_messages(icons);
         TRAY_CTX.with(|cell| *cell.borrow_mut() = None);
         result
     }
 
-    fn pump_messages() -> anyhow::Result<()> {
+    fn pump_messages(icons: [HICON; 3]) -> anyhow::Result<()> {
         // Register the window class. A zero atom usually means the class
         // already exists (a previous daemon generation in this process);
         // CreateWindowExW below is the real gate.
@@ -427,9 +407,11 @@ mod win_impl {
 
         // Add the icon. A NIM_ADD failure (e.g. Explorer not running) ends
         // the tray thread - the daemon itself never depends on the tray.
+        // The active icon leads; the first timer tick swaps in the real
+        // state within a second.
         let mut nid = base_notify_icon_data(hwnd);
         nid.uFlags |= NIF_ICON;
-        nid.hIcon = tray_icon_handle();
+        nid.hIcon = icons[state_index(TrayState::Active)];
         // SAFETY: nid references our own window/id; no pointers kept.
         if !unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool() {
             let _ = unsafe { DestroyWindow(hwnd) };
@@ -509,7 +491,7 @@ mod win_impl {
                         None => false,
                         Some(ctx) if ctx.shutdown.load(Ordering::Relaxed) => true,
                         Some(ctx) => {
-                            refresh_tooltip(ctx);
+                            refresh_tray(ctx);
                             false
                         }
                     }
@@ -635,12 +617,42 @@ mod win_impl {
         }
     }
 
-    /// Decode the embedded ICO into an HICON (blank default on failure; the
-    /// menu still works, only the slot art is empty).
-    fn tray_icon_handle() -> HICON {
-        // SAFETY: pure resource decode from our static bytes.
+    /// Decode one icon per tray state (issue #35): the taskbar theme picks
+    /// the dark- or light-bg set and the system small-icon metric picks the
+    /// embedded size. A decode failure leaves that state's slot blank (the
+    /// menu and tooltip still work - the same degrade contract as before).
+    fn tray_icon_handles() -> [HICON; 3] {
+        // SAFETY: plain system-metric read, no preconditions.
+        let metric = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(0) as usize;
+        let size = nearest_tray_size(metric);
+        let set = if taskbar_prefers_light() {
+            &TRAY_PNG_LIGHT
+        } else {
+            &TRAY_PNG_DARK
+        };
+        let size_idx = TRAY_SIZES.iter().position(|s| *s == size).unwrap_or(0);
+        let mut handles = [HICON::default(); 3];
+        for (state, pngs) in set.iter().enumerate() {
+            handles[state] = ico_from_png(pngs[size_idx]);
+        }
+        handles
+    }
+
+    /// Decode one embedded PNG at the system small-icon size (blank
+    /// default on failure; the menu still works, only the slot art is
+    /// empty). A PNG is the Vista+ RT_ICON resource format verbatim - the
+    /// shell decodes it natively, no BMP conversion needed.
+    pub(super) fn ico_from_png(png: &[u8]) -> HICON {
+        // SAFETY: pure resource decode from our own bytes.
         match unsafe {
-            CreateIconFromResourceEx(&TRAY_ICON_ICO, true, 0x0003_0000, 0, 0, LR_DEFAULTCOLOR)
+            CreateIconFromResourceEx(
+                png,
+                true,
+                0x0003_0000,
+                GetSystemMetrics(SM_CXSMICON),
+                GetSystemMetrics(SM_CYSMICON),
+                LR_DEFAULTCOLOR,
+            )
         } {
             Ok(icon) => icon,
             Err(e) => {
@@ -648,6 +660,31 @@ mod win_impl {
                 HICON::default()
             }
         }
+    }
+
+    /// Whether the system (taskbar) theme prefers light. Read once at
+    /// startup: the tray sits on the taskbar, which follows
+    /// SystemUsesLightTheme. Dark - the Windows default - is also the
+    /// answer on any read failure or missing value.
+    fn taskbar_prefers_light() -> bool {
+        let subkey = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+        let value = wide("SystemUsesLightTheme");
+        let mut dword: u32 = 0;
+        let mut len = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(0);
+        // SAFETY: all buffers outlive the call; RRF_RT_REG_DWORD pins the
+        // value type so a wrong-typed value fails instead of overflowing.
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR::from_raw(subkey.as_ptr()),
+                PCWSTR::from_raw(value.as_ptr()),
+                RRF_RT_REG_DWORD,
+                None,
+                Some((&mut dword as *mut u32).cast()),
+                Some(&mut len),
+            )
+        };
+        result == ERROR_SUCCESS && dword == 1
     }
 
     /// Copy `tip` into the NOTIFYICONDATAW tooltip slot (NUL-terminated,
@@ -658,9 +695,11 @@ mod win_impl {
         nid.szTip[..len].copy_from_slice(&wide_tip[..len]);
     }
 
-    /// Refresh the tooltip from current daemon health (once per second from
-    /// the timer; logs transitions).
-    fn refresh_tooltip(ctx: &mut TrayCtx) {
+    /// Refresh the tray from current daemon health (once per second from
+    /// the timer; logs transitions): a state change swaps both the icon
+    /// (pupil color = the state, issue #35) and the tooltip in one
+    /// NIM_MODIFY.
+    fn refresh_tray(ctx: &mut TrayCtx) {
         let state = current_tray_state(ctx);
         if ctx.last_state == Some(state) {
             return;
@@ -672,7 +711,8 @@ mod win_impl {
             return;
         }
         let mut nid = base_notify_icon_data(HWND(value as *mut core::ffi::c_void));
-        nid.uFlags |= NIF_TIP;
+        nid.uFlags |= NIF_ICON | NIF_TIP;
+        nid.hIcon = ctx.icons[state_index(state)];
         set_tip(&mut nid, &tray_tooltip(state, TRAY_VERSION));
         // SAFETY: nid references our own icon (hWnd/uID); no pointers kept.
         unsafe {
@@ -843,57 +883,48 @@ mod tests {
     }
 
     #[test]
-    fn embedded_ico_has_valid_header_bytes() {
-        let ico = &TRAY_ICON_ICO;
-        // ICONDIR: reserved 0, type 1 (icon), exactly one image.
-        assert_eq!(&ico[0..2], &[0, 0]);
-        assert_eq!(&ico[2..4], &[1, 0]);
-        assert_eq!(&ico[4..6], &[1, 0]);
-        // ICONDIRENTRY: 16x16, no palette colors, 1 plane, 32bpp.
-        assert_eq!(ico[6], 16);
-        assert_eq!(ico[7], 16);
-        assert_eq!(ico[8], 0, "palette color count");
-        assert_eq!(ico[9], 0, "reserved");
-        assert_eq!(u16::from_le_bytes([ico[10], ico[11]]), 1);
-        assert_eq!(u16::from_le_bytes([ico[12], ico[13]]), 32);
-        // The image resource is everything from offset 22 on.
-        assert_eq!(
-            u32::from_le_bytes([ico[14], ico[15], ico[16], ico[17]]),
-            1128
-        );
-        assert_eq!(u32::from_le_bytes([ico[18], ico[19], ico[20], ico[21]]), 22);
-        assert_eq!(ico.len(), 22 + 1128);
+    fn tray_png_set_is_complete() {
+        // The whole asset set is embedded, laid out [state][size] per the
+        // constants, and every entry is a real PNG.
+        for set in [&TRAY_PNG_DARK, &TRAY_PNG_LIGHT] {
+            assert_eq!(set.len(), 3, "three states: active / recording / stale");
+            for pngs in set {
+                assert_eq!(pngs.len(), TRAY_SIZES.len());
+                for png in pngs {
+                    assert!(png.len() > 8);
+                    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+                }
+            }
+        }
+    }
 
-        // BITMAPINFOHEADER: 40 bytes, 16 wide, 32 tall (XOR + AND rows),
-        // 1 plane, 32bpp, BI_RGB (0).
-        let h = 22;
-        assert_eq!(
-            u32::from_le_bytes([ico[h], ico[h + 1], ico[h + 2], ico[h + 3]]),
-            40
-        );
-        assert_eq!(
-            u32::from_le_bytes([ico[h + 4], ico[h + 5], ico[h + 6], ico[h + 7]]),
-            16
-        );
-        assert_eq!(
-            u32::from_le_bytes([ico[h + 8], ico[h + 9], ico[h + 10], ico[h + 11]]),
-            32
-        );
-        assert_eq!(u16::from_le_bytes([ico[h + 12], ico[h + 13]]), 1);
-        assert_eq!(u16::from_le_bytes([ico[h + 14], ico[h + 15]]), 32);
-        assert_eq!(
-            u32::from_le_bytes([ico[h + 16], ico[h + 17], ico[h + 18], ico[h + 19]]),
-            0
-        );
+    #[test]
+    fn nearest_tray_size_picks_the_closest_side() {
+        // Midpoints 18 / 22 / 28; ties pick the smaller side (strict <).
+        assert_eq!(nearest_tray_size(0), 16);
+        assert_eq!(nearest_tray_size(16), 16);
+        assert_eq!(nearest_tray_size(18), 16);
+        assert_eq!(nearest_tray_size(19), 20);
+        assert_eq!(nearest_tray_size(22), 20);
+        assert_eq!(nearest_tray_size(23), 24);
+        assert_eq!(nearest_tray_size(28), 24);
+        assert_eq!(nearest_tray_size(29), 32);
+        assert_eq!(nearest_tray_size(1000), 32);
+    }
 
-        // Pixel checks (bottom-up BGRA): center of the dot is opaque, a
-        // corner is fully transparent.
-        let center = h + 40 + (7 * 16 + 8) * 4; // screen row 8 -> image row 7
-        assert_eq!(ico[center + 3], 255);
-        let corner = h + 40 + (15 * 16) * 4; // screen row 0, col 0
-        assert_eq!(ico[corner + 3], 0);
-
-        // AND mask (last 64 bytes) is all zero: alpha carries transparency.
-        assert!(ico[ico.len() - 64..].iter().all(|byte| *byte == 0));
+    #[cfg(windows)]
+    #[test]
+    fn all_state_icons_decode() {
+        // The real gate for the tray: every embedded PNG, both themes, all
+        // sizes, decodes through the exact production path (the shell's
+        // CreateIconFromResourceEx) into a non-null icon.
+        for set in [&TRAY_PNG_DARK, &TRAY_PNG_LIGHT] {
+            for pngs in set {
+                for png in pngs {
+                    let icon = win_impl::ico_from_png(png);
+                    assert!(!icon.is_invalid(), "PNG must decode into an icon");
+                }
+            }
+        }
     }
 }
