@@ -25,6 +25,9 @@ log = { version = "0.4", features = ["std"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Issue #38: `status` fetches retention stats from the hub
+# (GET /api/retention) - same client crate (major) the forwarder uses.
+ureq = { version = "2", features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]
 # Issue #30 adds: ToolHelp (parent-process name for the hide-console auto
