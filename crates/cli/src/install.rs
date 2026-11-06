@@ -62,15 +62,18 @@ pub const SERVICE_DISPLAY_NAME: &str = "Activity Daemon Watchdog";
 /// Fallback scheduled task name.
 pub const WATCHDOG_TASK_NAME: &str = "ActivityDaemonKeepAlive";
 /// File the fallback task XML is staged to (in the data dir).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const WATCHDOG_TASK_XML_FILE: &str = "ActivityDaemonKeepAlive.task.xml";
 /// Service supervision cadence (the heartbeat is stale after
 /// `heartbeat::MAX_AGE_S` = 15s, so one tick sees every failure fast).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const TICK_MS: u64 = 15_000;
 /// Pause between the kill and the respawn of a wedged daemon (handles
 /// close asynchronously).
 pub const KILL_GRACE_MS: u64 = 1_000;
 /// `WTSGetActiveConsoleSessionId()` return value when no console session
 /// is active (logon screen).
+#[cfg_attr(not(windows), allow(dead_code))]
 const NO_CONSOLE_SESSION: u32 = 0xFFFF_FFFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Subcommand)]
