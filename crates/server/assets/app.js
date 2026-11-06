@@ -1,5 +1,6 @@
 /* activity-daemon hub UI — plain JS, no dependencies, no external fetches.
-   Data source: GET /api/machines and GET /api/calendar (same origin). */
+   Data sources: GET /api/machines, GET /api/calendar and the timesheet
+   review APIs (/api/timesheet/*, issue #47) — all same origin. */
 
 (() => {
   "use strict";
@@ -7,7 +8,7 @@
   const $ = (sel) => document.querySelector(sel);
 
   const state = {
-    view: "machine",            // 'machine' | 'cal'
+    view: "machine",            // 'machine' | 'cal' | 'ts'
     machines: null,             // /api/machines payload
     selected: null,             // selected device name
     filter: "",                 // device list filter text
@@ -15,6 +16,15 @@
     weekAnchor: startOfWeek(new Date()), // week grid Monday
     monthCal: null,             // month-range /api/calendar payload
     weekCal: null,              // week-range /api/calendar payload
+    tsMonthAnchor: new Date(),  // timesheet day-list month
+    tsDays: null,               // /api/timesheet/days payload
+    tsSelectedDay: null,        // the day under review, YYYY-MM-DD
+    tsDraft: null,              // /api/timesheet/draft?date= payload
+    tsVocab: null,              // /api/timesheet/vocab payload
+    tsQuestions: null,          // open questions payload
+    tsStyle: null,              // /api/timesheet/style payload (issue #53)
+    tsStyleAvailable: null,     // false once the style API 404s
+    tsDirty: new Map(),         // draftId -> edited fields not yet saved
     nowTimer: null,
   };
 
@@ -43,6 +53,10 @@
     return d.getFullYear() + "-" +
       String(d.getMonth() + 1).padStart(2, "0") + "-" +
       String(d.getDate()).padStart(2, "0");
+  }
+
+  function isoMonth(d) {
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
   }
 
   function fmtClock(rfc3339) {
@@ -83,6 +97,16 @@
   async function fetchJSON(url) {
     const res = await fetch(url, { cache: "no-store" });
     if (!res.ok) throw new Error(url + " -> HTTP " + res.status);
+    return res.json();
+  }
+
+  async function sendJSON(url, method, body) {
+    const res = await fetch(url, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(method + " " + url + " -> HTTP " + res.status);
     return res.json();
   }
 
@@ -150,8 +174,15 @@
 
   function refreshAll() {
     $("#refresh-btn").classList.add("spin");
-    const jobs = [refreshMachines()];
-    if (state.view === "cal") jobs.push(refreshCalendar());
+    const jobs = [];
+    if (state.view === "ts") {
+      // Manual refresh only — the timesheet view never auto-refreshes, so
+      // in-progress row edits are never clobbered.
+      jobs.push(refreshTsDays(), refreshTsDay(), refreshTsQuestions());
+    } else {
+      jobs.push(refreshMachines());
+      if (state.view === "cal") jobs.push(refreshCalendar());
+    }
     Promise.allSettled(jobs).finally(() => {
       setTimeout(() => $("#refresh-btn").classList.remove("spin"), 400);
     });
@@ -164,15 +195,25 @@
 
   // ---------------------------------------------------------- view routing
 
+  function viewFromHash() {
+    if (location.hash.includes("calendar")) return "cal";
+    if (location.hash.includes("timesheet")) return "ts";
+    return "machine";
+  }
+
   function showView(view) {
     state.view = view;
     $("#view-machine").classList.toggle("on", view === "machine");
     $("#view-cal").classList.toggle("on", view === "cal");
+    $("#view-ts").classList.toggle("on", view === "ts");
     $("#rail-machine").classList.toggle("on", view === "machine");
     $("#rail-cal").classList.toggle("on", view === "cal");
-    history.replaceState(null, "", "#" + (view === "cal" ? "calendar" : "machine"));
+    $("#rail-ts").classList.toggle("on", view === "ts");
+    const hash = view === "cal" ? "calendar" : view === "ts" ? "timesheet" : "machine";
+    history.replaceState(null, "", "#" + hash);
     if (view === "cal" && !state.weekCal) refreshCalendar();
     if (view === "machine" && !state.machines) refreshMachines();
+    if (view === "ts") showTimesheet();
   }
 
   // --------------------------------------------------------- machine view
@@ -535,13 +576,351 @@
     return String(text || "").slice(0, 60);
   }
 
+  // ------------------------------------------------------- timesheet view
+
+  function tsMonthRange(d) {
+    return [new Date(d.getFullYear(), d.getMonth(), 1),
+            new Date(d.getFullYear(), d.getMonth() + 1, 0)];
+  }
+
+  function tsMonthLabel(d) {
+    return d.toLocaleString("en-GB", { month: "long", year: "numeric" });
+  }
+
+  async function showTimesheet() {
+    const monthInput = $("#ts-export-month");
+    if (!monthInput.value) monthInput.value = isoMonth(new Date());
+    $("#ts-export-btn").disabled = !/^\d{4}-\d{2}$/.test(monthInput.value);
+    await refreshTsVocab();
+    await Promise.all([refreshTsDays(), refreshTsDay(), refreshTsQuestions(), refreshTsStyle()]);
+  }
+
+  async function refreshTsVocab() {
+    if (state.tsVocab) return;
+    try {
+      state.tsVocab = await fetchJSON("/api/timesheet/vocab");
+    } catch (e) {
+      state.tsVocab = { categories: [], projects: [] };
+    }
+  }
+
+  async function refreshTsDays() {
+    const [from, to] = tsMonthRange(state.tsMonthAnchor);
+    try {
+      state.tsDays = await fetchJSON(`/api/timesheet/days?from=${isoDate(from)}&to=${isoDate(to)}`);
+      renderTsDays();
+    } catch (e) {
+      showError(e.message);
+    }
+  }
+
+  function renderTsDays() {
+    const el = $("#ts-days");
+    if (!state.tsDays) { el.innerHTML = '<div class="empty">Loading…</div>'; return; }
+    $("#ts-month-label").textContent = tsMonthLabel(state.tsMonthAnchor);
+    const days = state.tsDays.days || [];
+    const [first, last] = tsMonthRange(state.tsMonthAnchor);
+    const inMonth = (iso) => iso >= isoDate(first) && iso <= isoDate(last);
+    if (!state.tsSelectedDay || !inMonth(state.tsSelectedDay)) {
+      const todayIso = isoDate(new Date());
+      state.tsSelectedDay = inMonth(todayIso) ? todayIso : (days.length ? days[0].day : isoDate(first));
+    }
+    if (!days.length) {
+      el.innerHTML = '<div class="empty">No drafted activities this month. Compile a day first (POST /api/timesheet/draft?date=…), or pick another month.</div>';
+      return;
+    }
+    el.innerHTML = days.map((d) => `
+      <button class="list-item ${d.day === state.tsSelectedDay ? "on" : ""}" data-day="${esc(d.day)}">
+        <span class="li-body">
+          <span class="li-name">${esc(d.day)}</span>
+          <span class="day-counts">
+            ${d.draft ? `<span class="dc">${d.draft} draft</span>` : ""}
+            ${d.reviewed ? `<span class="dc reviewed">${d.reviewed} rev</span>` : ""}
+            ${d.approved ? `<span class="dc approved">${d.approved} appr</span>` : ""}
+          </span>
+        </span>
+      </button>`).join("");
+    el.querySelectorAll(".list-item").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.tsSelectedDay = btn.dataset.day;
+        renderTsDays();
+        refreshTsDay();
+      });
+    });
+  }
+
+  async function refreshTsDay() {
+    if (!state.tsSelectedDay) return;
+    try {
+      state.tsDraft = await fetchJSON(`/api/timesheet/draft?date=${state.tsSelectedDay}`);
+      state.tsDirty.clear();
+      renderTsRows();
+    } catch (e) {
+      showError(e.message);
+    }
+  }
+
+  function rowState(d) {
+    return d.approved ? "approved" : d.reviewed ? "reviewed" : "draft";
+  }
+
+  function optionsWithCurrent(list, current) {
+    const values = list.slice();
+    if (current && !values.includes(current)) values.unshift(current);
+    return values.map((v) =>
+      `<option value="${esc(v)}"${v === current ? " selected" : ""}>${esc(v)}</option>`).join("");
+  }
+
+  function tsRowHtml(d) {
+    const st = rowState(d);
+    const sha = d.sources?.frame_sha16s?.[0];
+    const frameUrl = sha
+      ? `/api/timesheet/frame/${encodeURIComponent(sha)}?date=${state.tsSelectedDay}`
+      : null;
+    const conf = d.confidence || 0;
+    const confCls = conf >= 0.8 ? "hi" : conf >= 0.6 ? "mid" : "low";
+    const vocab = state.tsVocab || { projects: [], categories: [] };
+    const lock = st === "approved" ? " disabled" : "";
+    return `
+      <div class="ts-row ${st}" data-id="${d.id}">
+        <div class="ts-line1">
+          <span class="ts-time">${fmtClock(d.start)}–${fmtClock(d.end)}</span>
+          <span class="ts-dur">${fmtDur((new Date(d.end) - new Date(d.start)) / 1000)}</span>
+          <span class="conf ${confCls}" title="analysis confidence">conf ${Math.round(conf * 100)}%</span>
+          <span class="state ${st}">${st}</span>
+          ${frameUrl
+            ? `<a class="thumb" href="${frameUrl}" target="_blank" rel="noopener" title="evidence frame"><img src="${frameUrl}" alt="" loading="lazy" onerror="this.parentNode.style.display='none'"></a>`
+            : '<span class="thumb" style="display:none"></span>'}
+        </div>
+        <div class="ts-grid">
+          <select class="f-project" title="project"${lock}>${optionsWithCurrent(vocab.projects, d.project_guess)}</select>
+          <select class="f-category" title="category"${lock}>${optionsWithCurrent(vocab.categories, d.category)}</select>
+          <input class="f-task" title="task" placeholder="task" value="${esc(d.task || "")}"${lock}>
+          <input class="f-comment" title="comment" placeholder="comment" value="${esc(d.comment || "")}"${lock}>
+        </div>
+        <div class="ts-actions">
+          <button class="ts-btn ts-save" disabled${lock}>Save</button>
+          ${st === "approved" ? "" : '<button class="ts-btn primary ts-approve">Approve</button>'}
+        </div>
+      </div>`;
+  }
+
+  function renderTsRows() {
+    const el = $("#ts-rows");
+    const title = $("#ts-day-title");
+    const sub = $("#ts-day-sub");
+    const approveAll = $("#ts-approve-all");
+    if (!state.tsDraft) { el.innerHTML = '<div class="empty">Loading…</div>'; return; }
+    const drafts = state.tsDraft.drafts || [];
+    const counts = { draft: 0, reviewed: 0, approved: 0 };
+    for (const d of drafts) counts[rowState(d)]++;
+    title.textContent = state.tsSelectedDay;
+    sub.textContent = `${counts.draft} draft · ${counts.reviewed} reviewed · ${counts.approved} approved` +
+      (state.tsDraft.status?.generated_at ? ` · compiled ${fmtClock(state.tsDraft.status.generated_at)}` : "");
+    approveAll.disabled = !drafts.length || counts.approved === drafts.length;
+    if (!drafts.length) {
+      el.innerHTML = '<div class="empty">No draft activities for this day. POST /api/timesheet/draft?date=' +
+        esc(state.tsSelectedDay) + ' compiles one from the captured data.</div>';
+      return;
+    }
+    el.innerHTML = drafts.map(tsRowHtml).join("");
+    el.querySelectorAll(".ts-row").forEach((row) => {
+      const id = Number(row.dataset.id);
+      const proj = row.querySelector(".f-project");
+      const cat = row.querySelector(".f-category");
+      const task = row.querySelector(".f-task");
+      const comment = row.querySelector(".f-comment");
+      const saveBtn = row.querySelector(".ts-save");
+      const approveBtn = row.querySelector(".ts-approve");
+      const markDirty = () => {
+        state.tsDirty.set(id, {
+          project_guess: proj.value,
+          category: cat.value,
+          task: task.value,
+          comment: comment.value,
+        });
+        saveBtn.disabled = false;
+      };
+      [proj, cat, task, comment].forEach((c) => c.addEventListener("input", markDirty));
+      saveBtn.addEventListener("click", () => saveRow(id));
+      if (approveBtn) approveBtn.addEventListener("click", () => approveRow(id));
+    });
+  }
+
+  async function saveRow(id) {
+    const edit = state.tsDirty.get(id);
+    if (!edit) return;
+    try {
+      await sendJSON(`/api/timesheet/draft/${id}`, "PUT", edit);
+      state.tsDirty.delete(id);
+      await Promise.all([refreshTsDay(), refreshTsDays()]);
+    } catch (e) {
+      showError(e.message);
+    }
+  }
+
+  async function approveRow(id) {
+    try {
+      await sendJSON("/api/timesheet/approve", "POST", { date: state.tsSelectedDay, draft_id: id });
+      await Promise.all([refreshTsDay(), refreshTsDays()]);
+    } catch (e) {
+      showError(e.message);
+    }
+  }
+
+  async function approveAllDay() {
+    try {
+      await sendJSON("/api/timesheet/approve", "POST", { date: state.tsSelectedDay });
+      await Promise.all([refreshTsDay(), refreshTsDays()]);
+    } catch (e) {
+      showError(e.message);
+    }
+  }
+
+  function tsExport() {
+    const month = $("#ts-export-month").value;
+    if (/^\d{4}-\d{2}$/.test(month)) window.location.href = "/api/timesheet/export?month=" + month;
+  }
+
+  async function refreshTsQuestions() {
+    try {
+      state.tsQuestions = await fetchJSON("/api/timesheet/questions?status=open");
+    } catch (e) {
+      state.tsQuestions = null;
+    }
+    renderTsQuestions();
+  }
+
+  function renderTsQuestions() {
+    const el = $("#ts-questions");
+    const qs = state.tsQuestions?.questions || [];
+    if (!state.tsQuestions) { el.innerHTML = '<div class="hint">Open questions are not reachable right now.</div>'; return; }
+    if (!qs.length) {
+      el.innerHTML = '<div class="hint">No open questions — the analysis was confident, or nothing was captured yet.</div>';
+      return;
+    }
+    el.innerHTML = qs.map((q) => `
+      <div class="q-card" data-id="${q.id}">
+        <div class="q-text">${esc(q.question)}</div>
+        <div class="q-meta">${esc(q.day)} · asked ${fmtAge((Date.now() - new Date(q.created_at)) / 1000)}</div>
+        ${(q.evidence || []).length ? `<div class="q-thumbs">${q.evidence.map((f) =>
+          `<a href="${f.url}" target="_blank" rel="noopener" title="evidence frame"><img src="${f.url}" alt="" loading="lazy" onerror="this.parentNode.style.display='none'"></a>`).join("")}</div>` : ""}
+        <div class="q-answer">
+          <input placeholder="your answer" aria-label="answer for question ${q.id}">
+          <button class="ts-btn primary">Answer</button>
+        </div>
+      </div>`).join("");
+    el.querySelectorAll(".q-card").forEach((card) => {
+      const id = Number(card.dataset.id);
+      const input = card.querySelector("input");
+      const btn = card.querySelector("button");
+      const send = async () => {
+        const text = input.value.trim();
+        if (!text) return;
+        btn.disabled = true;
+        try {
+          await sendJSON(`/api/timesheet/questions/${id}/answer`, "POST", { answer: text });
+          await refreshTsQuestions();
+        } catch (e) {
+          showError(e.message);
+          btn.disabled = false;
+        }
+      };
+      btn.addEventListener("click", send);
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+    });
+  }
+
+  async function refreshTsStyle() {
+    try {
+      state.tsStyle = await fetchJSON("/api/timesheet/style");
+      state.tsStyleAvailable = true;
+    } catch (e) {
+      state.tsStyleAvailable = false;
+    }
+    renderTsStyle();
+  }
+
+  function renderTsStyle() {
+    const el = $("#ts-style");
+    if (state.tsStyleAvailable === false) {
+      // Graceful degradation: the style backend (issue #53) is not on this
+      // hub yet — the panel re-appears as soon as the endpoint exists.
+      el.innerHTML = '<div class="hint">Style settings are not on this hub yet (GET /api/timesheet/style → 404). They land with the style-prompt backend; this panel picks them up automatically after the hub updates.</div>';
+      return;
+    }
+    const s = state.tsStyle || { style_prompt: "", style_examples: [] };
+    el.innerHTML = `
+      <div class="ts-style">
+        <label class="lbl-note" for="ts-style-prompt">Style prompt — how generated timesheet text is written (empty = built-in default)</label>
+        <textarea id="ts-style-prompt" placeholder="e.g. concise professional English, verb-first">${esc(s.style_prompt || "")}</textarea>
+        <div class="lbl-note">Few-shot examples (task / comment)</div>
+        <div id="ts-style-examples"></div>
+        <div class="ts-actions" style="justify-content:flex-start">
+          <button class="ts-btn" id="ts-style-add">Add example</button>
+          <button class="ts-btn primary" id="ts-style-save">Save style</button>
+        </div>
+        <div class="note" id="ts-style-note">Applies to the next day compile; frame analyses pick it up after the next hub restart.</div>
+      </div>`;
+    const exWrap = $("#ts-style-examples");
+    const addExample = (ex) => {
+      const row = document.createElement("div");
+      row.className = "ts-ex";
+      row.innerHTML = `
+        <input class="ex-task" placeholder="task example" value="${esc(ex?.task || "")}">
+        <input class="ex-comment" placeholder="comment example" value="${esc(ex?.comment || "")}">
+        <button class="ts-ex-del" title="remove example">remove</button>`;
+      row.querySelector(".ts-ex-del").addEventListener("click", () => row.remove());
+      exWrap.appendChild(row);
+    };
+    (s.style_examples || []).forEach(addExample);
+    $("#ts-style-add").addEventListener("click", () => addExample({}));
+    $("#ts-style-save").addEventListener("click", async () => {
+      // The raw prompt as the owner wrote it — the backend resolves empty
+      // to the built-in default and validates on its side (issue #53).
+      const payload = {
+        style_prompt: $("#ts-style-prompt").value,
+        style_examples: [...exWrap.querySelectorAll(".ts-ex")].map((row) => ({
+          task: row.querySelector(".ex-task").value,
+          comment: row.querySelector(".ex-comment").value,
+        })),
+      };
+      try {
+        // sync to the disk-verified value the PUT returns
+        state.tsStyle = await sendJSON("/api/timesheet/style", "PUT", payload);
+        $("#ts-style-note").textContent = "Saved. Applies to the next day compile; frame analyses pick it up after the next hub restart.";
+      } catch (e) {
+        showError(e.message);
+      }
+    });
+  }
+
   // -------------------------------------------------------------- wiring
 
   function wire() {
     $("#rail-machine").addEventListener("click", () => showView("machine"));
     $("#rail-cal").addEventListener("click", () => showView("cal"));
+    $("#rail-ts").addEventListener("click", () => showView("ts"));
     $("#refresh-btn").addEventListener("click", refreshAll);
     $("#machine-refresh").addEventListener("click", refreshMachines);
+    $("#ts-month-prev").addEventListener("click", () => {
+      state.tsMonthAnchor = new Date(state.tsMonthAnchor.getFullYear(), state.tsMonthAnchor.getMonth() - 1, 1);
+      refreshTsDays();
+    });
+    $("#ts-month-next").addEventListener("click", () => {
+      state.tsMonthAnchor = new Date(state.tsMonthAnchor.getFullYear(), state.tsMonthAnchor.getMonth() + 1, 1);
+      refreshTsDays();
+    });
+    $("#ts-refresh").addEventListener("click", () => {
+      refreshTsDays();
+      refreshTsDay();
+      refreshTsQuestions();
+    });
+    $("#ts-approve-all").addEventListener("click", approveAllDay);
+    $("#ts-export-month").addEventListener("change", (e) => {
+      $("#ts-export-btn").disabled = !/^\d{4}-\d{2}$/.test(e.target.value);
+    });
+    $("#ts-export-btn").addEventListener("click", tsExport);
     $("#device-filter").addEventListener("input", (e) => {
       state.filter = e.target.value.trim().toLowerCase();
       renderDeviceList();
@@ -573,17 +952,17 @@
       }
       if (e.ctrlKey && e.key === "1") { e.preventDefault(); showView("machine"); }
       if (e.ctrlKey && e.key === "2") { e.preventDefault(); showView("cal"); }
+      if (e.ctrlKey && e.key === "3") { e.preventDefault(); showView("ts"); }
     });
-    window.addEventListener("hashchange", () => {
-      showView(location.hash.includes("calendar") ? "cal" : "machine");
-    });
+    window.addEventListener("hashchange", () => showView(viewFromHash()));
   }
 
   function init() {
     wire();
-    showView(location.hash.includes("calendar") ? "cal" : "machine");
-    refreshAll();
-    state.nowTimer = setInterval(refreshAll, 30000);
+    showView(viewFromHash());
+    // machine/calendar auto-refresh; the timesheet view is excluded so a
+    // half-edited review row is never wiped by a timer (manual refresh only)
+    state.nowTimer = setInterval(() => { if (state.view !== "ts") refreshAll(); }, 30000);
     // keep the now-line honest between refreshes
     setInterval(() => { if (state.view === "cal" && state.weekCal) renderWeekGrid(); }, 60000);
   }

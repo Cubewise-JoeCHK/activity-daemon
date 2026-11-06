@@ -231,6 +231,50 @@ async fn ui_index_and_assets_are_served() {
     drop(dir);
 }
 
+#[tokio::test]
+async fn timesheet_view_is_served_in_the_ui_shell() {
+    let (dir, state) = test_state("ui-timesheet");
+    let app = build_router(state);
+
+    // The shell carries the nav entry, the view section and its panels.
+    let res = app.clone().oneshot(get("/")).await.expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let html = body_text(res).await;
+    assert!(
+        html.contains(r#"id="rail-ts""#),
+        "nav entry for the timesheet view"
+    );
+    assert!(html.contains(r#"id="view-ts""#), "timesheet view section");
+    assert!(html.contains(r#"id="ts-questions""#), "questions panel");
+    assert!(html.contains(r#"id="ts-style""#), "style panel");
+    assert!(
+        html.contains(r#"id="ts-export-month""#),
+        "export month picker"
+    );
+
+    // The script wires every timesheet endpoint the page needs (issue #47),
+    // including the style contract of issue #53 (raw prompt in, restart
+    // hint out — the worker only re-reads style on hub restart).
+    let res = app.oneshot(get("/assets/app.js")).await.expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let js = body_text(res).await;
+    for needle in [
+        "/api/timesheet/days",
+        "/api/timesheet/draft?",
+        "/api/timesheet/draft/",
+        "/api/timesheet/approve",
+        "/api/timesheet/vocab",
+        "/api/timesheet/frame/",
+        "/api/timesheet/style",
+        "/api/timesheet/questions?status=open",
+        "/api/timesheet/export?month=",
+        "hub restart",
+    ] {
+        assert!(js.contains(needle), "app.js wires {needle}");
+    }
+    drop(dir);
+}
+
 // -------------------------------------------------------------- /api/machines
 
 #[tokio::test]
