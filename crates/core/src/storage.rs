@@ -337,6 +337,25 @@ impl Db {
         from_ts: Option<&str>,
         to_ts: Option<&str>,
     ) -> Result<Vec<Event>> {
+        self.query_event_rows_in(bucket, device, from_ts, to_ts)?
+            .iter()
+            .map(Event::try_from)
+            .collect::<Result<Vec<Event>>>()
+    }
+
+    /// Row-level variant of [`Db::query_events_in`]: identical filtering and
+    /// ordering, but returns raw [`EventRow`]s (carrying row ids) instead of
+    /// parsed [`Event`]s. The Timesheet AI compiler (issue #45) cites row ids
+    /// as activity evidence sources (`session_ids`), and hub-side refinement
+    /// paths rewrite row payloads in place (draft supersession), which the
+    /// id-less `Event` view cannot express.
+    pub fn query_event_rows_in(
+        &self,
+        bucket: Option<&str>,
+        device: Option<&str>,
+        from_ts: Option<&str>,
+        to_ts: Option<&str>,
+    ) -> Result<Vec<EventRow>> {
         if let Some(bucket) = bucket {
             validate_bucket(bucket)?;
         }
@@ -365,20 +384,34 @@ impl Db {
         if let Some(device) = device {
             bind.push(device.to_string());
         }
-        let mut hits: Vec<(DateTime<FixedOffset>, Event)> = Vec::new();
+        let mut hits: Vec<(DateTime<FixedOffset>, EventRow)> = Vec::new();
         for row in stmt.query_map(params_from_iter(bind.iter()), map_row)? {
             let row = row?;
             let ts = parse_rfc3339(&row.ts_start)?;
             if from.is_some_and(|f| ts < f) || to.is_some_and(|t| ts > t) {
                 continue;
             }
-            hits.push((ts, Event::try_from(&row)?));
+            hits.push((ts, row));
         }
         // `ORDER BY ts_start` is lexicographic, which is wrong across
         // timezone offsets; sort by parsed instant instead (stable, so ties
         // keep the insertion order above).
         hits.sort_by_key(|(ts, _)| *ts);
-        Ok(hits.into_iter().map(|(_, event)| event).collect())
+        Ok(hits.into_iter().map(|(_, row)| row).collect())
+    }
+
+    /// Replace the stored `data` JSON of one event row in place. Hub-side
+    /// refinement writes only: the daily itinerary compiler (issue #45) marks
+    /// superseded drafts this way; events stay append-only everywhere else.
+    /// The JSON string is validated before the write (same rule as insert).
+    /// Returns `false` when the id is unknown, `true` when the row updated.
+    pub fn update_event_data(&self, id: i64, data_json: &str) -> Result<bool> {
+        validate_data_json(data_json)?;
+        let updated = self.conn.execute(
+            "UPDATE events SET data = ?2 WHERE id = ?1",
+            params![id, data_json],
+        )?;
+        Ok(updated > 0)
     }
 
     /// Most recently arrived events, newest first, optionally narrowed to
@@ -1284,6 +1317,58 @@ mod tests {
         // empty refiner name rejected
         assert!(matches!(
             db.set_refiner_cursor("", 1),
+            Err(CoreError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn query_event_rows_in_returns_ids_and_updates_rewrite_data() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let id_a = insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-a",
+            "2026-11-04T09:00:00+08:00",
+            1.0,
+        );
+        let id_b = insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-a",
+            "2026-11-04T10:00:00+08:00",
+            2.0,
+        );
+        insert_for(&db, BUCKET_AFK, "dev-a", "2026-11-04T11:00:00+08:00", 3.0);
+
+        // row-level view carries ids and the same instant ordering
+        let rows = db
+            .query_event_rows_in(Some(BUCKET_WINDOW), None, None, None)
+            .expect("rows");
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![id_a, id_b]
+        );
+        assert_eq!(rows[0].duration_s, 1.0);
+        assert_eq!(rows[1].duration_s, 2.0);
+
+        // update_event_data rewrites the payload, other columns untouched
+        let new_json = r#"{"superseded_by":"batch-2"}"#;
+        assert!(db
+            .update_event_data(id_a, new_json)
+            .expect("update must succeed"));
+        let reread = db
+            .query_event_rows_in(Some(BUCKET_WINDOW), None, None, None)
+            .expect("rows after update");
+        assert_eq!(reread[0].id, id_a);
+        assert_eq!(reread[0].data, new_json);
+        assert_eq!(reread[0].duration_s, 1.0);
+        assert_eq!(reread[0].device, "dev-a");
+        assert_eq!(reread[1].data, "{\"marker\":\"2026-11-04T10:00:00+08:00\"}");
+
+        // unknown id: false, not an error; invalid JSON: rejected before write
+        assert!(!db.update_event_data(999, new_json).expect("unknown id"));
+        assert!(matches!(
+            db.update_event_data(id_b, "{not json"),
             Err(CoreError::Validation(_))
         ));
     }

@@ -111,8 +111,11 @@ impl Default for RetentionConfig {
 #[serde(default)]
 pub struct ServerConfig {
     pub retention: RetentionConfig,
-    /// `[timesheet]` section: month-end export settings (issue #46).
-    pub timesheet: crate::timesheet::TimesheetConfig,
+    /// `[timesheet]` section: the unified Timesheet AI settings
+    /// (refiner-timesheet `TimesheetConfig`, issues #43/#45/#53) - worker
+    /// keys, `use_llm_titles` + `max_block_min`, export `vocab_path`,
+    /// owner style.
+    pub timesheet: refiner_timesheet::TimesheetConfig,
 }
 
 /// Path of the server config file: `ACTIVITY_CONFIG` when set, otherwise

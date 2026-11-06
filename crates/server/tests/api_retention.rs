@@ -40,6 +40,7 @@ fn state_in(dir: &TempDir, retention: RetentionConfig) -> AppState {
         dir.0.join("media"),
         AuthConfig::disabled(),
         retention,
+        refiner_timesheet::TimesheetConfig::default(),
     )
     .expect("test app state")
 }

@@ -42,21 +42,38 @@
 //! as the core event store (the hub store) and follows the core `Db`
 //! pattern: WAL mode, idempotent schema, blocking rusqlite calls under a
 //! mutex, `spawn_blocking` discipline at the call site.
+//!
+//! Daily itinerary compiler (issue #45, [`compiler`]): merges a day's
+//! window sessions, frame analyses, AFK spans and answered questions into
+//! draft activities in bucket `timesheet-draft` (low-confidence spans
+//! become question items instead of activities). Its optional Lemonade
+//! titling call ([`llm`], one per day, fail-soft to heuristic titles;
+//! owner style injected per the issue #53 contract) shares the
+//! `[timesheet]` config section with the worker.
 
+pub mod compiler;
 pub mod config;
 pub mod export;
 pub mod lemonade;
+pub mod llm;
 pub mod sampler;
 pub mod storage;
 pub mod vocab;
 pub mod worker;
 
-pub use config::{SamplingMode, StyleConfig, StyleExample, TimesheetConfig};
+pub use compiler::{
+    current_draft_from_row, heuristic_title, parse_day, plan_day, store_day, ActivitySources,
+    BlockTitle, BlockTitler, DayInput, DayPlan, DraftActivity, HeuristicTitler, MergedBlock,
+    PlannedQuestion, StoredDay, ADJACENT_GAP_MAX_S, BUCKET_FRAME_ANALYSIS, BUCKET_TIMESHEET_DRAFT,
+    CATEGORY_UNCLASSIFIED, PROJECT_UNKNOWN, RESOLVE_MIN_CONFIDENCE,
+};
+pub use config::{SamplingMode, StyleConfig, StyleExample, TimesheetConfig, DEFAULT_STYLE_PROMPT};
 pub use export::{
     build_month_grid, export_month_bytes, parse_month, write_workbook, ExportCell, ExportOutcome,
     BUCKET_TIMESHEET_APPROVED, UPLOAD_HEADERS,
 };
 pub use lemonade::{FrameAnalysis, LemonadeClient, LemonadeError};
+pub use llm::{assemble_prompt, build_request_body, parse_titles, LemonadeTitler};
 pub use sampler::{SampleDecision, SamplerState};
 pub use storage::{EvidenceFrame, StatusFilter, TsQuestion, TsQuestionStatus, TsQuestionStore};
 pub use vocab::CubewiseVocab;

@@ -39,10 +39,21 @@
 //!   activities as a Cubewise offline-template xlsx download (issue #46),
 //!   `Content-Disposition: attachment; filename=timesheet_<month>.xlsx`;
 //!   refused rows are reported on the workbook's Warnings sheet and as
-//!   `X-Export-Warnings`. Follows the open `/api` precedent (issue #44):
-//!   the hub is single-owner and tailnet-only, so owner-facing `/api`
-//!   stays open while device-facing `/ingest` writes keep their token
-//!   guard.
+//!   `X-Export-Warnings`.
+//! - `GET  /api/timesheet/draft?date=YYYY-MM-DD` - the Timesheet AI daily
+//!   itinerary drafts (issue #45): the compiled draft activities for the
+//!   owner's local day, current ones only (superseded drafts hidden), plus
+//!   status (`generated_at`, count).
+//! - `POST /api/timesheet/draft?date=YYYY-MM-DD` - regenerate the day:
+//!   merge window sessions + frame analyses + AFK + answered questions
+//!   into fresh drafts (old drafts marked `superseded_by`), optionally
+//!   consulting Lemonade once for titles/comments (`use_llm_titles`,
+//!   fail-soft to heuristics). Returns the same payload as GET.
+//!
+//! All `/api/timesheet` endpoints follow the open `/api` precedent
+//! (issue #44): the hub is single-owner and tailnet-only, so owner-facing
+//! `/api` stays open while device-facing `/ingest` writes keep their token
+//! guard.
 //!
 //! Auth modes (issue #18; no passwords anywhere):
 //! 1. **tailscale-whois** - when the tailscaled socket
@@ -82,7 +93,9 @@
 //! `status --json` surfaces. Stage 2 (issue #39, `minio` module) moves
 //! verified bundles to the MinIO permanent tier
 //! (`blob.joechowhk.internal`) and deletes the hub copy only after a
-//! verified round trip; nothing is ever deleted from MinIO.
+//! verified round trip; nothing is ever deleted from MinIO. The same
+//! config file carries the `[timesheet]` section (issues #43/#45/#53)
+//! consumed by the worker, the draft endpoints and the export.
 
 pub mod minio;
 pub mod retention;
@@ -101,7 +114,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use refiner_timesheet::TsQuestionStore;
+use refiner_timesheet::{TimesheetConfig, TsQuestionStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest;
@@ -126,9 +139,10 @@ pub struct AppState {
     /// handle; the wiring point for that worker lives in this crate, which
     /// can see the field.
     ts_questions: Arc<Mutex<TsQuestionStore>>,
-    /// Month-end export vocabulary override (`[timesheet] vocab_path`,
-    /// issue #46); `None` = the embedded Cubewise template vocabulary.
-    timesheet_vocab_path: Option<PathBuf>,
+    /// `[timesheet]` config (issues #43/#45/#53): worker settings, LLM
+    /// titling flag, merge cap, Lemonade connection, export vocabulary
+    /// path, owner style. Parsed from the server config file at startup.
+    timesheet: TimesheetConfig,
     media_dir: PathBuf,
     /// Retention paths (`media/` root + `bundles/` output) and settings;
     /// issue #38.
@@ -232,37 +246,32 @@ impl AppState {
             media_dir,
             auth,
             retention::RetentionConfig::default(),
+            TimesheetConfig::default(),
         )
     }
 
     /// [`AppState::open_with_auth`] with explicit retention settings
-    /// (issue #38); production passes the parsed server config.
+    /// (issue #38) and the `[timesheet]` config (issues #43/#45); production
+    /// passes the parsed server config sections.
     pub fn open_with_retention(
         db_path: &Path,
         media_dir: PathBuf,
         auth: AuthConfig,
         retention: retention::RetentionConfig,
+        timesheet: TimesheetConfig,
     ) -> Result<AppState, CoreError> {
         Ok(AppState {
             db: Arc::new(Mutex::new(Db::open_db(db_path)?)),
             // Same file, dedicated `ts_questions` table (WAL keeps the two
             // connections out of each other's way).
             ts_questions: Arc::new(Mutex::new(TsQuestionStore::open(db_path)?)),
-            timesheet_vocab_path: None,
+            timesheet,
             media_dir: media_dir.clone(),
             retention_store: retention::RetentionStore::from_media_dir(&media_dir),
             retention,
             auth,
             started_at: Instant::now(),
         })
-    }
-
-    /// Attach the month-end export vocabulary override path (issue #46;
-    /// production passes the parsed `[timesheet]` config section). `None`
-    /// keeps the embedded Cubewise template vocabulary.
-    pub fn with_timesheet_vocab_path(mut self, vocab_path: Option<PathBuf>) -> AppState {
-        self.timesheet_vocab_path = vocab_path;
-        self
     }
 }
 

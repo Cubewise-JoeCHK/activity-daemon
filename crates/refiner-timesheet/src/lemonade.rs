@@ -15,7 +15,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde_json::json;
 
-use crate::config::{StyleConfig, TimesheetConfig, DEFAULT_STYLE_PROMPT};
+use crate::config::{StyleConfig, TimesheetConfig};
 use crate::vocab::CubewiseVocab;
 
 /// A validated model answer.
@@ -195,11 +195,7 @@ pub fn build_text_prompt(vocab: &CubewiseVocab, style: &StyleConfig) -> String {
 /// #53 injection contract). Empty config falls back to the documented
 /// built-in default.
 pub fn build_style_block(style: &StyleConfig) -> String {
-    let style_prompt = if style.style_prompt.trim().is_empty() {
-        DEFAULT_STYLE_PROMPT
-    } else {
-        style.style_prompt.trim()
-    };
+    let style_prompt = style.effective_prompt();
     let mut block =
         format!("\nWriting style (owner-configured, follow exactly):\n{style_prompt}\n");
     if !style.style_examples.is_empty() {
@@ -306,7 +302,7 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::StyleExample;
+    use crate::config::{StyleExample, DEFAULT_STYLE_PROMPT};
 
     fn vocab() -> CubewiseVocab {
         CubewiseVocab::parse_toml(

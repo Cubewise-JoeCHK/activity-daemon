@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::Local;
-use refiner_timesheet::{TimesheetConfig, WorkerContext};
+use refiner_timesheet::WorkerContext;
 use server::minio::{self, MinioTier};
 use server::retention::{self, RetentionStore};
 use server::{AppState, AuthConfig};
@@ -54,7 +54,9 @@ fn main() {
     // Server config: missing file means all defaults (retention disabled,
     // timesheet defaults); an unparsable file must not start the hub (a
     // typo must not silently run with different settings than the owner
-    // wrote down).
+    // wrote down). `server_config.timesheet` is the one unified
+    // `[timesheet]` section (issues #43/#45/#53): worker, compiler, export
+    // and style all read the same struct.
     let config_path = retention::config_path_or_default(&data_dir);
     let server_config = match retention::load_server_config(&config_path) {
         Ok(cfg) => cfg,
@@ -62,19 +64,6 @@ fn main() {
             eprintln!("{e}");
             std::process::exit(1);
         }
-    };
-    // The `[timesheet]` section of the same file (frame-analysis worker,
-    // issue #43); same typo policy as above - a broken section stops the
-    // hub instead of silently running with defaults.
-    let ts_cfg = match std::fs::read_to_string(&config_path) {
-        Ok(text) => match TimesheetConfig::from_toml_str(&text) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        },
-        Err(_) => TimesheetConfig::default(),
     };
     if !config_path.exists() {
         println!(
@@ -122,8 +111,8 @@ fn main() {
         data_dir.join("media"),
         auth,
         server_config.retention.clone(),
+        server_config.timesheet.clone(),
     )
-    .map(|state| state.with_timesheet_vocab_path(server_config.timesheet.vocab_path.clone()))
     .unwrap_or_else(|e| {
         eprintln!("failed to open central store at {}: {e}", db_path.display());
         std::process::exit(1);
@@ -134,19 +123,19 @@ fn main() {
     // broken vocabulary must not take ingestion down - the worker just
     // does not start (fail-soft), loudly.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let worker = if ts_cfg.enabled {
+    let worker = if server_config.timesheet.enabled {
         match WorkerContext::build(
             state.media_dir().to_path_buf(),
             state.ts_questions(),
-            ts_cfg.clone(),
+            server_config.timesheet.clone(),
         ) {
             Ok(ctx) => {
                 println!(
                     "timesheet worker: enabled (mode {:?}, max/hour {}, lemonade {} model {})",
-                    ts_cfg.sampling_mode,
-                    ts_cfg.max_per_hour,
-                    ts_cfg.lemonade_base_url,
-                    ts_cfg.lemonade_model
+                    server_config.timesheet.sampling_mode,
+                    server_config.timesheet.max_per_hour,
+                    server_config.timesheet.lemonade_base_url,
+                    server_config.timesheet.lemonade_model
                 );
                 Some((state.db_handle(), ctx, shutdown_rx))
             }

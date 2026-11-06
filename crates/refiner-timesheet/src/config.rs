@@ -1,5 +1,5 @@
-//! `[timesheet]` configuration section for the hub server (issue #43, ADR
-//! addendum on #16).
+//! `[timesheet]` configuration section for the hub server (issues #43/#45,
+//! ADR addendum on #16).
 //!
 //! The server binary resolves the config file (default
 //! `$ACTIVITY_DATA/config.toml`, `ACTIVITY_CONFIG` overrides) and hands the
@@ -12,12 +12,21 @@
 //! refuses to start) - a typo must not silently run with different
 //! settings than the owner wrote down.
 //!
-//! Style ([timesheet.style], issue #53): the owner decides HOW generated
-//! timesheet text is written. `style_prompt` is free text injected into
-//! every prompt after the builder's internal instructions; `style_examples`
-//! are few-shot `{task, comment}` pairs. Empty means the documented
-//! built-in default. The GET/PUT API and config write-back live in #53 -
-//! this crate only reads the section.
+//! One section serves every Timesheet AI consumer:
+//!
+//! - the frame-analysis worker (issue #43): `enabled`, the Lemonade
+//!   connection keys, the sampling policy and the vocabulary path;
+//! - the daily itinerary compiler (issue #45): `use_llm_titles` (consult
+//!   Lemonade once per day to title/comment draft blocks, fail-soft to
+//!   heuristic titles) and `max_block_min` (adjacent same-project sessions
+//!   merge up to this cap);
+//! - the month-end export (issue #46): `vocab_path` overrides the embedded
+//!   Cubewise template vocabulary;
+//! - `[timesheet.style]` (issue #53): the owner decides HOW generated
+//!   timesheet text is written. `style_prompt` is free text injected into
+//!   every prompt after the builder's internal instructions;
+//!   `style_examples` are few-shot `{task, comment}` pairs. Empty means the
+//!   documented built-in default.
 
 use std::path::{Path, PathBuf};
 
@@ -35,16 +44,18 @@ pub const DEFAULT_DEVICE_NAME: &str = "activity-hub";
 pub const DEFAULT_STYLE_PROMPT: &str =
     "Concise professional English, verb-first, no personal data beyond what the activity needs.";
 
-/// Top-level `[timesheet]` section (issue #43).
+/// Top-level `[timesheet]` section (issues #43/#45).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TimesheetConfig {
-    /// Worker on/off. Default on per the ADR (event-driven frame analysis):
-    /// while Lemonade is unreachable the worker just backs off (fail-soft).
+    /// Frame-analysis worker on/off. Default on per the ADR (event-driven
+    /// frame analysis): while Lemonade is unreachable the worker just backs
+    /// off (fail-soft).
     pub enabled: bool,
-    /// Base URL of the Lemonade server's OpenAI-compatible API. From the
-    /// hub container this is the Windows host's tailnet address (wired in
-    /// deployment, issue #49); the default targets a same-host Lemonade.
+    /// Base URL of the Lemonade server's OpenAI-compatible API, shared by
+    /// the worker (issue #43) and the daily titling call (issue #45). From
+    /// the hub container this is the Windows host's tailnet address (wired
+    /// in deployment, issue #49); the default targets a same-host Lemonade.
     pub lemonade_base_url: String,
     /// Vision-capable model id served by Lemonade.
     pub lemonade_model: String,
@@ -57,7 +68,7 @@ pub struct TimesheetConfig {
     /// in the frame's own timezone offset). 0 disables analysis entirely.
     pub max_per_hour: u32,
     /// Answers below this confidence go to the question queue hand-off
-    /// (issue #44; logged until it lands).
+    /// (issue #44).
     pub confidence_threshold: f64,
     /// Seconds between arrival polls of the store.
     pub poll_interval_s: u64,
@@ -70,8 +81,15 @@ pub struct TimesheetConfig {
     pub backoff_max_s: u64,
     /// Device name stamped on `frame-analysis` events.
     pub device_name: String,
-    /// Optional path overriding the embedded template vocabulary seed.
+    /// Optional path overriding the embedded template vocabulary seed
+    /// (worker analysis and month-end export alike, issue #46).
     pub vocab_path: Option<PathBuf>,
+    /// Issue #45: consult Lemonade once per day to title/comment draft
+    /// blocks. Fail-soft: any Lemonade error falls back to heuristic titles.
+    pub use_llm_titles: bool,
+    /// Adjacent sessions with the same project + category merge up to this
+    /// many minutes (issue #45: "configurable max block", default 2 h).
+    pub max_block_min: u64,
     /// Owner writing style (issue #53).
     pub style: StyleConfig,
 }
@@ -98,6 +116,20 @@ pub struct StyleConfig {
     pub style_examples: Vec<StyleExample>,
 }
 
+impl StyleConfig {
+    /// The effective style prompt: the owner's text when set (trimmed), the
+    /// built-in default otherwise. Every prompt builder resolves the style
+    /// through this method so the fallback rule lives in exactly one place.
+    pub fn effective_prompt(&self) -> &str {
+        let trimmed = self.style_prompt.trim();
+        if trimmed.is_empty() {
+            DEFAULT_STYLE_PROMPT
+        } else {
+            trimmed
+        }
+    }
+}
+
 /// One few-shot style example (issue #53).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StyleExample {
@@ -121,6 +153,8 @@ impl Default for TimesheetConfig {
             backoff_max_s: 300,
             device_name: DEFAULT_DEVICE_NAME.to_string(),
             vocab_path: None,
+            use_llm_titles: true,
+            max_block_min: 120,
             style: StyleConfig::default(),
         }
     }
@@ -153,7 +187,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_the_issue_43_contract() {
+    fn defaults_match_the_issue_43_and_45_contract() {
         let cfg = TimesheetConfig::default();
         assert!(cfg.enabled);
         assert_eq!(cfg.lemonade_base_url, "http://127.0.0.1:11434/v1");
@@ -168,7 +202,28 @@ mod tests {
         assert_eq!(cfg.backoff_max_s, 300);
         assert_eq!(cfg.device_name, "activity-hub");
         assert_eq!(cfg.vocab_path, None);
+        // issue #45
+        assert!(cfg.use_llm_titles);
+        assert_eq!(cfg.max_block_min, 120);
         assert_eq!(cfg.style, StyleConfig::default());
+    }
+
+    #[test]
+    fn empty_style_prompt_resolves_to_builtin_default() {
+        let style = StyleConfig::default();
+        assert_eq!(style.effective_prompt(), DEFAULT_STYLE_PROMPT);
+        // whitespace-only counts as empty
+        let style = StyleConfig {
+            style_prompt: "   ".to_string(),
+            style_examples: vec![],
+        };
+        assert_eq!(style.effective_prompt(), DEFAULT_STYLE_PROMPT);
+        // a custom prompt wins
+        let style = StyleConfig {
+            style_prompt: "German, telegraphic.".to_string(),
+            style_examples: vec![],
+        };
+        assert_eq!(style.effective_prompt(), "German, telegraphic.");
     }
 
     #[test]
@@ -176,7 +231,7 @@ mod tests {
         let cfg = TimesheetConfig::from_toml_str(
             "[timesheet]\nmax_per_hour = 3\ndevice_name = \"hub-x\"\n\n\
              [timesheet.style]\nstyle_prompt = \"Match the owner's tone.\"\n\n\
-             [screen]\ninterval_s = 9\n",
+             [screen]\ninterval_s = 9\n[retention]\nenabled = false\n",
         )
         .expect("parse partial config");
         assert_eq!(cfg.max_per_hour, 3);
@@ -185,6 +240,7 @@ mod tests {
         // untouched fields keep defaults, unrelated sections are ignored
         assert!(cfg.enabled);
         assert_eq!(cfg.lemonade_base_url, DEFAULT_LEMONADE_BASE_URL);
+        assert_eq!(cfg.max_block_min, 120);
     }
 
     #[test]
@@ -210,6 +266,25 @@ mod tests {
             "Fixed 3 rules in the P&L cube"
         );
         assert_eq!(cfg.style.style_examples[1].comment, "");
+    }
+
+    #[test]
+    fn compiler_keys_parse_alongside_worker_keys() {
+        // Real config spelling: #45's compiler keys next to #43's worker
+        // keys, `[timesheet.style]` under the `[timesheet]` table.
+        let cfg = TimesheetConfig::from_toml_str(
+            "[timesheet]\nuse_llm_titles = false\nmax_block_min = 90\n\
+             lemonade_base_url = \"http://lemonade:11434/v1\"\n\n\
+             [timesheet.style]\nstyle_prompt = \"Bullet style, no prose.\"\n",
+        )
+        .expect("parse compiler config");
+        assert!(!cfg.use_llm_titles);
+        assert_eq!(cfg.max_block_min, 90);
+        assert_eq!(cfg.lemonade_base_url, "http://lemonade:11434/v1");
+        assert_eq!(cfg.style.effective_prompt(), "Bullet style, no prose.");
+        // worker keys keep their defaults
+        assert!(cfg.enabled);
+        assert_eq!(cfg.lemonade_model, DEFAULT_LEMONADE_MODEL);
     }
 
     #[test]
