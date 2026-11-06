@@ -1,8 +1,20 @@
 # Data pipeline plan (v0.2+)
 
 Raw events and media land in the central store on WSL (v0.1 collection).
-Everything below is refinement stages that run there; none of it changes the
-raw data.
+Raw media then follows the lifecycle below; the stages after it are
+refinements that run on the hub and never change the raw data.
+
+## Raw-data lifecycle (v1.2)
+
+```
+client capture -> upload -> delete-on-ack -> hub raw -> monthly tar.zst
+    -> 365d hot on hub -> MinIO permanent (blob.joechowhk.internal)
+```
+
+The decisions behind every step (pass-through client, budgets as
+upload-failure backstop, the zero-redundancy-after-ack trade-off) live in
+the Media section of docs/needs.md - the source of truth. Events and
+derived artifacts are exempt: they stay on the hub permanently.
 
 ## Timesheet / summaries (v0.2)
 
