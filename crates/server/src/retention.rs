@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use activity_core::CoreError;
+use refiner_timesheet::TimesheetConfig;
 
 /// Media kinds in retention scope (issue #38: frames + audio only). Other
 /// kinds under `media/` are never bundled and never deleted.
@@ -100,6 +101,11 @@ impl Default for RetentionConfig {
 #[serde(default)]
 pub struct ServerConfig {
     pub retention: RetentionConfig,
+    /// `[timesheet]` section (issue #45): LLM titling flag, merge cap,
+    /// Lemonade connection (shared keys parsed defensively until #43's
+    /// config definition lands - reconcile on merge), owner style
+    /// (issue #53).
+    pub timesheet: TimesheetConfig,
 }
 
 /// Path of the server config file: `ACTIVITY_CONFIG` when set, otherwise

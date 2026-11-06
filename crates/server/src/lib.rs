@@ -38,6 +38,15 @@
 //!   Follows the open `/api` precedent (issue #44): the hub is
 //!   single-owner and tailnet-only, so owner-facing `/api` stays open
 //!   while device-facing `/ingest` writes keep their token guard.
+//! - `GET  /api/timesheet/draft?date=YYYY-MM-DD` - the Timesheet AI daily
+//!   itinerary drafts (issue #45): the compiled draft activities for the
+//!   owner's local day, current ones only (superseded drafts hidden), plus
+//!   status (`generated_at`, count).
+//! - `POST /api/timesheet/draft?date=YYYY-MM-DD` - regenerate the day:
+//!   merge window sessions + frame analyses + AFK + answered questions
+//!   into fresh drafts (old drafts marked `superseded_by`), optionally
+//!   consulting Lemonade once for titles/comments (`use_llm_titles`,
+//!   fail-soft to heuristics). Returns the same payload as GET.
 //!
 //! Auth modes (issue #18; no passwords anywhere):
 //! 1. **tailscale-whois** - when the tailscaled socket
@@ -68,7 +77,8 @@
 //! are bundled into `bundles/<YYYY-MM>.tar.zst` once they age beyond the
 //! hot window (`[retention]` in the server config file, disabled by
 //! default); `GET /api/retention` reports the stats the client's
-//! `status --json` surfaces.
+//! `status --json` surfaces. The same config file carries the
+//! `[timesheet]` section (issue #45/#53) consumed by the draft endpoints.
 
 pub mod retention;
 pub mod timesheet;
@@ -86,7 +96,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use refiner_timesheet::TsQuestionStore;
+use refiner_timesheet::{TimesheetConfig, TsQuestionStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest;
@@ -116,6 +126,10 @@ pub struct AppState {
     /// issue #38.
     retention_store: retention::RetentionStore,
     retention: retention::RetentionConfig,
+    /// `[timesheet]` config (issue #45): LLM titling flag, merge cap,
+    /// Lemonade connection, owner style (issue #53). Read from the server
+    /// config file at startup; #53's style PUT may reload it later.
+    timesheet: TimesheetConfig,
     auth: AuthConfig,
     /// When this state was constructed (= hub process start in production);
     /// surfaces as `hub.uptime_s` in the web UI's machine view.
@@ -193,16 +207,19 @@ impl AppState {
             media_dir,
             auth,
             retention::RetentionConfig::default(),
+            TimesheetConfig::default(),
         )
     }
 
     /// [`AppState::open_with_auth`] with explicit retention settings
-    /// (issue #38); production passes the parsed server config.
+    /// (issue #38) and the `[timesheet]` config (issue #45); production
+    /// passes the parsed server config sections.
     pub fn open_with_retention(
         db_path: &Path,
         media_dir: PathBuf,
         auth: AuthConfig,
         retention: retention::RetentionConfig,
+        timesheet: TimesheetConfig,
     ) -> Result<AppState, CoreError> {
         Ok(AppState {
             db: Arc::new(Mutex::new(Db::open_db(db_path)?)),
@@ -212,6 +229,7 @@ impl AppState {
             media_dir: media_dir.clone(),
             retention_store: retention::RetentionStore::from_media_dir(&media_dir),
             retention,
+            timesheet,
             auth,
             started_at: Instant::now(),
         })

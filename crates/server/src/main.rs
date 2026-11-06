@@ -99,6 +99,7 @@ fn main() {
         data_dir.join("media"),
         auth,
         server_config.retention.clone(),
+        server_config.timesheet,
     )
     .unwrap_or_else(|e| {
         eprintln!("failed to open central store at {}: {e}", db_path.display());

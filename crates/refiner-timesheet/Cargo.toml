@@ -12,3 +12,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Lemonade titling (issue #45): small blocking HTTP client, same crate and
+# feature set as the sync forwarder (plain loop, builds on Windows + Linux).
+ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+# Config-section tests parse [timesheet] TOML bodies (same major as the
+# server/core config parsers).
+toml = "1"
