@@ -64,9 +64,8 @@ pub mod worker;
 pub use compiler::{
     current_draft_from_row, heuristic_title, parse_day, plan_day, store_day,
     superseded_question_ids, ActivitySources, BlockTitle, BlockTitler, DayInput, DayPlan,
-    DraftActivity, HeuristicTitler, MergedBlock, PlannedQuestion, StoredDay, ADJACENT_GAP_MAX_S,
-    BUCKET_FRAME_ANALYSIS, BUCKET_TIMESHEET_DRAFT, CATEGORY_UNCLASSIFIED, PROJECT_UNKNOWN,
-    RESOLVE_MIN_CONFIDENCE,
+    DraftActivity, HeuristicTitler, MergedBlock, PlannedQuestion, StoredDay, BUCKET_FRAME_ANALYSIS,
+    BUCKET_TIMESHEET_DRAFT, CATEGORY_UNCLASSIFIED, PROJECT_UNKNOWN, RESOLVE_MIN_CONFIDENCE,
 };
 pub use config::{SamplingMode, StyleConfig, StyleExample, TimesheetConfig, DEFAULT_STYLE_PROMPT};
 pub use export::{

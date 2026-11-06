@@ -18,9 +18,14 @@
 //!   connection keys, the sampling policy and the vocabulary path;
 //! - the daily itinerary compiler (issue #45): `use_llm_titles` (consult
 //!   Lemonade once per day to title/comment draft blocks, fail-soft to
-//!   heuristic titles), `max_block_min` (adjacent same-project sessions
-//!   merge up to this cap) and `classify_window_s` (issue #63: how far the
-//!   nearest frame analysis may sit from a session and still classify it);
+//!   heuristic titles) and `max_block_min` (blocks split at this cap);
+//!   since issue #67 the compiler segments FIRST (adjacent sessions with
+//!   gaps up to `segment_gap_s` form contiguous work blocks) and then
+//!   classifies each block by majority vote over its attached analyses;
+//!   `classify_window_s` (issue #63: how far an analysis may sit from a
+//!   session and still attach to it) feeds that vote;
+//!   `daily_question_cap` (issues #64/#67: at most this many grey-stretch
+//!   questions per day, beyond it one aggregate summary question);
 //! - the month-end export (issue #46): `vocab_path` overrides the embedded
 //!   Cubewise template vocabulary;
 //! - `[timesheet.style]` (issue #53): the owner decides HOW generated
@@ -88,17 +93,26 @@ pub struct TimesheetConfig {
     /// Issue #45: consult Lemonade once per day to title/comment draft
     /// blocks. Fail-soft: any Lemonade error falls back to heuristic titles.
     pub use_llm_titles: bool,
-    /// Adjacent sessions with the same project + category merge up to this
-    /// many minutes (issue #45: "configurable max block", default 2 h).
+    /// Contiguous work blocks split at this many minutes (issue #45:
+    /// "configurable max block", default 2 h; a single session longer than
+    /// the cap is never split).
     pub max_block_min: u64,
-    /// How far in seconds the nearest frame analysis may sit from a
-    /// session's span and still classify it (issue #63, default 600 s):
-    /// one keyframe classifies the surrounding minutes instead of only the
-    /// single short session containing its instant, so flip-flopping
-    /// adjacent classifications stop fragmenting the day into sub-minute
-    /// drafts. Sessions with no analysis inside this window stay
-    /// unclassified (grey question hand-off).
+    /// How far in seconds an analysis may sit from a session's span and
+    /// still attach to it (issue #63, default 600 s). Attached analyses
+    /// feed the per-block majority vote (issue #67); sessions with no
+    /// analysis inside this window contribute none.
     pub classify_window_s: u64,
+    /// Segment-then-classify (issue #67, default 300 s): adjacent window
+    /// sessions whose gap is at most this many seconds - and covered by no
+    /// AFK span - segment into one contiguous work block. Larger gaps stay
+    /// separate blocks (the unexplained time would silently vanish inside
+    /// a merged block).
+    pub segment_gap_s: u64,
+    /// Daily cap on grey-stretch questions (issues #64/#67, default 5):
+    /// the first N unclassified stretches of a day get one question each,
+    /// beyond the cap the remaining stretches fold into one aggregate
+    /// summary question.
+    pub daily_question_cap: u32,
     /// Owner writing style (issue #53).
     pub style: StyleConfig,
 }
@@ -165,6 +179,8 @@ impl Default for TimesheetConfig {
             use_llm_titles: true,
             max_block_min: 120,
             classify_window_s: 600,
+            segment_gap_s: 300,
+            daily_question_cap: 5,
             style: StyleConfig::default(),
         }
     }
@@ -217,6 +233,9 @@ mod tests {
         assert_eq!(cfg.max_block_min, 120);
         // issue #63
         assert_eq!(cfg.classify_window_s, 600);
+        // issue #67
+        assert_eq!(cfg.segment_gap_s, 300);
+        assert_eq!(cfg.daily_question_cap, 5);
         assert_eq!(cfg.style, StyleConfig::default());
     }
 
@@ -312,6 +331,23 @@ mod tests {
         let untouched = TimesheetConfig::from_toml_str("[timesheet]\nmax_block_min = 90\n")
             .expect("parse without classify_window_s");
         assert_eq!(untouched.classify_window_s, 600);
+    }
+
+    #[test]
+    fn segment_and_question_cap_keys_parse_alongside_compiler_keys() {
+        // Issues #64/#67's segment-then-classify keys sit next to the
+        // compiler keys and parse like them; untouched keys keep defaults.
+        let cfg = TimesheetConfig::from_toml_str(
+            "[timesheet]\nsegment_gap_s = 120\ndaily_question_cap = 3\nmax_block_min = 90\n",
+        )
+        .expect("parse segment keys");
+        assert_eq!(cfg.segment_gap_s, 120);
+        assert_eq!(cfg.daily_question_cap, 3);
+        assert_eq!(cfg.max_block_min, 90);
+        let untouched = TimesheetConfig::from_toml_str("[timesheet]\nmax_block_min = 90\n")
+            .expect("parse without segment keys");
+        assert_eq!(untouched.segment_gap_s, 300);
+        assert_eq!(untouched.daily_question_cap, 5);
     }
 
     #[test]

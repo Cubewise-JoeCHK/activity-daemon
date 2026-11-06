@@ -1,31 +1,42 @@
 //! Daily itinerary compiler (issue #45, ADR addendum on issue #16): merges
 //! one local day's raw material into draft activities for owner review.
 //!
-//! Contract (issue #45):
+//! Contract (issues #45 + #67, segment-then-classify):
 //! - Window sessions are the duration backbone: every draft activity's
-//!   start/end comes from a session (`ts_start` .. `ts_start + duration_s`).
+//!   start/end comes from sessions (`ts_start` .. `ts_start + duration_s`).
 //!   Gaps and AFK time never become activities.
-//! - Frame analyses classify a session by nearest in time (issue #63): the
-//!   analysis whose instant sits closest to the session's span provides
-//!   `project_guess` / `category` / confidence - distance 0 inside the
-//!   span, the earliest analysis wins distance ties - as long as it is
-//!   within `classify_window_s` (default 600 s) of the span. One keyframe
-//!   therefore classifies the surrounding minutes instead of only the
-//!   single short session containing its instant, so flip-flop chains of
-//!   adjacent classifications coalesce into reviewable blocks; sessions
-//!   with no analysis inside the window stay unclassified (grey question
-//!   hand-off). All in-window analyses' frame hashes join the evidence
-//!   sources.
-//! - Adjacent sessions with the same project + category merge up to
-//!   `max_block_min` (default 2 h). "Adjacent" means the gap between the
-//!   spans is at most [`ADJACENT_GAP_MAX_S`] and no AFK span covers the
-//!   gap; a single session longer than the cap is never split.
-//! - Low-confidence spans that cannot be resolved (no analysis, or best
-//!   confidence below [`RESOLVE_MIN_CONFIDENCE`]) become question items
-//!   through the issue #44 store instead of activities. An already-open
-//!   question whose evidence frame falls inside the span (containment,
-//!   issue #65) or whose text matches is never duplicated; an answered
-//!   one resolves the span with the owner's answer (confidence 1.0).
+//! - SEGMENT FIRST (issue #67 step 1): adjacent window sessions whose gap
+//!   is at most `segment_gap_s` (default 300 s) and covered by no AFK span
+//!   form one contiguous work segment. Sessions overlapping an approved
+//!   span are skipped entirely (issue #60); a session whose question match
+//!   is answered resolves as its own draft and splits the segment around
+//!   it (the owner's own words never merge). Segments split at
+//!   `max_block_min` (default 2 h) on session boundaries; a single session
+//!   longer than the cap is never split.
+//! - THEN CLASSIFY (issue #67 step 2): every analysis within
+//!   `classify_window_s` (default 600 s, issue #63) of a member session's
+//!   span attaches to the segment (distance 0 inside the span, the
+//!   earliest analysis wins distance ties). The segment's classification
+//!   is the plurality vote over the attached analyses' normalized
+//!   `(project, category)` pairs; vote ties go to the pair whose analysis
+//!   sits nearest the segment's midpoint (then the earlier analysis). The
+//!   selected analysis' activity text titles the block and its confidence
+//!   walks the resolution gate: a segment with no attached analyses, or
+//!   whose selected analysis sits below [`RESOLVE_MIN_CONFIDENCE`], stays
+//!   unclassified (grey) - never force-classified.
+//! - One draft per classified segment (issue #67 step 3; the 2 h splitter
+//!   keeps month-end rows sane). Zero sub-minute blocks expected except
+//!   pathological cases.
+//! - Grey segments hand off to the question queue with #64 semantics
+//!   (issue #67 step 4): consecutive grey segments of one run form ONE
+//!   stretch and raise ONE question covering the span, with the attached
+//!   frames from inside the stretch as evidence; at most
+//!   `daily_question_cap` (default 5) such questions per day, beyond the
+//!   cap the remaining stretches fold into one aggregate summary question.
+//!   An already-open question whose evidence frame falls inside the
+//!   stretch (containment, issue #65) or whose text matches is never
+//!   duplicated; an answered one resolves the stretch with the owner's
+//!   answer (confidence 1.0).
 //! - [`store_day`] writes drafts via the normal core insert: bucket
 //!   `timesheet-draft`, `ts_start` = activity start, `duration_s` = length,
 //!   `device` = the day's majority session device, `data` = the activity
@@ -44,9 +55,10 @@
 //! local date of `ts_start`), so a hub in a different timezone than the
 //! device still groups events into the right local day.
 //!
-//! [`plan_day`] holds every merge decision and is deterministic and pure
-//! apart from the injected [`BlockTitler`]; [`store_day`] is the only
-//! writer. Unit tests drive both with fixture event rows.
+//! [`plan_day`] holds every segmentation and classification decision and
+//! is deterministic and pure apart from the injected [`BlockTitler`];
+//! [`store_day`] is the only writer. Unit tests drive both with fixture
+//! event rows.
 
 use std::collections::BTreeMap;
 
@@ -71,12 +83,6 @@ pub const BUCKET_FRAME_ANALYSIS: &str = "frame-analysis";
 /// activities on their own - they become question items instead. Compiler
 /// policy; issue #43 owns the per-frame confidence scale itself.
 pub const RESOLVE_MIN_CONFIDENCE: f64 = 0.6;
-
-/// Two sessions are merge-adjacent when the gap between them is at most
-/// this many seconds (~2 missed poll intervals) and no AFK span covers the
-/// gap. Larger gaps stay separate activities - the unexplained time would
-/// silently vanish inside a merged block.
-pub const ADJACENT_GAP_MAX_S: f64 = 120.0;
 
 /// `project_guess` for spans with no analysis-provided project.
 pub const PROJECT_UNKNOWN: &str = "Unknown";
@@ -401,29 +407,87 @@ fn parse_afk(rows: &[EventRow], day: NaiveDate) -> (Vec<AfkRec>, usize) {
 
 // ---------------------------------------------------------------- planning
 
-/// The compiler's decision for one session.
-struct Candidate {
+/// Per-session analysis attachment (issue #63): every analysis within
+/// `classify_window_s` of the session's span, plus the single nearest one
+/// (distance ties go to the earlier analysis; a same-instant higher-
+/// confidence frame replaces the winner deterministically).
+struct Attachment<'a> {
+    attached: Vec<&'a AnalysisRec>,
+    best: Option<&'a AnalysisRec>,
+}
+
+/// One contiguous work segment (issue #67 step 1): a maximal run of
+/// adjacent segmentable sessions - every internal gap is at most
+/// `segment_gap_s` and covered by no AFK span and no owner-answered
+/// session - split at `max_block_min` on session boundaries.
+struct Segment<'a> {
+    sessions: Vec<&'a SessionRec>,
+    start: DateTime<FixedOffset>,
+    end: DateTime<FixedOffset>,
+    apps: Vec<String>,
+}
+
+/// The majority-vote classification of one segment (issue #67 step 2).
+/// The pool holds every analysis attached to the segment's sessions; the
+/// plurality `(project, category)` pair wins, vote ties go to the pair
+/// whose nearest-to-midpoint analysis is nearest (then the earlier one).
+/// The selected analysis' activity text titles the block and its
+/// confidence walks the resolution gate - a segment whose selected
+/// analysis sits below [`RESOLVE_MIN_CONFIDENCE`] stays unclassified
+/// (grey), never force-classified.
+struct Classification<'a> {
+    project_guess: String,
+    category: String,
+    /// The vote's tiebreak analysis (the winning pair's analysis nearest
+    /// the segment midpoint); `None` only for an empty pool.
+    selected: Option<&'a AnalysisRec>,
+    pool: Vec<&'a AnalysisRec>,
+}
+
+/// A complete owner-answered draft (the answer is the task, confidence
+/// maximal, never merged - the owner's own words). Built per matched
+/// session (session-span question) or per matched grey stretch
+/// (stretch-span question).
+struct AnsweredDraft {
     start: DateTime<FixedOffset>,
     end: DateTime<FixedOffset>,
     project_guess: String,
     category: String,
-    confidence: f64,
     task: String,
     comment: String,
-    /// Winning analysis' activity text and its confidence/timestamp (the
-    /// group title source; comparisons stay deterministic: higher
-    /// confidence wins, earliest timestamp breaks ties).
-    activity: String,
-    activity_confidence: f64,
-    activity_ts: DateTime<FixedOffset>,
     shas: Vec<String>,
     session_ids: Vec<i64>,
     question_ids: Vec<i64>,
-    app: String,
-    /// True when the candidate may merge with same-project neighbours
-    /// (analysis-classified spans). Owner-answered spans never merge:
-    /// their task text is the owner's own words.
-    mergeable: bool,
+}
+
+/// One classified draft block (issue #67 step 3): a segment with its
+/// winning labels, title source and evidence.
+struct Group {
+    start: DateTime<FixedOffset>,
+    end: DateTime<FixedOffset>,
+    project_guess: String,
+    category: String,
+    /// Block confidence: the minimum over all attached analyses (the
+    /// block is only as strong as its weakest evidence).
+    confidence: f64,
+    /// The selected analysis' activity text (what the frames showed).
+    activity: String,
+    apps: Vec<String>,
+    session_count: usize,
+    shas: Vec<String>,
+    session_ids: Vec<i64>,
+}
+
+/// One contiguous grey stretch (issues #64 + #67 step 4): consecutive
+/// grey segments of one run merged into a single question covering the
+/// whole span, with the attached frames from inside it as evidence.
+struct Stretch<'a> {
+    start: DateTime<FixedOffset>,
+    end: DateTime<FixedOffset>,
+    sessions: Vec<&'a SessionRec>,
+    /// Every analysis attached to the stretch's sessions (the evidence
+    /// source and the dedup-arm sha set).
+    pool: Vec<&'a AnalysisRec>,
 }
 
 /// Absolute gap in whole milliseconds between an instant and a session's
@@ -440,17 +504,22 @@ fn span_distance_ms(session: &SessionRec, ts: DateTime<FixedOffset>) -> i64 {
     }
 }
 
-/// Does a question's evidence frame fall inside the session's span
+/// Does a question's evidence frame fall inside the span
 /// (`[start, end)`, the containment [`span_distance_ms`] uses)? The
 /// existing-question dedup's frame-hash arm matches only frames inside
-/// the candidate span (issue #65): since #63 a session cites every
+/// the candidate span - session spans for answered questions, stretch
+/// spans for grey questions (issue #65): since #63 a session cites every
 /// analysis within `classify_window_s`, so a bare hash overlap would let
 /// a far-away open question suppress a real session. A frame whose
 /// timestamp does not parse never matches; the question-text arm still
 /// covers the question.
-fn frame_in_span(session: &SessionRec, frame: &EvidenceFrame) -> bool {
+fn frame_in_span(
+    start: DateTime<FixedOffset>,
+    end: DateTime<FixedOffset>,
+    frame: &EvidenceFrame,
+) -> bool {
     match DateTime::parse_from_rfc3339(&frame.ts) {
-        Ok(ts) => ts >= session.start && ts < session.end,
+        Ok(ts) => ts >= start && ts < end,
         Err(_) => false,
     }
 }
@@ -486,73 +555,288 @@ fn classify_labels(best: Option<&AnalysisRec>) -> (String, String) {
     }
 }
 
-/// A merge group under construction.
-struct Group {
+/// Per-session analysis attachment (issue #63): scan the (ts, sha)-sorted
+/// analyses, keeping every in-window one and the single nearest (distance
+/// ties go to the earlier analysis; a same-instant higher-confidence
+/// frame replaces the winner deterministically).
+fn attach_analyses<'a>(
+    session: &SessionRec,
+    analyses: &'a [AnalysisRec],
+    window_ms: i64,
+) -> Attachment<'a> {
+    let mut attached: Vec<&AnalysisRec> = Vec::new();
+    let mut best: Option<&AnalysisRec> = None;
+    let mut best_distance_ms = i64::MAX;
+    for analysis in analyses {
+        let distance_ms = span_distance_ms(session, analysis.ts);
+        if distance_ms > window_ms {
+            continue;
+        }
+        attached.push(analysis);
+        let wins = match best {
+            None => true,
+            Some(winner) => {
+                distance_ms < best_distance_ms
+                    || (distance_ms == best_distance_ms
+                        && analysis.ts == winner.ts
+                        && analysis.confidence > winner.confidence)
+            }
+        };
+        if wins {
+            best = Some(analysis);
+            best_distance_ms = distance_ms;
+        }
+    }
+    Attachment { attached, best }
+}
+
+/// Maximal runs of adjacent segmentable sessions (issue #67 step 1): a
+/// gap beyond `segment_gap_ms`, an AFK span covering the gap, or an
+/// owner-answered session sitting in the gap starts a new run - the
+/// unexplained time would silently vanish inside a merged block, and a
+/// merged draft would overlap the answered one. Indices arrive in start
+/// order (sessions are sorted).
+fn runs_of<'a>(
+    indices: &[usize],
+    sessions: &'a [SessionRec],
+    segment_gap_ms: i64,
+    afk: &[AfkRec],
+    answered: &[(DateTime<FixedOffset>, DateTime<FixedOffset>)],
+) -> Vec<Vec<&'a SessionRec>> {
+    let mut runs: Vec<Vec<&SessionRec>> = Vec::new();
+    for &index in indices {
+        let session = &sessions[index];
+        let extends_last = match runs.last_mut() {
+            Some(last) => {
+                let previous = *last.last().expect("runs are non-empty");
+                let gap_ms = (session.start - previous.end).num_milliseconds();
+                gap_ms <= segment_gap_ms
+                    && !afk_overlaps(previous.end, session.start, afk)
+                    && !answered_overlaps(previous.end, session.start, answered)
+            }
+            None => false,
+        };
+        if extends_last {
+            runs.last_mut().expect("checked above").push(session);
+        } else {
+            runs.push(vec![session]);
+        }
+    }
+    runs
+}
+
+/// Split a run at `max_block` on session boundaries (greedy: absorb
+/// sessions while the chunk stays within the cap; a single session longer
+/// than the cap is never split). The run is non-empty.
+fn split_at_max_block<'a>(run: &[&'a SessionRec], max_block: Duration) -> Vec<Vec<&'a SessionRec>> {
+    let mut chunks: Vec<Vec<&SessionRec>> = Vec::new();
+    let mut chunk: Vec<&SessionRec> = Vec::new();
+    let mut chunk_start = run[0].start;
+    for session in run {
+        if !chunk.is_empty() && session.end - chunk_start > max_block {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_start = session.start;
+        }
+        chunk.push(session);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// Build one [`Segment`] from a session chunk (session-boundary split of
+/// a run): span from first start to last end, apps distinct in session
+/// order.
+fn build_segment(sessions: Vec<&SessionRec>) -> Segment<'_> {
+    let start = sessions[0].start;
+    let end = sessions
+        .iter()
+        .map(|session| session.end)
+        .max()
+        .unwrap_or(start);
+    let mut apps: Vec<String> = Vec::new();
+    for session in &sessions {
+        if !session.app.is_empty() && !apps.contains(&session.app) {
+            apps.push(session.app.clone());
+        }
+    }
+    Segment {
+        sessions,
+        start,
+        end,
+        apps,
+    }
+}
+
+/// Classify one segment by majority vote (issue #67 step 2). The pool is
+/// the union of the sessions' attachments, deduplicated by (instant,
+/// frame hash) and kept in (ts, sha) order; the plurality normalized pair
+/// wins, vote ties go to the pair whose nearest-to-midpoint analysis is
+/// nearest (then the earlier analysis; full ties keep the lexicographically
+/// first pair - `votes` iterates a sorted map).
+fn classify_segment<'a>(
+    segment: &Segment,
+    analyses: &'a [AnalysisRec],
+    window_ms: i64,
+) -> Classification<'a> {
+    let mut pool: Vec<&AnalysisRec> = Vec::new();
+    for session in &segment.sessions {
+        for analysis in &attach_analyses(session, analyses, window_ms).attached {
+            if !pool
+                .iter()
+                .any(|seen| seen.ts == analysis.ts && seen.frame_sha16 == analysis.frame_sha16)
+            {
+                pool.push(analysis);
+            }
+        }
+    }
+    pool.sort_by_key(|analysis| (analysis.ts, analysis.frame_sha16.clone()));
+
+    if pool.is_empty() {
+        return Classification {
+            project_guess: PROJECT_UNKNOWN.to_string(),
+            category: CATEGORY_UNCLASSIFIED.to_string(),
+            selected: None,
+            pool,
+        };
+    }
+
+    let midpoint = segment.start + (segment.end - segment.start) / 2;
+    // Nearest-to-midpoint analysis within a voter list (ties -> earlier).
+    let nearest_to_midpoint = |voters: &[&'a AnalysisRec]| -> (&'a AnalysisRec, i64) {
+        let mut best = voters[0];
+        let mut best_distance = (best.ts - midpoint).num_milliseconds().abs();
+        for analysis in &voters[1..] {
+            let distance = (analysis.ts - midpoint).num_milliseconds().abs();
+            if distance < best_distance || (distance == best_distance && analysis.ts < best.ts) {
+                best = analysis;
+                best_distance = distance;
+            }
+        }
+        (best, best_distance)
+    };
+
+    let mut votes: BTreeMap<(String, String), Vec<&AnalysisRec>> = BTreeMap::new();
+    for analysis in &pool {
+        let (project, category) = classify_labels(Some(analysis));
+        votes.entry((project, category)).or_default().push(analysis);
+    }
+    let mut winner: Option<((String, String), &'a AnalysisRec)> = None;
+    let mut winner_key: Option<(usize, i64, DateTime<FixedOffset>)> = None;
+    for (pair, voters) in &votes {
+        let (selected, distance) = nearest_to_midpoint(voters);
+        // More votes wins; then nearer midpoint; then earlier analysis.
+        let key = (voters.len(), distance, selected.ts);
+        let wins = match winner_key {
+            None => true,
+            Some(best) => {
+                key.0 > best.0
+                    || (key.0 == best.0 && (key.1 < best.1 || (key.1 == best.1 && key.2 < best.2)))
+            }
+        };
+        if wins {
+            winner_key = Some(key);
+            winner = Some((pair.clone(), selected));
+        }
+    }
+    let (pair, selected) = winner.expect("the vote pool is non-empty");
+    Classification {
+        project_guess: pair.0,
+        category: pair.1,
+        selected: Some(selected),
+        pool,
+    }
+}
+
+/// The `(project, category)` fallback labels for a grey stretch's
+/// answered draft: the pool's analysis nearest the stretch midpoint (ties
+/// -> earlier), Unknown/Uncategorized for an empty pool.
+fn pool_labels(
     start: DateTime<FixedOffset>,
     end: DateTime<FixedOffset>,
-    project_guess: String,
-    category: String,
-    confidence: f64,
-    activity: String,
-    activity_confidence: f64,
-    activity_ts: DateTime<FixedOffset>,
-    shas: Vec<String>,
-    session_ids: Vec<i64>,
-    apps: Vec<String>,
-    session_count: usize,
+    pool: &[&AnalysisRec],
+) -> (String, String) {
+    let midpoint = start + (end - start) / 2;
+    let nearest = pool.iter().copied().min_by_key(|analysis| {
+        (
+            (analysis.ts - midpoint).num_milliseconds().abs(),
+            analysis.ts,
+        )
+    });
+    classify_labels(nearest)
 }
 
-impl Group {
-    fn from_candidate(candidate: &Candidate) -> Group {
-        Group {
-            start: candidate.start,
-            end: candidate.end,
-            project_guess: candidate.project_guess.clone(),
-            category: candidate.category.clone(),
-            confidence: candidate.confidence,
-            activity: candidate.activity.clone(),
-            activity_confidence: candidate.activity_confidence,
-            activity_ts: candidate.activity_ts,
-            shas: candidate.shas.clone(),
-            session_ids: candidate.session_ids.clone(),
-            apps: if candidate.app.is_empty() {
-                Vec::new()
-            } else {
-                vec![candidate.app.clone()]
-            },
-            session_count: 1,
+/// Distinct frame hashes of an analysis list, kept in list (ts) order.
+fn pool_shas(pool: &[&AnalysisRec]) -> Vec<String> {
+    let mut shas: Vec<String> = Vec::new();
+    for analysis in pool {
+        if !shas.contains(&analysis.frame_sha16) {
+            shas.push(analysis.frame_sha16.clone());
         }
     }
+    shas
+}
 
-    fn absorb(&mut self, candidate: &Candidate) {
-        if candidate.end > self.end {
-            self.end = candidate.end;
-        }
-        if candidate.confidence < self.confidence {
-            self.confidence = candidate.confidence;
-        }
-        if candidate.activity_confidence > self.activity_confidence
-            || (candidate.activity_confidence == self.activity_confidence
-                && candidate.activity_ts < self.activity_ts)
-        {
-            self.activity = candidate.activity.clone();
-            self.activity_confidence = candidate.activity_confidence;
-            self.activity_ts = candidate.activity_ts;
-        }
-        extend_distinct(&mut self.shas, &candidate.shas);
-        self.session_ids.extend_from_slice(&candidate.session_ids);
-        if !candidate.app.is_empty() && !self.apps.contains(&candidate.app) {
-            self.apps.push(candidate.app.clone());
-        }
-        self.session_count += 1;
+/// The evidence frames of a grey stretch: attached analyses whose instant
+/// falls inside the stretch (issues #64 + #67: referenced evidence comes
+/// from inside the span), chronological.
+fn stretch_evidence(
+    start: DateTime<FixedOffset>,
+    end: DateTime<FixedOffset>,
+    pool: &[&AnalysisRec],
+) -> Vec<EvidenceFrame> {
+    pool.iter()
+        .filter(|analysis| analysis.ts >= start && analysis.ts < end)
+        .map(|analysis| EvidenceFrame {
+            frame_path: analysis.frame_path.clone(),
+            frame_sha16: analysis.frame_sha16.clone(),
+            ts: analysis.ts.to_rfc3339(),
+        })
+        .collect()
+}
+
+/// Fold consecutive grey segments (with their merged attachment pool)
+/// into one [`Stretch`] (issues #64 + #67 step 4): ONE question per
+/// contiguous grey stretch. The segments are non-empty.
+fn fold_stretch<'a>(segments: Vec<Segment<'a>>, pool: Vec<&'a AnalysisRec>) -> Stretch<'a> {
+    let start = segments[0].start;
+    let end = segments
+        .last()
+        .map(|segment| segment.end)
+        .expect("a stretch has segments");
+    let sessions: Vec<&SessionRec> = segments
+        .into_iter()
+        .flat_map(|segment| segment.sessions.into_iter())
+        .collect();
+    Stretch {
+        start,
+        end,
+        sessions,
+        pool,
     }
 }
 
-fn extend_distinct(target: &mut Vec<String>, source: &[String]) {
-    for sha in source {
-        if !target.contains(sha) {
-            target.push(sha.clone());
-        }
+/// Assemble one classified [`Group`] from a segment and its vote result.
+fn group_from(segment: &Segment, classification: &Classification) -> Group {
+    Group {
+        start: segment.start,
+        end: segment.end,
+        project_guess: classification.project_guess.clone(),
+        category: classification.category.clone(),
+        confidence: classification
+            .pool
+            .iter()
+            .map(|analysis| analysis.confidence)
+            .fold(f64::INFINITY, f64::min),
+        activity: classification
+            .selected
+            .map(|selected| selected.activity.clone())
+            .unwrap_or_default(),
+        apps: segment.apps.clone(),
+        session_count: segment.sessions.len(),
+        shas: pool_shas(&classification.pool),
+        session_ids: segment.sessions.iter().map(|s| s.id).collect(),
     }
 }
 
@@ -561,35 +845,53 @@ fn afk_overlaps(start: DateTime<FixedOffset>, end: DateTime<FixedOffset>, afk: &
     afk.iter().any(|span| span.start < end && span.end > start)
 }
 
-/// Does any session other than the candidate's own overlap the open
-/// interval (start, end)? An owner-answered session between two mergeable
-/// ones breaks their adjacency exactly like AFK does - merging through it
-/// would produce two overlapping drafts.
-fn session_overlaps(
+/// Does any owner-answered span overlap the open interval (start, end)?
+/// An answered session between two segmentable ones breaks their
+/// adjacency exactly like AFK does - segmenting through it would produce
+/// a draft overlapping the answered draft.
+fn answered_overlaps(
     start: DateTime<FixedOffset>,
     end: DateTime<FixedOffset>,
-    sessions: &[SessionRec],
-    exclude_ids: &[i64],
+    answered: &[(DateTime<FixedOffset>, DateTime<FixedOffset>)],
 ) -> bool {
-    sessions.iter().any(|session| {
-        !exclude_ids.contains(&session.id) && session.start < end && session.end > start
-    })
+    answered
+        .iter()
+        .any(|(span_start, span_end)| *span_start < end && *span_end > start)
 }
 
 /// Heuristic question text for an unresolvable session (deterministic: the
 /// same session produces the same text, which doubles as the regeneration
 /// dedup key for frame-less questions).
 fn heuristic_question(session: &SessionRec) -> String {
-    let app = if session.app.is_empty() {
-        "your screen"
-    } else {
-        &session.app
-    };
+    span_question(session.start, session.end, &session.app)
+}
+
+/// Heuristic question text for a span (deterministic dedup key for
+/// frame-less questions; shared by session spans and grey-stretch spans).
+fn span_question(start: DateTime<FixedOffset>, end: DateTime<FixedOffset>, app: &str) -> String {
+    let app = if app.is_empty() { "your screen" } else { app };
     format!(
         "What were you working on {}-{} ({app})?",
-        session.start.format("%H:%M"),
-        session.end.format("%H:%M")
+        start.format("%H:%M"),
+        end.format("%H:%M")
     )
+}
+
+/// The stretch's question text: its span plus the majority session app
+/// (ties break to the smallest name, like the device stamp).
+fn stretch_question(stretch: &Stretch) -> String {
+    let mut apps: BTreeMap<&str, usize> = BTreeMap::new();
+    for session in &stretch.sessions {
+        if !session.app.is_empty() {
+            *apps.entry(session.app.as_str()).or_default() += 1;
+        }
+    }
+    let app = apps
+        .into_iter()
+        .max_by_key(|(name, count)| (*count, std::cmp::Reverse(*name)))
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_default();
+    span_question(stretch.start, stretch.end, &app)
 }
 
 fn sentence_case(text: &str) -> String {
@@ -852,11 +1154,22 @@ pub fn plan_day(
         .filter_map(approved_span)
         .collect();
 
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut planned_questions: Vec<PlannedQuestion> = Vec::new();
     let window_ms = classification_window_ms(cfg);
+    let segment_gap_ms = i64::try_from(cfg.segment_gap_s.saturating_mul(1000)).unwrap_or(i64::MAX);
+    let max_block =
+        Duration::milliseconds((cfg.max_block_min.saturating_mul(60) as i64).saturating_mul(1000));
 
-    for session in &sessions {
+    // Dispositions: approved-overlapping sessions are skipped entirely
+    // (issue #60); sessions whose question match is answered resolve as
+    // their own drafts and split the segmentation around them (the
+    // owner's own words never merge); everything else segments. An open
+    // question match does not split - the session's time belongs to its
+    // block, the question stays open until answered or superseded (issue
+    // #66 closes covered questions on regeneration).
+    let mut answered_drafts: Vec<AnsweredDraft> = Vec::new();
+    let mut answered_spans: Vec<(DateTime<FixedOffset>, DateTime<FixedOffset>)> = Vec::new();
+    let mut segmentable: Vec<usize> = Vec::new();
+    for (index, session) in sessions.iter().enumerate() {
         // Approve-aware regeneration (issue #60): a session overlapping an
         // approved span is already carried by the `timesheet-approved`
         // bucket - re-drafting it would let a second approval duplicate
@@ -869,79 +1182,38 @@ pub fn plan_day(
         {
             continue;
         }
-        // Nearest-in-time classification (issue #63): the analysis closest
-        // to the session's span classifies it while it stays within the
-        // configured window, so one keyframe covers the surrounding
-        // minutes. `attached` gathers every in-window analysis (evidence
-        // sources and question hand-off); `best` is the single nearest one.
-        // Analyses are (ts, sha)-sorted, so scanning keeps the earliest on
-        // distance ties ("ties -> earlier analysis"); a same-instant frame
-        // with higher confidence replaces the winner deterministically.
-        let mut attached: Vec<&AnalysisRec> = Vec::new();
-        let mut best: Option<&AnalysisRec> = None;
-        let mut best_distance_ms = i64::MAX;
-        for analysis in &analyses {
-            let distance_ms = span_distance_ms(session, analysis.ts);
-            if distance_ms > window_ms {
-                continue;
-            }
-            attached.push(analysis);
-            let wins = match best {
-                None => true,
-                Some(winner) => {
-                    distance_ms < best_distance_ms
-                        || (distance_ms == best_distance_ms
-                            && analysis.ts == winner.ts
-                            && analysis.confidence > winner.confidence)
-                }
-            };
-            if wins {
-                best = Some(analysis);
-                best_distance_ms = distance_ms;
-            }
-        }
-        let mut shas: Vec<String> = Vec::new();
-        for analysis in &attached {
-            if !shas.contains(&analysis.frame_sha16) {
-                shas.push(analysis.frame_sha16.clone());
-            }
-        }
+        // Existing questions covering this session: an evidence frame
+        // inside the span (containment, issue #65 - a session cites every
+        // analysis within `classify_window_s`, so a bare hash overlap
+        // would let a question ten minutes away suppress it), or the
+        // deterministic question text (covers frame-less questions).
+        let attachment = attach_analyses(session, &analyses, window_ms);
+        let shas = pool_shas(&attachment.attached);
         let question_text = heuristic_question(session);
-
-        // Existing questions covering this span: an evidence frame inside
-        // the span (containment, issue #65 - after #63 a session cites
-        // every analysis within `classify_window_s`, so a bare hash
-        // overlap would let a question ten minutes away suppress the
-        // session), or the deterministic question text (covers frame-less
-        // questions).
         let matches: Vec<&TsQuestion> = existing_questions
             .iter()
             .filter(|q| {
                 q.day == day_str
-                    && (q
-                        .evidence
-                        .iter()
-                        .any(|f| shas.contains(&f.frame_sha16) && frame_in_span(session, f))
-                        || q.question == question_text)
+                    && (q.evidence.iter().any(|f| {
+                        shas.contains(&f.frame_sha16)
+                            && frame_in_span(session.start, session.end, f)
+                    }) || q.question == question_text)
             })
             .collect();
-        let answered = matches
+        if let Some(question) = matches
             .iter()
             .filter(|q| q.answer.is_some())
             .max_by_key(|q| q.id)
-            .copied();
-        let has_open = matches.iter().any(|q| q.answer.is_none());
-
-        if let Some(question) = answered {
+            .copied()
+        {
             // Owner-confirmed: the answer becomes the task, confidence is
             // maximal, the span never merges (owner's own words stay).
-            let (project, category) = classify_labels(best);
-            candidates.push(Candidate {
+            let (project, category) = classify_labels(attachment.best);
+            answered_drafts.push(AnsweredDraft {
                 start: session.start,
                 end: session.end,
                 project_guess: project,
                 category,
-                confidence: 1.0,
                 task: question
                     .answer
                     .clone()
@@ -952,9 +1224,6 @@ pub fn plan_day(
                     "Owner answer to question #{} (\"{}\")",
                     question.id, question.question
                 ),
-                activity: String::new(),
-                activity_confidence: f64::NEG_INFINITY,
-                activity_ts: session.start,
                 shas,
                 session_ids: vec![session.id],
                 question_ids: matches
@@ -962,79 +1231,153 @@ pub fn plan_day(
                     .filter(|q| q.answer.is_some())
                     .map(|q| q.id)
                     .collect(),
-                app: session.app.clone(),
-                mergeable: false,
             });
-        } else if has_open {
-            // Unresolved and already asked: no activity, no duplicate
-            // question.
-        } else if let Some(analysis) = best.filter(|b| b.confidence >= RESOLVE_MIN_CONFIDENCE) {
-            let (project, category) = classify_labels(best);
-            candidates.push(Candidate {
-                start: session.start,
-                end: session.end,
-                project_guess: project,
-                category,
-                confidence: analysis.confidence,
-                task: String::new(),
-                comment: String::new(),
-                activity: analysis.activity.clone(),
-                activity_confidence: analysis.confidence,
-                activity_ts: analysis.ts,
-                shas,
-                session_ids: vec![session.id],
-                question_ids: Vec::new(),
-                app: session.app.clone(),
-                mergeable: true,
-            });
-        } else {
-            // Unresolvable: hand off to the question queue.
-            planned_questions.push(PlannedQuestion {
-                question: question_text,
-                evidence: attached
-                    .iter()
-                    .map(|a| EvidenceFrame {
-                        frame_path: a.frame_path.clone(),
-                        frame_sha16: a.frame_sha16.clone(),
-                        ts: a.ts.to_rfc3339(),
-                    })
-                    .collect(),
-            });
+            answered_spans.push((session.start, session.end));
+            continue;
+        }
+        segmentable.push(index);
+    }
+
+    // Segment FIRST (issue #67 step 1), then classify each segment by
+    // majority vote (step 2). Consecutive grey segments of one run
+    // accumulate into a single stretch (issue #64); a classified segment
+    // flushes the stretch under construction.
+    let mut groups: Vec<Group> = Vec::new();
+    let mut stretches: Vec<Stretch> = Vec::new();
+    for run in runs_of(
+        &segmentable,
+        &sessions,
+        segment_gap_ms,
+        &afk,
+        &answered_spans,
+    ) {
+        let mut grey: Vec<Segment> = Vec::new();
+        let mut grey_pool: Vec<&AnalysisRec> = Vec::new();
+        for chunk in split_at_max_block(&run, max_block) {
+            let segment = build_segment(chunk);
+            let classification = classify_segment(&segment, &analyses, window_ms);
+            let resolvable = classification
+                .selected
+                .is_some_and(|s| s.confidence >= RESOLVE_MIN_CONFIDENCE);
+            if resolvable {
+                if !grey.is_empty() {
+                    stretches.push(fold_stretch(
+                        std::mem::take(&mut grey),
+                        std::mem::take(&mut grey_pool),
+                    ));
+                }
+                groups.push(group_from(&segment, &classification));
+            } else {
+                // Unresolvable (no attached analyses, or the vote's
+                // selected analysis sits below the gate): grey.
+                grey.push(segment);
+                for analysis in classification.pool {
+                    if !grey_pool.iter().any(|seen| {
+                        seen.ts == analysis.ts && seen.frame_sha16 == analysis.frame_sha16
+                    }) {
+                        grey_pool.push(analysis);
+                    }
+                }
+            }
+        }
+        if !grey.is_empty() {
+            stretches.push(fold_stretch(grey, grey_pool));
         }
     }
 
-    // Merge adjacent mergeable candidates (start-ordered: sessions are) of
-    // the same project + category, up to the max block.
-    let max_block =
-        Duration::milliseconds((cfg.max_block_min.saturating_mul(60) as i64).saturating_mul(1000));
-    let mut groups: Vec<Group> = Vec::new();
-    for candidate in &candidates {
-        if !candidate.mergeable {
-            continue;
+    // Grey stretches -> #64 question semantics (issue #67 step 4): ONE
+    // question per stretch with the frames from inside it; an answered
+    // match resolves the whole stretch, an open match suppresses the
+    // duplicate; beyond the daily cap the remaining stretches fold into
+    // one summary question.
+    let mut planned_questions: Vec<PlannedQuestion> = Vec::new();
+    let mut pending: Vec<&Stretch> = Vec::new();
+    for stretch in &stretches {
+        let question_text = stretch_question(stretch);
+        let shas = pool_shas(&stretch.pool);
+        let matches: Vec<&TsQuestion> = existing_questions
+            .iter()
+            .filter(|q| {
+                q.day == day_str
+                    && (q.evidence.iter().any(|f| {
+                        shas.contains(&f.frame_sha16)
+                            && frame_in_span(stretch.start, stretch.end, f)
+                    }) || q.question == question_text)
+            })
+            .collect();
+        if let Some(question) = matches
+            .iter()
+            .filter(|q| q.answer.is_some())
+            .max_by_key(|q| q.id)
+            .copied()
+        {
+            // The owner's answer resolves the whole stretch.
+            let (project, category) = pool_labels(stretch.start, stretch.end, &stretch.pool);
+            answered_drafts.push(AnsweredDraft {
+                start: stretch.start,
+                end: stretch.end,
+                project_guess: project,
+                category,
+                task: question
+                    .answer
+                    .clone()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                comment: format!(
+                    "Owner answer to question #{} (\"{}\")",
+                    question.id, question.question
+                ),
+                shas,
+                session_ids: stretch.sessions.iter().map(|s| s.id).collect(),
+                question_ids: matches
+                    .iter()
+                    .filter(|q| q.answer.is_some())
+                    .map(|q| q.id)
+                    .collect(),
+            });
+        } else if matches.iter().any(|q| q.answer.is_none()) {
+            // Unresolved and already asked: no duplicate question.
+        } else {
+            pending.push(stretch);
         }
-        let merged_into_last = match groups.last_mut() {
-            Some(last)
-                if last.project_guess == candidate.project_guess
-                    && last.category == candidate.category
-                    && (candidate.start - last.end).num_milliseconds() as f64 / 1000.0
-                        <= ADJACENT_GAP_MAX_S
-                    && !afk_overlaps(last.end, candidate.start, &afk)
-                    && !session_overlaps(
-                        last.end,
-                        candidate.start,
-                        &sessions,
-                        &candidate.session_ids,
-                    )
-                    && (candidate.end - last.start) <= max_block =>
-            {
-                last.absorb(candidate);
-                true
-            }
-            _ => false,
-        };
-        if !merged_into_last {
-            groups.push(Group::from_candidate(candidate));
-        }
+    }
+    let cap = usize::try_from(cfg.daily_question_cap).unwrap_or(usize::MAX);
+    for stretch in pending.iter().take(cap) {
+        planned_questions.push(PlannedQuestion {
+            question: stretch_question(stretch),
+            evidence: stretch_evidence(stretch.start, stretch.end, &stretch.pool),
+        });
+    }
+    if pending.len() > cap {
+        // Beyond the cap: one aggregate summary question (issue #64). Its
+        // text parses as one span (first start .. last end) so the issue
+        // #66 supersession rule can close it once drafts cover the span.
+        let folded = &pending[cap..];
+        let first = folded.first().expect("a non-empty tail");
+        let last = folded.last().expect("a non-empty tail");
+        let spans: Vec<String> = folded
+            .iter()
+            .map(|stretch| {
+                format!(
+                    "{}-{}",
+                    stretch.start.format("%H:%M"),
+                    stretch.end.format("%H:%M")
+                )
+            })
+            .collect();
+        let question = format!(
+            "What were you working on {}-{} ({} unclassified stretches: {})?",
+            first.start.format("%H:%M"),
+            last.end.format("%H:%M"),
+            folded.len(),
+            spans.join(", ")
+        );
+        let evidence: Vec<EvidenceFrame> = folded
+            .iter()
+            .flat_map(|stretch| stretch_evidence(stretch.start, stretch.end, &stretch.pool))
+            .collect();
+        planned_questions.push(PlannedQuestion { question, evidence });
     }
 
     // One titler call for the whole day ("consult Lemonade once per day").
@@ -1080,24 +1423,23 @@ pub fn plan_day(
             }
         })
         .collect();
-    // Owner-answered candidates are already complete drafts.
-    for candidate in &candidates {
-        if !candidate.mergeable {
-            activities.push(DraftActivity {
-                start: candidate.start.to_rfc3339(),
-                end: candidate.end.to_rfc3339(),
-                project_guess: candidate.project_guess.clone(),
-                category: candidate.category.clone(),
-                task: candidate.task.clone(),
-                comment: candidate.comment.clone(),
-                confidence: candidate.confidence,
-                sources: ActivitySources {
-                    frame_sha16s: candidate.shas.clone(),
-                    session_ids: candidate.session_ids.clone(),
-                    question_ids: candidate.question_ids.clone(),
-                },
-            });
-        }
+    // Owner-answered drafts are already complete (session-span and
+    // stretch-span answers alike).
+    for draft in &answered_drafts {
+        activities.push(DraftActivity {
+            start: draft.start.to_rfc3339(),
+            end: draft.end.to_rfc3339(),
+            project_guess: draft.project_guess.clone(),
+            category: draft.category.clone(),
+            task: draft.task.clone(),
+            comment: draft.comment.clone(),
+            confidence: 1.0,
+            sources: ActivitySources {
+                frame_sha16s: draft.shas.clone(),
+                session_ids: draft.session_ids.clone(),
+                question_ids: draft.question_ids.clone(),
+            },
+        });
     }
     activities.sort_by_key(|a| DateTime::parse_from_rfc3339(&a.start).unwrap_or_default());
 
@@ -1497,13 +1839,18 @@ mod tests {
     }
 
     #[test]
-    fn flip_flop_keyframes_coalesce_into_order_of_ten_blocks() {
-        // Pilot-day cadence (issue #63): 10 s poll sessions tiling one
-        // hour, 8 keyframes/hour whose labels flip-flop between two
+    fn flip_flop_labels_majority_vote_into_one_block() {
+        // Pilot-day cadence (issues #63/#67): 10 s poll sessions tiling
+        // one hour, 8 keyframes whose labels flip-flop between two
         // project/category pairs. Containment classified only the ~10 s
-        // session containing each frame (8 sub-minute drafts + ~352
-        // questions); nearest-in-time gives one ~7.5 min block per
-        // keyframe zone - order of ten, no sub-minute draft.
+        // session containing each frame (45 of 52 drafts sub-minute on
+        // the real day); nearest-in-time still left one block per
+        // keyframe zone. Segment-then-classify merges the whole hour and
+        // majority-votes the labels: 4 x (C1234, Consulting) vs
+        // 4 x (C9999, QA) ties, the midpoint tiebreak picks the analysis
+        // nearest the block's midpoint (15:30 - the k=4 frame at exactly
+        // 15:30:00) -> C1234 wins. One draft, zero questions, no
+        // sub-minute slivers.
         let mut rows = Vec::new();
         for k in 0..360 {
             rows.push(poll_session(k + 1, k * 10));
@@ -1524,27 +1871,50 @@ mod tests {
             ));
         }
         let planned = plan(&input_for(rows));
-        assert_eq!(planned.activities.len(), 8, "one block per keyframe zone");
+        assert_eq!(planned.activities.len(), 1, "one majority-vote block");
         assert!(planned.questions.is_empty());
-        for activity in &planned.activities {
-            assert!(
-                span_seconds(activity) >= 60,
-                "sub-minute draft in a flip-flop hour"
-            );
-        }
-        // zones alternate, so neighbours never merge
-        assert_eq!(planned.activities[0].project_guess, "C1234");
-        assert_eq!(planned.activities[1].project_guess, "C9999");
-        assert_eq!(planned.activities[2].project_guess, "C1234");
+        let activity = &planned.activities[0];
+        assert!(span_seconds(activity) >= 60 * 30, "the whole hour drafts");
+        assert_eq!(activity.project_guess, "C1234", "midpoint tiebreak");
+        assert_eq!(activity.category, "Consulting");
+        assert_eq!(activity.sources.session_ids.len(), 360);
+        assert_eq!(activity.sources.frame_sha16s.len(), 8);
     }
 
     #[test]
-    fn pilot_day_burst_stays_bounded_with_sub_minute_exception() {
+    fn plurality_beats_a_minority_zone_inside_a_segment() {
+        // A 2-1 vote: two C1234 frames against one C9999 frame all inside
+        // one contiguous run - the plurality pair wins the block (issue
+        // #67 majority vote), no per-zone split.
+        let input = input_for(vec![
+            poll_session(1, 0),
+            poll_session(2, 10),
+            poll_session(3, 20),
+            poll_session(4, 30),
+            poll_session(5, 40),
+            poll_session(6, 50),
+            offset_analysis(10, 0, "C1234", "Consulting", 0.9),
+            offset_analysis(11, 25, "C9999", "QA", 0.95),
+            offset_analysis(12, 50, "C1234", "Consulting", 0.8),
+        ]);
+        let planned = plan(&input);
+        assert_eq!(planned.activities.len(), 1);
+        assert_eq!(planned.activities[0].project_guess, "C1234");
+        assert_eq!(planned.activities[0].category, "Consulting");
+        // block confidence is the minimum over all attached analyses
+        assert!((planned.activities[0].confidence - 0.8).abs() < 1e-9);
+        assert!(planned.questions.is_empty());
+    }
+
+    #[test]
+    fn pilot_day_burst_loses_the_majority_vote() {
         // The 15:07 pattern from issue #63: a burst of five analyses
         // seconds apart answering five different project/category pairs,
-        // embedded in a calm hour of stable keyframes. The day compiles
-        // to a handful of reviewable blocks; only the burst's flip-flop
-        // slivers stay sub-minute.
+        // embedded in a calm hour of stable keyframes. Nearest-in-time
+        // still produced one sub-minute block per burst zone; segment-
+        // then-classify majority-votes the whole contiguous hour: the 7
+        // calm C1234 votes outvote the five 1-vote burst pairs, the day
+        // compiles to one reviewable block, zero sub-minute drafts.
         let mut rows = Vec::new();
         for k in 0..360 {
             rows.push(poll_session(k + 1, k * 10));
@@ -1577,59 +1947,212 @@ mod tests {
         }
         let planned = plan(&input_for(rows));
         assert!(planned.questions.is_empty());
-        assert_eq!(
-            planned.activities.len(),
-            7,
-            "calm C1234 flank - 5 burst zones - calm C1234 flank"
-        );
-        let projects: Vec<&str> = planned
-            .activities
-            .iter()
-            .map(|a| a.project_guess.as_str())
-            .collect();
-        assert_eq!(
-            projects,
-            vec!["C1234", "C000P021", "C000P001", "C000P027", "C000P001", "C000P027", "C1234"]
-        );
+        assert_eq!(planned.activities.len(), 1, "one block for the hour");
+        assert_eq!(planned.activities[0].project_guess, "C1234");
+        assert_eq!(planned.activities[0].category, "Consulting");
+        assert!(span_seconds(&planned.activities[0]) >= 60 * 30);
         let sub_minute = planned
             .activities
             .iter()
             .filter(|a| span_seconds(a) < 60)
             .count();
-        assert_eq!(sub_minute, 3, "only the burst's middle flip-flop slivers");
+        assert_eq!(sub_minute, 0, "no sub-minute slivers survive the vote");
     }
 
     #[test]
-    fn sessions_beyond_classify_window_stay_grey() {
-        // One keyframe at 15:06:00. The default 600 s window classifies
-        // the surrounding +-10 min; sessions farther out stay unclassified
-        // and go to the question queue (no force-classification).
+    fn a_segment_with_a_frame_classifies_wholly_grey_stays_one_question() {
+        // Segment-then-classify (issue #67): one keyframe inside a
+        // contiguous run classifies the whole segment - the classify
+        // window gates attachment to individual sessions, not the block
+        // extent (nearest-in-time still split 15:00-15:20 into a
+        // classified head and grey tail). A run with no analysis within
+        // the window stays grey as ONE stretch raising ONE question
+        // (issue #64), not one question per ~10 s session.
         let build_rows = || {
             let mut rows = Vec::new();
             for k in 0..120 {
                 rows.push(poll_session(k + 1, k * 10)); // 15:00:00-15:20:00
             }
-            rows.push(offset_analysis(1000, 360, "C1234", "Consulting", 0.9));
+            for k in 0..30 {
+                // A 5-minute grey stretch later in the day (a 55-minute
+                // gap from any frame of the day).
+                rows.push(poll_session(1000 + k, 3600 + k * 10)); // 16:00:00-16:05:00
+            }
+            rows.push(offset_analysis(2000, 360, "C1234", "Consulting", 0.9)); // 15:06:00
             rows
         };
         let planned = plan(&input_for(build_rows()));
-        assert_eq!(planned.activities.len(), 1);
+        assert_eq!(planned.activities.len(), 1, "the 15:00 run classifies");
         let activity = &planned.activities[0];
-        // The window reaches 600 s in both directions: the whole slice up
-        // to 15:16:00 (exactly 600 s after the frame) is classified; the
-        // next session (610 s) is not.
         assert_eq!(activity.start, "2026-11-06T15:00:00+08:00");
-        assert_eq!(activity.end, "2026-11-06T15:16:10+08:00");
-        assert_eq!(planned.questions.len(), 23, "15:16:10-15:20:00 stays grey");
+        assert_eq!(activity.end, "2026-11-06T15:20:00+08:00");
+        assert_eq!(planned.questions.len(), 1, "the grey run asks once");
+        let question = &planned.questions[0];
+        assert!(question.question.contains("16:00-16:05"));
+        assert!(
+            question.evidence.is_empty(),
+            "no frames fall inside the stretch"
+        );
 
-        // A tight window only classifies the frame's immediate surround.
+        // A tight window changes nothing about the classified block: the
+        // frame still attaches to its surrounding sessions and feeds the
+        // segment's vote.
         let mut tight = cfg();
         tight.classify_window_s = 60;
         let planned = plan_day(&input_for(build_rows()), &[], &tight, &HeuristicTitler);
         assert_eq!(planned.activities.len(), 1);
-        assert_eq!(planned.activities[0].start, "2026-11-06T15:04:50+08:00");
-        assert_eq!(planned.activities[0].end, "2026-11-06T15:07:10+08:00");
-        assert_eq!(planned.questions.len(), 106);
+        assert_eq!(planned.activities[0].end, "2026-11-06T15:20:00+08:00");
+        assert_eq!(planned.questions.len(), 1);
+    }
+
+    #[test]
+    fn low_confidence_frames_inside_a_grey_stretch_become_its_evidence() {
+        // Issue #64/#67: a grey stretch (the vote's selected analysis sits
+        // below the gate) cites the frames that fall INSIDE the stretch -
+        // not far-away ones.
+        let mut rows = Vec::new();
+        for k in 0..30 {
+            rows.push(poll_session(k + 1, k * 10)); // 15:00:00-15:05:00
+        }
+        rows.push(offset_analysis(10, 120, "?", "?", 0.3)); // 15:02:00, in-stretch
+        rows.push(offset_analysis(11, 3600, "C1234", "Consulting", 0.3)); // 16:00, outside
+        let planned = plan(&input_for(rows));
+        assert!(planned.activities.is_empty());
+        assert_eq!(planned.questions.len(), 1);
+        assert_eq!(planned.questions[0].evidence.len(), 1, "in-stretch only");
+        assert_eq!(planned.questions[0].evidence[0].frame_sha16, "sha-0010");
+        assert_eq!(
+            planned.questions[0].evidence[0].ts,
+            "2026-11-06T15:02:00+08:00"
+        );
+    }
+
+    #[test]
+    fn grey_stretches_beyond_the_daily_cap_fold_into_one_summary() {
+        // Issue #64 acceptance: a 30-minute grey stretch produces exactly
+        // 1 question; with more stretches than the daily cap the
+        // remainder folds into one aggregate summary question whose span
+        // (first start .. last end) the #66 supersession rule can parse.
+        let build_rows = |count: usize| {
+            let mut rows = Vec::new();
+            // `count` five-minute grey stretches, each 1 h apart, no
+            // analyses anywhere (every stretch is its own run).
+            for n in 0..count {
+                for k in 0..30 {
+                    rows.push(poll_session(
+                        (1000 * (n + 1) + k) as i64,
+                        (n as i64 * 3600) + k as i64 * 10,
+                    ));
+                }
+            }
+            rows
+        };
+        // Under the cap: one question per stretch.
+        let planned = plan(&input_for(build_rows(3)));
+        assert_eq!(planned.questions.len(), 3);
+        assert!(planned.questions[0].question.contains("15:00-15:05"));
+
+        // Beyond the cap (7 stretches, cap 5): 5 questions + 1 summary.
+        let planned = plan(&input_for(build_rows(7)));
+        assert_eq!(planned.questions.len(), 6);
+        let summary = &planned.questions[5];
+        assert!(
+            summary.question.contains("2 unclassified stretches"),
+            "summary names the folded stretch count: {}",
+            summary.question
+        );
+        assert!(
+            summary.question.contains("20:00-20:05"),
+            "summary lists the folded spans: {}",
+            summary.question
+        );
+        // The summary's span parses (first start .. last end) for #66.
+        let span = question_text_span(&TsQuestion {
+            id: 0,
+            day: DAY.to_string(),
+            question: summary.question.clone(),
+            evidence: Vec::new(),
+            status: TsQuestionStatus::Open,
+            answer: None,
+            created_at: String::new(),
+            answered_at: None,
+        });
+        assert_eq!(
+            span,
+            Some(QuestionSpan::Text(
+                NaiveTime::from_hms_opt(20, 0, 0).expect("20:00"),
+                NaiveTime::from_hms_opt(21, 5, 0).expect("21:05")
+            ))
+        );
+
+        // A cap of 0 folds everything into the summary alone.
+        let mut zero = cfg();
+        zero.daily_question_cap = 0;
+        let planned = plan_day(&input_for(build_rows(2)), &[], &zero, &HeuristicTitler);
+        assert_eq!(planned.questions.len(), 1);
+        assert!(planned.questions[0]
+            .question
+            .contains("2 unclassified stretches"));
+    }
+
+    #[test]
+    fn answered_stretch_question_resolves_the_whole_stretch() {
+        // A previously asked stretch question (issue #64 text shape) that
+        // the owner answered resolves the whole stretch as one draft -
+        // the same rule session-span answers have always had.
+        let questions = TsQuestionStore::open_in_memory().expect("store");
+        let question_id = questions
+            .create_question(DAY, "What were you working on 15:00-15:05 (Code.exe)?", &[])
+            .expect("create");
+        questions
+            .answer_question(question_id, "Invoice run for C1234")
+            .expect("answer");
+        let mut rows = Vec::new();
+        for k in 0..30 {
+            rows.push(poll_session(k + 1, k * 10)); // 15:00:00-15:05:00
+        }
+        let input = input_for(rows);
+        let existing = questions.list_questions(StatusFilter::All).expect("list");
+        let planned = plan_day(&input, &existing, &cfg(), &HeuristicTitler);
+        assert!(planned.questions.is_empty(), "answered, not re-asked");
+        assert_eq!(planned.activities.len(), 1, "one draft for the stretch");
+        let activity = &planned.activities[0];
+        assert_eq!(activity.start, "2026-11-06T15:00:00+08:00");
+        assert_eq!(activity.end, "2026-11-06T15:05:00+08:00");
+        assert_eq!(activity.task, "Invoice run for C1234");
+        assert!((activity.confidence - 1.0).abs() < 1e-9);
+        assert_eq!(activity.sources.question_ids, vec![question_id]);
+        assert_eq!(activity.sources.session_ids.len(), 30);
+    }
+
+    #[test]
+    fn open_stretch_question_suppresses_the_duplicate() {
+        // An open stretch question (evidence frame inside the stretch)
+        // suppresses the new question; the stretch stays un-drafted.
+        let questions = TsQuestionStore::open_in_memory().expect("store");
+        questions
+            .create_question(
+                DAY,
+                "What were you working on 15:00-15:05 (Code.exe)?",
+                &[EvidenceFrame {
+                    frame_path: "media/screen/2026/11/06/f10.jpg".to_string(),
+                    frame_sha16: "sha-0010".to_string(),
+                    ts: "2026-11-06T15:02:00+08:00".to_string(),
+                }],
+            )
+            .expect("create");
+        let mut rows = Vec::new();
+        for k in 0..30 {
+            rows.push(poll_session(k + 1, k * 10)); // 15:00:00-15:05:00
+        }
+        // The stretch's own low-confidence analysis (post-#63 every
+        // session within 600 s cites it as evidence).
+        rows.push(offset_analysis(10, 120, "?", "?", 0.3));
+        let input = input_for(rows);
+        let existing = questions.list_questions(StatusFilter::All).expect("list");
+        let planned = plan_day(&input, &existing, &cfg(), &HeuristicTitler);
+        assert!(planned.questions.is_empty(), "no duplicate question");
+        assert!(planned.activities.is_empty(), "grey stretch stays grey");
     }
 
     #[test]
@@ -1984,7 +2507,12 @@ mod tests {
             planned.questions.is_empty(),
             "no new questions for resolved sessions"
         );
-        assert_eq!(planned.activities.len(), 4, "all four sessions draft");
+        // Segment-then-classify (issue #67): the three short sessions
+        // (60-150 s apart) segment into ONE majority-vote block, so two
+        // drafts carry the day. The regression stays pinned: ALL FOUR
+        // session ids still draft - no session vanishes to an open
+        // question.
+        assert_eq!(planned.activities.len(), 2);
         let mut drafted_ids: Vec<i64> = planned
             .activities
             .iter()
