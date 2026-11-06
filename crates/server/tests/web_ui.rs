@@ -3,14 +3,16 @@
 //! pattern. Day-related assertions mirror the server's local-timezone
 //! bucketing; seeded timestamps are mid-day +08:00 instants that land on the
 //! same calendar date in every timezone between UTC and +14 (CI runs UTC,
-//! the owner runs +08).
+//! the owner runs +08). The `/api/machines` summary seeds are anchored to
+//! local midnight (`minutes_into_today`) instead of wall-clock now, so
+//! today-boundary assertions hold at every run time (#54).
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{Local, TimeZone};
+use chrono::{DateTime, Duration, Local, SecondsFormat, TimeZone, Utc};
 use serde_json::{json, Value};
 use server::{build_router, AppState, AuthConfig};
 use tower::ServiceExt;
@@ -77,24 +79,25 @@ fn post_json(uri: &str, value: &Value) -> Request<Body> {
         .expect("request")
 }
 
-/// RFC3339 timestamp for today's server-local date at the given
-/// wall-clock time. Seeding with fixed wall-clock times on the server's
-/// local date keeps every seed on one calendar day no matter when the
-/// test runs; the previous `now - minutes` seeds crossed local midnight
-/// in the first minutes/hours after 00:00 and broke the day-bucketing
-/// assertions (active-today, events-today) once a day.
-fn today_at(hour: u32, minute: u32) -> String {
-    let now = Local::now();
-    let naive = now
+/// Server-local midnight of today. Same DST-tolerant interpretation as the
+/// summary's `map_local` in web.rs: take the earliest on a fall-back, and
+/// fall back to a UTC reading inside a spring-forward gap.
+fn local_midnight() -> DateTime<Local> {
+    let midnight = Local::now()
         .date_naive()
-        .and_hms_opt(hour, minute, 0)
-        .expect("valid wall-clock time");
-    // A fixed offset has no DST transitions, so this always resolves.
-    now.offset()
-        .from_local_datetime(&naive)
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is valid");
+    Local
+        .from_local_datetime(&midnight)
         .earliest()
-        .expect("local wall-clock time resolves")
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        .unwrap_or_else(|| Utc.from_utc_datetime(&midnight).with_timezone(&Local))
+}
+
+/// RFC3339 timestamp `minutes` after local midnight today, so every seed is
+/// unambiguously "today" at any wall-clock run time - unlike now-relative
+/// seeds, which sit on yesterday during the first minutes of the local day.
+fn minutes_into_today(minutes: i64) -> String {
+    (local_midnight() + Duration::minutes(minutes)).to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
 async fn seed(state: &AppState, device: &str, events: Value) {
@@ -209,24 +212,22 @@ async fn machines_reports_per_device_summary_and_feed() {
     let (dir, state) = test_state("machines-summary");
     let app = build_router(state.clone());
 
-    // same-day wall-clock seeds: window sessions (counted as active time),
-    // an AFK span (event, but not active time), a media index row.
-    // Insert order is the arrival order the feed asserts on. The media
-    // timestamp is kept in a variable for the last_seen_age assertion.
-    let media_ts = today_at(10, 0);
+    // midnight-anchored seeds: window sessions (counted as active time), an
+    // AFK span (event, but not active time), a media index row. Batch order
+    // is the arrival order the feed assertions below rely on.
     seed(
         &state,
         "dev-laptop",
         json!([
             window_event(
-                &today_at(11, 45),
+                &minutes_into_today(35),
                 600.0,
                 "Code.exe",
                 "main.rs - activity-daemon"
             ),
-            window_event(&today_at(9, 30), 300.0, "chrome.exe", "MS Graph docs"),
-            afk_span_event(&today_at(1, 30), 2820.0),
-            media_event(&media_ts),
+            window_event(&minutes_into_today(5), 300.0, "chrome.exe", "MS Graph docs"),
+            afk_span_event(&minutes_into_today(120), 2820.0),
+            media_event(&minutes_into_today(10)),
         ]),
     )
     .await;
@@ -254,7 +255,8 @@ async fn machines_reports_per_device_summary_and_feed() {
     assert_eq!(devices[1]["device"], "dev-laptop");
 
     let laptop = &devices[1];
-    // 10 min + 5 min of window sessions today (both seeded after midnight)
+    // 10 min (Code.exe) + 5 min (chrome.exe) of window sessions, all seeded
+    // after today's local midnight - at any wall-clock run time
     let active = laptop["active_today_s"].as_f64().expect("active_today_s");
     assert!(
         (active - 900.0).abs() < 1.0,
@@ -277,17 +279,16 @@ async fn machines_reports_per_device_summary_and_feed() {
     assert_eq!(recent[3]["bucket"], "window-watcher");
     assert_eq!(recent[2]["data"]["app"], "chrome.exe");
     assert_eq!(recent[3]["data"]["app"], "Code.exe");
-    // last arrival = the media row seeded at today_at(10, 0); the expected
-    // age is derived from the same stamp (the server clamps future seeds
-    // to 0, so mirror that)
-    let expected_age = (Local::now().fixed_offset()
-        - chrono::DateTime::parse_from_rfc3339(&media_ts).expect("seed ts"))
-    .num_seconds()
-    .max(0) as f64;
+    // last arrival = the media row seeded 10 minutes into today; the server
+    // clamps the age at 0 while that instant is still ahead of the clock
+    // (runs inside the first ten minutes of the local day)
     let age = laptop["last_seen_age_s"].as_f64().expect("age");
+    let expected_age = (Local::now() - (local_midnight() + Duration::minutes(10)))
+        .num_seconds()
+        .max(0) as f64;
     assert!(
-        (expected_age - 5.0..=expected_age + 60.0).contains(&age),
-        "last seen ~{expected_age} s, got {age}"
+        (age - expected_age).abs() < 60.0,
+        "last seen ~{expected_age} s past its seed, got {age}"
     );
     // the silent device has no today activity
     assert_eq!(devices[0]["events_today"], 0);
