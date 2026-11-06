@@ -13,6 +13,10 @@
 //!   window sessions and AFK spans grouped by day for the behaviour
 //!   calendar. Without `device` the device with the most window events in
 //!   the range wins (single-owner hub: usually every day has exactly one).
+//! - `GET /api/retention` - hub-side media retention stats (issue #38):
+//!   hot raw bytes per kind, bundle count/bytes, cold months still pending,
+//!   and the next scheduled action. Surfaced through the client's
+//!   `status --json`.
 //!
 //! Day boundaries ("today", calendar day bucketing) use the SERVER's local
 //! timezone. A single owner's devices share that timezone, and window
@@ -63,6 +67,7 @@ pub fn web_router() -> Router<AppState> {
         .route("/assets/{file}", get(ui_asset))
         .route("/api/machines", get(api_machines))
         .route("/api/calendar", get(api_calendar))
+        .route("/api/retention", get(api_retention))
 }
 
 // ------------------------------------------------------------------ assets
@@ -388,6 +393,24 @@ fn calendar_payload(
         "to": to.format("%Y-%m-%d").to_string(),
         "days": days,
     }))
+}
+
+// ------------------------------------------------------- GET /api/retention
+
+/// Retention stats (issue #38): a read-only snapshot of the bundling state,
+/// same accounting as the sweeper's dry-run plan.
+async fn api_retention(State(state): State<AppState>) -> Response {
+    let store = state.retention_store.clone();
+    let cfg = state.retention.clone();
+    // Filesystem walk - stays off the async runtime, like every /api read.
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::retention::collect_stats(&store, &cfg, Local::now().date_naive())
+    })
+    .await;
+    match outcome {
+        Ok(stats) => json_response(StatusCode::OK, stats),
+        Err(e) => internal_error(format!("retention task failed: {e}")),
+    }
 }
 
 // ----------------------------------------------------------------- time utils
