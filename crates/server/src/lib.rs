@@ -28,6 +28,16 @@
 //!   for its local copy. The media index row is NOT written here - it
 //!   arrives as an ordinary event via `POST /ingest/events` (file first,
 //!   index row after, ADR rev 5).
+//! - `GET  /api/timesheet/questions?status=open|answered|all` - the
+//!   Timesheet AI question queue (issue #44): questions the frame analysis
+//!   left for the owner, with evidence frame refs. Default filter `open`.
+//! - `GET  /api/timesheet/questions/{id}/evidence/{n}` - the n-th evidence
+//!   frame of a question as JPEG bytes, resolved against the media root.
+//! - `POST /api/timesheet/questions/{id}/answer` - body
+//!   `{"answer": "..."}`; marks the question answered (last write wins).
+//!   Follows the open `/api` precedent (issue #44): the hub is
+//!   single-owner and tailnet-only, so owner-facing `/api` stays open
+//!   while device-facing `/ingest` writes keep their token guard.
 //!
 //! Auth modes (issue #18; no passwords anywhere):
 //! 1. **tailscale-whois** - when the tailscaled socket
@@ -45,7 +55,9 @@
 //!    for probes.
 //!
 //! Storage: core `Db` at `ACTIVITY_DB` (default `./data/activity.db`), media
-//! root at `ACTIVITY_DATA/media` (default `./data/media`).
+//! root at `ACTIVITY_DATA/media` (default `./data/media`). The Timesheet AI
+//! question queue (`refiner-timesheet` crate) opens the same database file:
+//! its `ts_questions` table lives beside the `events` table on the hub.
 //!
 //! Web UI (read-only, `web` module): `GET /` serves the embedded Graphite
 //! UI (machine status + behaviour calendar), backed by `GET /api/machines`
@@ -59,6 +71,7 @@
 //! `status --json` surfaces.
 
 pub mod retention;
+pub mod timesheet;
 pub mod web;
 pub mod whois;
 
@@ -73,6 +86,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use refiner_timesheet::TsQuestionStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest;
@@ -91,6 +105,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone)]
 pub struct AppState {
     db: Arc<Mutex<Db>>,
+    /// Timesheet AI question queue (issue #44): a second connection to the
+    /// same hub SQLite file, owning the `ts_questions` table. The
+    /// frame-analysis worker (issue #43) creates questions through this
+    /// handle; the wiring point for that worker lives in this crate, which
+    /// can see the field.
+    ts_questions: Arc<Mutex<TsQuestionStore>>,
     media_dir: PathBuf,
     /// Retention paths (`media/` root + `bundles/` output) and settings;
     /// issue #38.
@@ -186,6 +206,9 @@ impl AppState {
     ) -> Result<AppState, CoreError> {
         Ok(AppState {
             db: Arc::new(Mutex::new(Db::open_db(db_path)?)),
+            // Same file, dedicated `ts_questions` table (WAL keeps the two
+            // connections out of each other's way).
+            ts_questions: Arc::new(Mutex::new(TsQuestionStore::open(db_path)?)),
             media_dir: media_dir.clone(),
             retention_store: retention::RetentionStore::from_media_dir(&media_dir),
             retention,
@@ -210,6 +233,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .merge(guarded)
         .merge(web::web_router())
+        .merge(timesheet::timesheet_router())
         .with_state(state)
 }
 
@@ -494,7 +518,9 @@ fn normalize_sha256(raw: &str) -> Option<String> {
 
 /// Single path component: non-empty ASCII alphanumerics plus `.` `-` `_`,
 /// never `.` or `..` (rejects path traversal in every route segment).
-fn valid_component(s: &str) -> bool {
+/// Shared with the timesheet evidence resolver, which applies the same
+/// rules to every segment of a stored evidence frame path.
+pub(crate) fn valid_component(s: &str) -> bool {
     if s.is_empty() || s == "." || s == ".." {
         return false;
     }
