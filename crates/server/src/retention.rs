@@ -623,7 +623,9 @@ impl PassReport {
         }
         for (month, files, bytes) in &self.pruned {
             lines.push(format!(
-                "retention: pruned {month} ({files} files, {})",
+                "retention: pruned {month} ({} {}, {})",
+                files,
+                files_word(*files),
                 human_bytes(*bytes)
             ));
         }
@@ -749,16 +751,18 @@ pub fn plan_months(
                 .and_then(|manifest| raws_match_manifest(&manifest, &raws))
             {
                 Ok(()) => format!(
-                    "would delete {} raw files ({}) - bundle already archived and verified",
+                    "would delete {} raw {} ({}) - bundle already archived and verified",
                     raws.len(),
+                    files_word(raws.len()),
                     human_bytes(bytes)
                 ),
                 Err(reason) => format!("would keep raws - bundle verify failed: {reason}"),
             }
         } else {
             format!(
-                "would bundle into bundles/{month}.tar.zst then delete {} raw files ({})",
+                "would bundle into bundles/{month}.tar.zst then delete {} raw {} ({})",
                 raws.len(),
+                files_word(raws.len()),
                 human_bytes(bytes)
             )
         };
@@ -789,9 +793,10 @@ pub fn render_plan(store: &RetentionStore, cfg: &RetentionConfig, today: NaiveDa
     }
     for plan in &plans {
         out.push_str(&format!(
-            "  {}: {} files, {}\n    {}\n",
+            "  {}: {} {}, {}\n    {}\n",
             plan.month,
             plan.files,
+            files_word(plan.files),
             human_bytes(plan.bytes),
             plan.action
         ));
@@ -889,17 +894,19 @@ pub fn collect_stats(
         Some(first) => {
             if store.bundle_path(&first.month).exists() {
                 format!(
-                    "delete {} raw files of {} ({}) - bundle already archived",
+                    "delete {} raw {} of {} ({}) - bundle already archived",
                     first.files,
+                    files_word(first.files as usize),
                     first.month,
                     human_bytes(first.bytes)
                 )
             } else {
                 format!(
-                    "bundle {} into bundles/{}.tar.zst ({} files, {}) then delete raws",
+                    "bundle {} into bundles/{}.tar.zst ({} {}, {}) then delete raws",
                     first.month,
                     first.month,
                     first.files,
+                    files_word(first.files as usize),
                     human_bytes(first.bytes)
                 )
             }
@@ -915,6 +922,15 @@ pub fn collect_stats(
         bundle_bytes,
         months_pending,
         next_action,
+    }
+}
+
+/// Singular/plural for human file-count strings ("1 file", "2 files").
+fn files_word(count: usize) -> &'static str {
+    if count == 1 {
+        "file"
+    } else {
+        "files"
     }
 }
 
@@ -1345,6 +1361,9 @@ mod tests {
             plan.contains("would bundle into bundles/2025-03.tar.zst"),
             "{plan}"
         );
+        // Singular for a single-file month ("1 file", not "1 files").
+        assert!(plan.contains("2025-03: 1 file, "), "{plan}");
+        assert!(plan.contains("then delete 1 raw file ("), "{plan}");
         assert!(plan.contains("hot window kept raw"), "{plan}");
 
         // Disabled retention prints the preview banner.
