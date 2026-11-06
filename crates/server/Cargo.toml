@@ -14,7 +14,13 @@ http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Issue #38: monthly retention bundles are POSIX tar archives, zstd-compressed.
+tar = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "fs", "io-util", "signal", "time"] }
+# Same TOML crate (major) as core's config parser; the server config file
+# carries the `[retention]` section.
+toml = "1"
+zstd = "0.13"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -160,21 +160,70 @@ grows the same value and the forwarder sends the header (wiring in #7).
 
 ## Environment variables (ACTIVITY_*)
 
-| var              | default               | meaning                                                        |
-|------------------|-----------------------|----------------------------------------------------------------|
-| `ACTIVITY_PORT`  | `8080`                | port bound on `0.0.0.0`                                        |
-| `ACTIVITY_DB`    | `./data/activity.db`  | central SQLite store (WAL)                                     |
-| `ACTIVITY_DATA`  | `./data`              | media root; files land under `$ACTIVITY_DATA/media/<kind>/...` |
-| `ACTIVITY_TOKEN` | unset                 | require matching `X-Activity-Token` header on `/ingest`        |
+| var               | default                 | meaning                                                        |
+|-------------------|-------------------------|----------------------------------------------------------------|
+| `ACTIVITY_PORT`   | `8080`                  | port bound on `0.0.0.0`                                        |
+| `ACTIVITY_DB`     | `./data/activity.db`    | central SQLite store (WAL)                                     |
+| `ACTIVITY_DATA`   | `./data`                | media root; files land under `$ACTIVITY_DATA/media/<kind>/...` |
+| `ACTIVITY_TOKEN`  | unset                   | require matching `X-Activity-Token` header on `/ingest`        |
+| `ACTIVITY_CONFIG` | `$ACTIVITY_DATA/config.toml` | server config file (only `[retention]` today)             |
 
 The container image presets `ACTIVITY_PORT=8080`, `ACTIVITY_DB=/data/activity.db`,
 `ACTIVITY_DATA=/data` - keep the volume mounted at `/data` and everything
-persists.
+persists. A missing config file means all defaults; an unparsable one stops
+the hub (a typo must not silently run with different settings).
+
+## Server config: `[retention]` (issue #38)
+
+Finished months of raw screen frames and meeting audio are bundled into
+`bundles/<YYYY-MM>.tar.zst` next to `media/` once they age beyond the hot
+window; that month's raw files are deleted only after the bundle verifies.
+Events in SQLite, transcripts and summaries are exempt - retention only
+ever touches `media/frames/...` and `media/audio/...`. Disabled by default:
+
+```toml
+[retention]
+enabled = true     # default false - nothing is bundled or deleted until this is set
+hot_days = 365     # raw files stay browsable this long (default 365)
+bundle = "monthly" # the only cadence today
+```
+
+Safety contract:
+
+- The sweeper runs inside the server on a daily tick (one pass at startup,
+  then every 24 h). Passes are idempotent and crash-safe: bundles are
+  written to a `.part` file and atomically renamed, so a final path only
+  ever holds a complete archive; a crash mid-prune is completed by the
+  next pass.
+- The bundle's first tar member is `_manifest.json` (every file with size
+  + sha256). Verification (manifest vs archive listing, total bytes,
+  spot-check sample checksums) always runs BEFORE any deletion; a verify
+  failure keeps the raw files, logs the reason and retries next tick.
+- Deletion is targeted per-file removal - no wildcard or recursive shell
+  deletion. A verified bundle also gets a `<bundle>.tar.zst.sha256`
+  sidecar (sha256sum format).
+- `hot_days` and the current month: a month is eligible once it is fully
+  elapsed AND its last day lies strictly beyond the hot window; the
+  current month is never touched.
+
+Preview without touching anything:
+
+```sh
+activity-server --dry-run   # prints months found, sizes, would-bundle/would-delete
+```
+
+`status --json` on a client surfaces the hub state (`GET /api/retention`,
+fetched best-effort): hot bytes by kind, bundle count/bytes, months
+pending, next scheduled action.
 
 ## HTTP API
 
 - `GET /health` -> `{"ok": true, "status": "ok", "version": "...", "events_count": n}`
   (`version` feeds the hub updater, issue #32)
+- `GET /api/retention` -> retention stats (issue #38, read-only, open per
+  the `/api` precedent): `{"enabled", "hot_days", "hot_bytes": {"frames",
+  "audio"}, "bundle_count", "bundle_bytes", "months_pending":
+  [{"month", "files", "bytes"}], "next_action"}`.
 - `POST /ingest/events`
   - body: `{"device": "...", "events": [{"bucket", "timestamp" (RFC3339 with
     offset), "duration_s", "data"} ...]}`
