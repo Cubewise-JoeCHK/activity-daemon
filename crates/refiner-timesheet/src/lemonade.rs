@@ -115,6 +115,10 @@ impl LemonadeClient {
                 "temperature": 0.2,
                 "stream": false,
                 "max_tokens": 512,
+                // Reasoning models (Qwen3.x on Lemonade) put their chain of
+                // thought in `reasoning_content`; on vision calls it can
+                // outlive `max_tokens` and leave `content` empty (#61).
+                "chat_template_kwargs": {"enable_thinking": false},
             }))
             .map_err(|e| LemonadeError::Http(e.to_string()))?;
         let body: serde_json::Value = response

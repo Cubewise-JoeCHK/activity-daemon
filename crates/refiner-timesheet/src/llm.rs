@@ -85,6 +85,9 @@ pub fn build_request_body(prompt: &str, model: &str) -> Value {
     let mut body = json!({
         "temperature": 0,
         "messages": [{"role": "system", "content": prompt}],
+        // Reasoning models (Qwen3.x on Lemonade) put their chain of
+        // thought in `reasoning_content`; keep the titles direct (#61).
+        "chat_template_kwargs": {"enable_thinking": false},
     });
     if !model.trim().is_empty() {
         body["model"] = json!(model.trim());
