@@ -2,9 +2,9 @@
 
 This document is the deployment runbook for the WSL central hub and the
 contract the Windows client forwarder (`activity-sync`) follows when pushing
-data to it. Design context: ADR revisions 3, 5 and 6 on issue #16 (local
-first, file-first upload ordering, central keep-forever archive, Tailscale
-transport, no passwords).
+data to it. Design context: ADR revisions 3, 5, 6 and 12 on issue #16 (local
+first, file-first upload ordering, client media pass-through with
+durability-gated acks, Tailscale transport, no passwords).
 
 ## Topology
 
@@ -15,15 +15,21 @@ Windows client (plain exe, issue #7)                WSL hub (podman container)
   both connected over the tailnet (plain HTTP; encryption + identity = Tailscale)
 ```
 
-- The client is **local-first**: every event and every media file is written
-  locally before anything is forwarded. Nothing in this pipeline deletes
-  client data (rolling retention on the client - issue #5/#6 - only prunes
-  files already synced).
-- The hub is the **archive**: server-side retention defaults to
-  keep-forever (configurable cap if disk ever demands it).
-- **File first, index row after**: for media, the file is uploaded first and
-  only then does the index event go out, so the central index never points
-  at a missing file.
+- The client is **local-first** for events and a **pass-through** for media
+  (sync contract v2, issue #40, ADR rev 12): every event is written locally
+  before it is forwarded, while a media file is deleted locally once the hub
+  has durably accepted both the file (checksum-verified PUT) and its
+  referencing index row. No verified upload, a checksum mismatch, or a
+  rejected row keeps the file untouched, so an unsynced row can never lose
+  its file. The rolling budgets (issue #5/#6) are a backstop for
+  hub-unreachable periods only.
+- The hub is the **archive**: raw media stays hot for 365 days as monthly
+  tar.zst bundles, then moves to the permanent MinIO tier; event rows stay
+  in the central SQLite store indefinitely.
+- **File first, index row after**: for media, the file is uploaded first -
+  acked only after fsync + checksum verification - and only then does the
+  index event go out, so the central index never points at a missing file.
+  Per forwarder round: capture -> upload -> post batch -> delete.
 
 ## Server: build and run (WSL + podman)
 
@@ -236,8 +242,12 @@ pending, next scheduled action.
 - `PUT /ingest/media/{kind}/{YYYY-MM-DD}/{filename}`
   - raw body streamed to `<media_root>/<kind>/<YYYY>/<MM>/<DD>/<filename>`;
     optional `X-SHA256` (lowercase hex) verified after write; mismatch
-    deletes the file and returns 400.
-  - response: `{"stored": "media/<kind>/<Y>/<M>/<D>/<file>", "bytes": n}`.
+    deletes the file and returns 400. The file is fsynced before the ack -
+    the ack verifies the durable write; the client deletes its local copy
+    only after the referencing index batch is also accepted (sync contract
+    v2, issue #40, ADR rev 12).
+  - response: `{"stored": "media/<kind>/<Y>/<M>/<D>/<file>", "bytes": n,
+    "sha256": "<hex of the stored bytes>"}`.
   - path traversal is rejected in every segment (kind/date/filename are
     restricted to ASCII alphanumerics plus `.`, `-`, `_`; date must be
     `YYYY-MM-DD`; `.` and `..` never pass).
@@ -277,12 +287,15 @@ curl -s http://activity-hub:8080/ingest/events \
 - Events keep buffering in the local SQLite `events` table with
   `synced = 0` (bounded batches of 500 per round; a full batch drains
   immediately without waiting for the next interval).
-- Media files keep buffering on disk. **Rolling retention never deletes
-  unsynced files** (ADR rev 5): the forwarder only ever marks a media row
-  synced after BOTH the file upload and the event batch succeeded, and the
-  client retention rules prune synced files only. A media row whose file is
-  missing is skipped and retried later - it is never posted and never
-  marked synced.
+- Media files keep buffering on disk until the hub has durably accepted
+  both the bytes (checksum-verified PUT) and the referencing index row:
+  deletion happens only then (sync contract v2, issue #40, ADR rev 12) - a
+  rejected row keeps its file and retries. During an outage nothing is
+  deleted until the rolling budgets bite - at current capture rates roughly
+  26 days of frames accumulate before eviction begins; the budgets are the
+  outage backstop. Audio retention additionally spares not-yet-synced files
+  (ADR rev 5). A media row whose file is missing is skipped and retried
+  later - it is never posted and never marked synced.
 - Rejected events (server-side 4xx with reasons) stay unsynced and are
   logged each round - nothing is silently dropped; a poison row shows up in
   the client log and can be fixed or removed manually.

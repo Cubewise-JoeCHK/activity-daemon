@@ -313,6 +313,12 @@ async fn media_put_stores_file_in_dated_layout() {
     let v = body_json(res).await;
     assert_eq!(v["stored"], "media/screen/2026/11/04/frame_001.jpg");
     assert_eq!(v["bytes"], "fake-media-bytes".len() as u64);
+    // sync contract v2 (#40): the ack echoes the checksum of the stored
+    // bytes, after the durable write
+    assert_eq!(
+        v["sha256"],
+        "f524f7ac9d9733793e107295719abe1ebf17f5c9de2afae0fc8af7c725d6d4ab"
+    );
 
     let stored = dir
         .0
@@ -344,6 +350,9 @@ async fn media_put_verifies_sha256_and_deletes_on_mismatch() {
     assert_eq!(res.status(), StatusCode::OK);
     let stored_ok = dir.0.join("media/screen/2026/11/04/ok.jpg");
     assert!(stored_ok.exists());
+    // the verified ack echoes the matching checksum (deletion clearance)
+    let ack = body_json(res).await;
+    assert_eq!(ack["sha256"], good);
 
     // uppercase hex is normalized
     let res = app
@@ -355,6 +364,7 @@ async fn media_put_verifies_sha256_and_deletes_on_mismatch() {
         .await
         .expect("oneshot");
     assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_json(res).await["sha256"], good);
     let _ = std::fs::remove_file(dir.0.join("media/screen/2026/11/04/upper.jpg"));
 
     // wrong hash deletes the file and returns 400

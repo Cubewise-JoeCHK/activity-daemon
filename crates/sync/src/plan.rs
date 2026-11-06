@@ -157,6 +157,31 @@ pub fn accepted_row_ids(posted: &[(i64, Event)], ack: &IngestAck) -> Vec<i64> {
         .collect()
 }
 
+/// Server ack for `PUT /ingest/media/{kind}/{date}/{filename}` (sync
+/// contract v2, issue #40):
+/// `{"stored": "media/...", "bytes": n, "sha256": "<lowercase hex>"}`.
+/// `sha256` echoes the checksum of the bytes the hub durably wrote (the
+/// ack is sent only after the fsync). It is optional so a pre-v2 hub (ack
+/// without a checksum) still parses - such an ack is never treated as
+/// verified, so nothing is deleted locally.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MediaPutAck {
+    pub stored: String,
+    pub bytes: u64,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// True when the media PUT ack proves the hub durably stored exactly the
+/// bytes the client hashed: the ack carries a checksum and it matches
+/// `local_sha256_hex` (case-insensitive compare; both sides emit lowercase,
+/// a hand-rolled hub may not).
+pub fn ack_verifies_upload(ack: &MediaPutAck, local_sha256_hex: &str) -> bool {
+    ack.sha256
+        .as_deref()
+        .is_some_and(|sha| sha.eq_ignore_ascii_case(local_sha256_hex))
+}
+
 /// Exponential backoff: `base * 2^attempt`, saturated and capped.
 /// `attempt` starts at 0 (= `base`).
 pub fn backoff_delay(attempt: u32, base: Duration, cap: Duration) -> Duration {
@@ -359,6 +384,42 @@ mod tests {
         };
         let ids = accepted_row_ids(&posted, &ack);
         assert_eq!(ids, vec![7, 8, 10]);
+    }
+
+    #[test]
+    fn media_put_ack_parses_v2_and_v1_bodies() {
+        let v2: MediaPutAck = serde_json::from_str(
+            r#"{"stored":"media/screen/2026/11/03/f.jpg","bytes":10,
+                "sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"}"#,
+        )
+        .expect("v2 ack");
+        assert_eq!(
+            v2.sha256.as_deref(),
+            Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+        // pre-v2 hub: no checksum in the ack
+        let v1: MediaPutAck =
+            serde_json::from_str(r#"{"stored":"media/x","bytes":1}"#).expect("v1 ack");
+        assert_eq!(v1.sha256, None);
+        assert!(serde_json::from_str::<MediaPutAck>("{\"bytes\":1}").is_err());
+    }
+
+    #[test]
+    fn ack_verifies_upload_rules() {
+        let local = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let ack = |sha: Option<&str>| MediaPutAck {
+            stored: "media/x".to_string(),
+            bytes: 5,
+            sha256: sha.map(str::to_string),
+        };
+        assert!(ack_verifies_upload(&ack(Some(local)), local));
+        assert!(ack_verifies_upload(
+            &ack(Some(&local.to_ascii_uppercase())),
+            local
+        ));
+        // wrong checksum, missing checksum: never verified
+        assert!(!ack_verifies_upload(&ack(Some(&"0".repeat(64))), local));
+        assert!(!ack_verifies_upload(&ack(None), local));
     }
 
     #[test]

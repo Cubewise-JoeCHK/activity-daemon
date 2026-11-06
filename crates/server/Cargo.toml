@@ -23,4 +23,7 @@ toml = "1"
 zstd = "0.13"
 
 [dev-dependencies]
+# Sync contract v2 integration tests (#40): the real client forwarder
+# against the real hub router over loopback HTTP.
+activity-sync = { path = "../sync" }
 tower = { version = "0.5", features = ["util"] }

@@ -21,9 +21,13 @@
 //!   `<media_root>/<kind>/<YYYY>/<MM>/<DD>/<filename>`. Optional
 //!   `X-SHA256` header (lowercase hex): when present the stored bytes are
 //!   verified after the write and a mismatch deletes the file and returns
-//!   400. Response: `{"stored": "media/...", "bytes": n}`. The media index
-//!   row is NOT written here - it arrives as an ordinary event via
-//!   `POST /ingest/events` (file first, index row after, ADR rev 5).
+//!   400. The ack is durability-gated (sync contract v2, issue #40): the
+//!   file is fsynced BEFORE the response and the ack echoes the stored
+//!   bytes' checksum, `{"stored": "media/...", "bytes": n, "sha256":
+//!   "<hex>"}` - the client treats this verified ack as deletion clearance
+//!   for its local copy. The media index row is NOT written here - it
+//!   arrives as an ordinary event via `POST /ingest/events` (file first,
+//!   index row after, ADR rev 5).
 //!
 //! Auth modes (issue #18; no passwords anywhere):
 //! 1. **tailscale-whois** - when the tailscaled socket
@@ -448,11 +452,17 @@ async fn ingest_media(
     }
     drop(file);
 
+    // The checksum of the durably stored bytes, computed while streaming.
+    // Sync contract v2 (issue #40): the ack only leaves here - after the
+    // fsync above - and echoes this value so the client can verify the
+    // write before deleting its local copy. An ack before the durable
+    // write is a contract violation.
+    let actual_sha = format!("{:x}", sha2::Sha256::finalize(hasher));
+
     // Optional integrity check: on mismatch the file is deleted and the
     // client retries later (the index row never made it here).
     if let Some(expected) = expected_sha {
-        let actual = format!("{:x}", sha2::Sha256::finalize(hasher));
-        if actual != expected {
+        if actual_sha != expected {
             let _ = tokio::fs::remove_file(&dest).await;
             return bad_request("sha256 mismatch: file deleted");
         }
@@ -467,7 +477,10 @@ async fn ingest_media(
         .and_then(|s| s.to_str())
         .unwrap_or("media");
     let rel = format!("{media_root}/{kind}/{year}/{month}/{day}/{filename}");
-    json_response(StatusCode::OK, json!({ "stored": rel, "bytes": bytes }))
+    json_response(
+        StatusCode::OK,
+        json!({ "stored": rel, "bytes": bytes, "sha256": actual_sha }),
+    )
 }
 
 /// Validate and lowercase a sha256 header value.
