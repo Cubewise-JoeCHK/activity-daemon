@@ -111,7 +111,8 @@ pub struct StatusReport {
 
 /// Hub-side media retention snapshot (issue #38), fetched from
 /// `GET /api/retention` on the configured hub. Mirror of the server
-/// payload; deserializes loosely so additive server fields stay harmless.
+/// payload; deserializes loosely so additive server fields stay harmless
+/// (defaults keep old hubs parseable against new mirrors and vice versa).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetentionStats {
     pub enabled: bool,
@@ -124,6 +125,14 @@ pub struct RetentionStats {
     pub months_pending: Vec<HubPendingMonth>,
     /// What the hub's next daily sweeper pass would do.
     pub next_action: String,
+    /// Per-bundle tier (`hot` / `minio`), issue #39; empty from hubs
+    /// predating it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<HubBundle>,
+    /// MinIO permanent tier block (issue #39); absent from hubs predating
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minio: Option<HubMinio>,
 }
 
 /// One pending month on the hub ([`RetentionStats`]).
@@ -132,6 +141,50 @@ pub struct HubPendingMonth {
     pub month: String,
     pub files: u64,
     pub bytes: u64,
+}
+
+/// One bundle and its storage tier (issue #39).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HubBundle {
+    /// `YYYY-MM`.
+    pub month: String,
+    pub bytes: u64,
+    /// `hot` (hub-local) or `minio` (permanent tier).
+    pub tier: String,
+}
+
+/// Hub MinIO permanent tier block (issue #39). Names only - no credentials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HubMinio {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub secure: bool,
+    /// Months with a verified remote copy, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moved_months: Vec<String>,
+    #[serde(default)]
+    pub moved_bytes: u64,
+    /// The most recent move attempt (any month).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_move: Option<HubMoveOutcome>,
+    /// Present when the hub's move state file was unreadable (paused).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_warning: Option<String>,
+}
+
+/// The most recent move attempt outcome ([`HubMinio`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HubMoveOutcome {
+    pub month: String,
+    /// `moved` | `failed`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// RFC3339 instant of that attempt.
+    pub at: String,
+    pub attempts: u64,
 }
 
 /// Best-effort fetch of the hub's retention stats. `None` on any failure
@@ -372,8 +425,34 @@ pub(crate) fn render_human(report: &StatusReport) -> String {
                 retention.next_action
             )
         };
+        // MinIO permanent tier (issue #39): moved volume + last failure.
+        let mut minio_note = String::new();
+        if let Some(minio) = &retention.minio {
+            if minio.enabled {
+                if minio.moved_months.is_empty() {
+                    minio_note.push_str(", minio tier on (nothing moved yet)");
+                } else {
+                    minio_note.push_str(&format!(
+                        ", {} month(s) in minio ({})",
+                        minio.moved_months.len(),
+                        human_bytes(minio.moved_bytes)
+                    ));
+                }
+                if let Some(last) = &minio.last_move {
+                    if last.status == "failed" {
+                        minio_note.push_str(&format!(
+                            ", last move {} failed (retry next tick)",
+                            last.month
+                        ));
+                    }
+                }
+                if let Some(warning) = &minio.state_warning {
+                    minio_note.push_str(&format!(", minio paused ({warning})"));
+                }
+            }
+        }
         out.push_str(&format!(
-            "  hub:      {} bundle(s) ({}), {pending}, retention {state}\n",
+            "  hub:      {} bundle(s) ({}), {pending}, retention {state}{minio_note}\n",
             retention.bundle_count,
             human_bytes(retention.bundle_bytes)
         ));
@@ -587,11 +666,51 @@ mod tests {
             next_action:
                 "bundle 2025-10 into bundles/2025-10.tar.zst (12 files, 2.0 KB) then delete raws"
                     .to_string(),
+            bundles: vec![
+                HubBundle {
+                    month: "2025-10".to_string(),
+                    bytes: 4096,
+                    tier: "hot".to_string(),
+                },
+                HubBundle {
+                    month: "2025-09".to_string(),
+                    bytes: 2048,
+                    tier: "minio".to_string(),
+                },
+            ],
+            minio: Some(HubMinio {
+                enabled: true,
+                endpoint: "blob.joechowhk.internal".to_string(),
+                bucket: "activity-archive".to_string(),
+                prefix: "bundles".to_string(),
+                secure: false,
+                moved_months: vec!["2025-09".to_string()],
+                moved_bytes: 2048,
+                last_move: Some(HubMoveOutcome {
+                    month: "2025-09".to_string(),
+                    status: "moved".to_string(),
+                    error: None,
+                    at: "2026-11-07T04:00:00+08:00".to_string(),
+                    attempts: 1,
+                }),
+                state_warning: None,
+            }),
         });
         let json = serde_json::to_string(&with_hub).expect("serialize");
         assert!(json.contains("\"retention\""), "{json}");
+        assert!(json.contains("\"tier\":\"minio\""), "{json}");
         let back: StatusReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, with_hub);
+
+        // A hub payload predating #39 (no bundles/minio fields) parses.
+        let legacy = r#"{"enabled":true,"hot_days":365,"hot_bytes":{"frames":1024},
+            "bundle_count":1,"bundle_bytes":4096,"months_pending":[],
+            "next_action":"none"}"#;
+        let mut legacy_hub = report.clone();
+        legacy_hub.retention =
+            Some(serde_json::from_str::<RetentionStats>(legacy).expect("legacy payload"));
+        let legacy_text = render_human(&legacy_hub);
+        assert!(legacy_text.contains("1 bundle(s)"), "{legacy_text}");
 
         // Human rendering carries the essentials.
         let text = render_human(&with_hub);
@@ -599,6 +718,7 @@ mod tests {
         assert!(text.contains("2 bundle(s)"), "{text}");
         assert!(text.contains("1 month(s) pending"), "{text}");
         assert!(text.contains("on (hot 365d)"), "{text}");
+        assert!(text.contains("1 month(s) in minio"), "{text}");
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
     }
 }
