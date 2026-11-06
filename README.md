@@ -51,10 +51,14 @@ First `run` creates a fully commented config template with defaults at
 (`server_url`, `device_name`) once the hub exists.
 
 - **Where data lives**: `%APPDATA%\activity-daemon\data` by default -
-  `activity.db` (SQLite, WAL), `media\frames` + `media\audio` (rolling
-  retention budgets), `heartbeat` (liveness, rewritten every 5 s),
-  `daemon.lock` (single instance), `daemon.log` (+ `logs\audio.log`).
-  Stop with Ctrl+C; the window watcher flushes its open session.
+  `activity.db` (SQLite, WAL), `media\frames` + `media\audio` (media
+  pass-through, sync contract v2 #40: files are deleted locally as soon as
+  the hub acks a checksum-verified durable write), `heartbeat` (liveness,
+  rewritten every 5 s), `daemon.lock` (single instance), `daemon.log` (+
+  `logs\audio.log`). Stop with Ctrl+C; the window watcher flushes its open
+  session. The rolling budgets (`screen.max_total_mb` / `max_age_days`,
+  audio equivalents) are a backstop only now: they matter while the hub is
+  unreachable, not in day-to-day operation.
 - **Multi-monitor**: `screen.monitors` picks what the frame watcher
   captures - `all` (default, one frame per connected monitor) or
   `primary` (the v0.1 behavior). Frame files carry their monitor in the
