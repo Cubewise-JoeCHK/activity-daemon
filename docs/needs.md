@@ -39,7 +39,7 @@ need; the owner queries when filling a timesheet or reflecting.
   volume.
 - The owner works across multiple monitors; screen frames must cover every
   screen actually in use, not just the primary one. Monitors share the
-  client-side retention budget.
+  client-side retention budget (backstop; primary retention is hub-side).
 - Media lifecycle (owner decision v1.2, 2026-11-06): captured media uploads
   to the hub promptly and the client deletes its local copy on ack
   (delete-on-ack pass-through). Client rolling budgets survive only as an
