@@ -1,7 +1,11 @@
 //! The forwarder loop: fetch unsynced rows, upload media files first, post
-//! the event batch, mark accepted rows synced. Errors are retried with
-//! exponential backoff plus jitter; the shutdown flag is polled every
-//! 250 ms so the daemon (issue #7) can stop the thread promptly.
+//! the event batch, mark accepted rows synced. Media pass-through (sync
+//! contract v2, issue #40): a media file is deleted from the client as soon
+//! as the hub's PUT ack proves a durable, checksum-verified write; no ack,
+//! a checksum mismatch, or any other error leaves the file untouched for
+//! the retry. Errors are retried with exponential backoff plus jitter; the
+//! shutdown flag is polled every 250 ms so the daemon (issue #7) can stop
+//! the thread promptly.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,8 +15,8 @@ use activity_core::Db;
 
 use crate::http::{HttpClient, HttpError, RetryClass, UreqClient};
 use crate::plan::{
-    accepted_row_ids, apply_jitter, backoff_delay, build_post_batch, join_url, plan_rows,
-    sha256_file_hex, IngestAck, PlannedRow, BACKOFF_BASE, MAX_BACKOFF,
+    accepted_row_ids, ack_verifies_upload, apply_jitter, backoff_delay, build_post_batch, join_url,
+    plan_rows, sha256_file_hex, IngestAck, MediaPutAck, PlannedRow, BACKOFF_BASE, MAX_BACKOFF,
 };
 use crate::settings::SyncSettings;
 
@@ -189,7 +193,13 @@ pub fn sync_once(
     Ok(stats)
 }
 
-/// Hash and stream one media file to the hub.
+/// Hash and stream one media file to the hub, then apply the sync v2
+/// pass-through (issue #40): on a verified ack - the hub fsynced exactly
+/// these bytes and echoes their checksum - the local file is deleted
+/// (targeted per-file removal). An ack whose checksum mismatches fails the
+/// upload (the row stays unsynced and retries); a pre-v2 ack without a
+/// checksum counts as uploaded but keeps the file (deletion requires a
+/// verified checksum).
 fn upload_media_file(
     client: &dyn HttpClient,
     settings: &SyncSettings,
@@ -201,9 +211,42 @@ fn upload_media_file(
     let handle =
         std::fs::File::open(file).map_err(|e| format!("cannot open {}: {e}", file.display()))?;
     let url = crate::plan::media_put_url(&settings.server_url, media);
-    client
+    let body = client
         .put_media(&url, &sha_hex, Box::new(handle))
         .map_err(|e| e.to_string())?;
+    let ack: MediaPutAck = serde_json::from_str(&body)
+        .map_err(|e| format!("unparseable media ack from {url}: {e}"))?;
+    if ack_verifies_upload(&ack, &sha_hex) {
+        // Verified: the hub durably holds exactly these bytes - the client
+        // stops being a media archive. A failed removal is logged, not
+        // fatal: the hub copy exists, so the index row must still flow; the
+        // rolling budget backstop will evict the leftover file later.
+        if let Err(e) = std::fs::remove_file(file) {
+            log::warn!(
+                "media uploaded and acked, but {} could not be deleted: {e} - the rolling budget will evict it",
+                file.display()
+            );
+        } else {
+            log::info!(
+                "media uploaded (ack verified), local copy deleted: {}",
+                file.display()
+            );
+        }
+    } else if ack.sha256.is_some() {
+        // A checksum that does NOT match is never deletion clearance: fail
+        // the upload so the row stays unsynced and retries.
+        return Err(format!(
+            "hub ack for {url} is not checksum-verified (ack sha {:?} vs local {sha_hex}) - file retained",
+            ack.sha256
+        ));
+    } else {
+        // Pre-v2 hub (ack without a checksum): the upload counts, the file
+        // stays - an old hub must not stall media sync.
+        log::info!(
+            "media uploaded; hub ack carries no checksum (pre-v2 hub) - file retained: {}",
+            file.display()
+        );
+    }
     Ok(())
 }
 
@@ -230,26 +273,33 @@ fn rand01() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{parse_media_rel_path, MediaRef};
+    use crate::plan::{parse_media_rel_path, to_hex, MediaRef};
     use activity_core::Db;
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// Fake client that records call order and can fail per endpoint.
+    /// Fake client that records call order and can fail per endpoint. The
+    /// media PUT behaves like a sync-v2 hub: it hashes the received bytes
+    /// and echoes their sha256 in the ack - unless an explicit ack body is
+    /// forced (mismatch / pre-v2 ack cases).
     struct FakeClient {
         calls: Mutex<Vec<String>>,
         put_result: Mutex<Option<Result<String, HttpError>>>,
         post_result: Mutex<Option<Result<String, HttpError>>>,
         last_post_body: Mutex<Option<serde_json::Value>>,
+        put_ack_body: Mutex<Option<String>>,
     }
 
     impl FakeClient {
         fn ok() -> FakeClient {
             FakeClient {
                 calls: Mutex::new(Vec::new()),
-                put_result: Mutex::new(Some(Ok("{\"stored\":\"x\",\"bytes\":1}".to_string()))),
+                put_result: Mutex::new(None),
                 post_result: Mutex::new(Some(Ok("{\"accepted\":2,\"rejected\":[]}".to_string()))),
                 last_post_body: Mutex::new(None),
+                put_ack_body: Mutex::new(None),
             }
         }
 
@@ -262,6 +312,14 @@ mod tests {
         fn with_put_error(res: HttpError) -> FakeClient {
             let c = FakeClient::ok();
             *c.put_result.lock().expect("lock") = Some(Err(res));
+            c
+        }
+
+        /// Force the media PUT ack body verbatim (wrong checksum, or a
+        /// pre-v2 hub ack without a checksum).
+        fn with_put_ack_body(body: &str) -> FakeClient {
+            let c = FakeClient::ok();
+            *c.put_ack_body.lock().expect("lock") = Some(body.to_string());
             c
         }
 
@@ -285,17 +343,30 @@ mod tests {
             &self,
             url: &str,
             sha256_hex: &str,
-            _reader: Box<dyn std::io::Read + '_>,
+            mut reader: Box<dyn std::io::Read + '_>,
         ) -> Result<String, HttpError> {
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .map_err(|e| HttpError::transport(e.to_string()))?;
             self.calls
                 .lock()
                 .expect("lock")
                 .push(format!("put {url} {sha256_hex}"));
+            let ack = match &*self.put_ack_body.lock().expect("lock") {
+                Some(forced) => forced.clone(),
+                None => serde_json::json!({
+                    "stored": "x",
+                    "bytes": bytes.len(),
+                    "sha256": to_hex(&Sha256::digest(&bytes)),
+                })
+                .to_string(),
+            };
             self.put_result
                 .lock()
                 .expect("lock")
                 .take()
-                .unwrap_or_else(|| Ok("{\"stored\":\"x\",\"bytes\":1}".to_string()))
+                .unwrap_or(Ok(ack))
         }
     }
 
@@ -375,7 +446,71 @@ mod tests {
         assert_eq!(db.unsynced_count().expect("count"), 0);
         assert_eq!(stats.accepted, 2);
         assert_eq!(stats.uploaded_files, 1);
+        // sync contract v2 (#40): the verified ack deletes the local file
+        assert!(
+            !file_path.exists(),
+            "checksum-verified ack must delete the local media file"
+        );
         let _ = (plain, media);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn mismatched_checksum_ack_keeps_the_file_and_the_row_unsynced() {
+        // A 200 ack carrying the WRONG checksum (broken middlebox / skew):
+        // the client must not delete, and the row must stay unsynced for
+        // retry - only a matching checksum is deletion clearance.
+        let dir = temp_dir("mismatch");
+        let db = Db::open_in_memory().expect("db");
+        insert_plain(&db, "a");
+        let rel = "media/screen/2026/11/03/frame-9.jpg";
+        insert_media(&db, rel);
+        let file_path = dir.join(rel);
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file_path, b"jpeg-bytes").expect("write file");
+
+        let forced = format!(
+            r#"{{"stored":"x","bytes":10,"sha256":"{}"}}"#,
+            "0".repeat(64)
+        );
+        let client = FakeClient::with_put_ack_body(&forced);
+        let settings = SyncSettings::new("http://hub:8080", "laptop");
+        let stats = sync_once(&client, &settings, &db, &dir).expect("round completes");
+
+        assert!(
+            file_path.exists(),
+            "mismatched checksum ack must keep the file"
+        );
+        assert_eq!(stats.uploaded_files, 0, "mismatch counts as not uploaded");
+        assert_eq!(
+            db.unsynced_count().expect("count"),
+            1,
+            "media row stays unsynced, plain event delivered"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn v1_ack_without_checksum_delivers_the_event_but_keeps_the_file() {
+        // Skew: a pre-v2 hub acks without a checksum. The upload counts and
+        // the index row flows (the bytes were accepted), but the local file
+        // is retained - deletion requires a verified checksum.
+        let dir = temp_dir("v1ack");
+        let db = Db::open_in_memory().expect("db");
+        insert_plain(&db, "a");
+        let rel = "media/screen/2026/11/03/frame-10.jpg";
+        insert_media(&db, rel);
+        let file_path = dir.join(rel);
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file_path, b"jpeg-bytes").expect("write file");
+
+        let client = FakeClient::with_put_ack_body(r#"{"stored":"x","bytes":10}"#);
+        let settings = SyncSettings::new("http://hub:8080", "laptop");
+        let stats = sync_once(&client, &settings, &db, &dir).expect("round completes");
+
+        assert!(file_path.exists(), "unverified ack must keep the file");
+        assert_eq!(stats.uploaded_files, 1);
+        assert_eq!(db.unsynced_count().expect("count"), 0);
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

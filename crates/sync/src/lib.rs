@@ -4,10 +4,14 @@
 //! a dedicated thread: it forwards locally-stored events and media files to
 //! the WSL central hub over plain HTTP on the tailnet.
 //!
-//! Contract:
-//! - Local-first: nothing is ever deleted locally here; the daemon's rolling
-//!   retention (elsewhere) only prunes files whose index rows are already
-//!   synced.
+//! Contract (sync v2, issue #40 - client media pass-through):
+//! - Local-first events: every event is written locally before anything is
+//!   forwarded. Media files are pass-through: a file is deleted locally
+//!   (targeted per-file removal) as soon as the hub's PUT ack proves a
+//!   durable, checksum-verified write; no ack, a checksum mismatch, or any
+//!   error keeps the file untouched. The watchers' rolling budgets
+//!   (watcher-screen/-audio) keep working unchanged as a backstop for
+//!   hub-unreachable periods.
 //! - File first, index row after (ADR rev 5): for each unsynced `media`
 //!   event the referenced file is uploaded via
 //!   `PUT /ingest/media/{kind}/{date}/{filename}` BEFORE the index row is
@@ -41,8 +45,8 @@ pub use http::{
     HttpClient, HttpError, RetryClass, UreqClient, CONNECT_TIMEOUT_S, REQUEST_TIMEOUT_S,
 };
 pub use plan::{
-    accepted_row_ids, apply_jitter, backoff_delay, build_post_batch, join_url, media_put_url,
-    parse_media_rel_path, plan_rows, sha256_file_hex, IngestAck, MediaRef, PlannedRow,
-    RejectedItem, BACKOFF_BASE, MAX_BACKOFF,
+    accepted_row_ids, ack_verifies_upload, apply_jitter, backoff_delay, build_post_batch, join_url,
+    media_put_url, parse_media_rel_path, plan_rows, sha256_file_hex, IngestAck, MediaPutAck,
+    MediaRef, PlannedRow, RejectedItem, BACKOFF_BASE, MAX_BACKOFF,
 };
 pub use settings::{SyncSettings, DEFAULT_BATCH_SIZE, DEFAULT_INTERVAL_S};
