@@ -53,7 +53,7 @@ new frame -> sampling -> Lemonade analysis -> question queue
 - **Calendar (processed data only)**: approved activities show with
   category colour and project label, unclassified active time stays grey,
   AFK unchanged; drafts never appear on the calendar and the heuristic app
-  shading retires.
+  shading is retired (issue #48).
 - **Month-end export**: one xlsx row per approved activity into the
   Cubewise offline template (`timsheet_offline_2026_08.xlsx`, `upload`
   sheet, columns

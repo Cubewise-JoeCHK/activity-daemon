@@ -7,8 +7,12 @@
   --ink:#1b1b1b; --ink2:#5c5c5c; --ink3:#8f8f8f;
   --line:#e4e4e4; --line2:#efefef;
   --hover:#ececec; --active:#e0e0e0; --search:#efefef;
-  --ev-deep:#1b1b1b; --ev-meet:#555555; --ev-res:#b9b9b9; --ev-com:#dcdcdc;
-  --ev-other:#eeeeee;
+  /* Timesheet category colour scale (#48): approved activities only.
+     Muted hues, white labels AA-contrast on every step. */
+  --cat-consulting:#0e6b60; --cat-support:#2b5797; --cat-training:#6b4fa0;
+  --cat-management:#4a4a4a; --cat-presales:#9c5703; --cat-qa:#a03a6b;
+  --cat-customer-returned:#5c7a29;
+  --ev-uncovered:#e9e9e9;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
@@ -177,13 +181,16 @@ svg{display:block}
 }
 .ev b{display:block;font-weight:600;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ev .t{font-size:11px;opacity:.85}
-.ev.deep{background:var(--ev-deep);color:#fff}
-.ev.meet{background:var(--ev-meet);color:#fff}
-.ev.res{background:var(--ev-res);color:var(--ink)}
-.ev.com{background:var(--ev-com);color:var(--ink)}
-.ev.other{background:var(--ev-other);color:var(--ink2);border:1px solid var(--line)}
+.ev.cat-consulting{background:var(--cat-consulting);color:#fff}
+.ev.cat-support{background:var(--cat-support);color:#fff}
+.ev.cat-training{background:var(--cat-training);color:#fff}
+.ev.cat-management{background:var(--cat-management);color:#fff}
+.ev.cat-pre-sales{background:var(--cat-presales);color:#fff}
+.ev.cat-qa{background:var(--cat-qa);color:#fff}
+.ev.cat-customer-returned{background:var(--cat-customer-returned);color:#fff}
+.ev.cat-none{background:#dcdcdc;color:var(--ink2);border:1px solid var(--line)}
+.ev.uncovered{background:var(--ev-uncovered);border:1px solid var(--line)}
 .ev.afk{border:1.5px dashed #b9b9b9;color:var(--ink3);background:transparent}
-.ev.live{box-shadow:0 0 0 1.5px var(--ink) inset}
 .nowline{position:absolute;left:0;right:0;height:0;border-top:2px solid var(--ink);z-index:3}
 .nowline::before{content:"";position:absolute;left:-4px;top:-5px;width:8px;height:8px;border-radius:50%;background:var(--ink)}
 .nowline .nowtag{position:absolute;left:-2px;top:-18px;font-size:10px;font-weight:700;background:var(--ink);color:#fff;border-radius:3px;padding:1px 4px}
@@ -207,9 +214,14 @@ svg{display:block}
 .legend .lg-title{font-size:11px;font-weight:700;color:var(--ink2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px}
 .lg-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink2);margin-bottom:6px}
 .sw{width:12px;height:12px;border-radius:3px;flex:none}
-.sw.deep{background:var(--ev-deep)} .sw.meet{background:var(--ev-meet)}
-.sw.res{background:var(--ev-res)} .sw.com{background:var(--ev-com)}
-.sw.other{background:var(--ev-other);border:1px solid var(--line)}
+.sw.cat-consulting{background:var(--cat-consulting)}
+.sw.cat-support{background:var(--cat-support)}
+.sw.cat-training{background:var(--cat-training)}
+.sw.cat-management{background:var(--cat-management)}
+.sw.cat-pre-sales{background:var(--cat-presales)}
+.sw.cat-qa{background:var(--cat-qa)}
+.sw.cat-customer-returned{background:var(--cat-customer-returned)}
+.sw.uncovered{background:var(--ev-uncovered);border:1px solid var(--line)}
 .sw.afk{border:1.5px dashed #b5b5b5;background:transparent}
 
 /* ============ error banner ============ */

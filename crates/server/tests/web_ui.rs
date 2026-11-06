@@ -148,6 +148,49 @@ fn media_event(ts: &str) -> Value {
     })
 }
 
+/// An owner-approved timesheet activity (#47's writer shape: the draft JSON
+/// plus `approved_at`), seeded through the normal ingest path - the same
+/// rows `GET /api/calendar` must surface as coloured blocks.
+fn approved_event(ts: &str, end: &str, project: &str, category: &str) -> Value {
+    json!({
+        "bucket": "timesheet-approved",
+        "timestamp": ts,
+        "duration_s": 3600.0,
+        "data": {
+            "start": ts,
+            "end": end,
+            "project_guess": project,
+            "category": category,
+            "task": "client work",
+            "comment": "",
+            "confidence": 0.87,
+            "sources": { "frame_sha16s": [], "session_ids": [1], "question_ids": [] },
+            "approved_at": "2026-03-02T18:00:00+08:00"
+        }
+    })
+}
+
+/// A daily-compiler draft (#45 shape, no `approved_at`). The calendar must
+/// never surface these: drafts are reviewed data, the calendar shows the
+/// approved result.
+fn draft_event(ts: &str, end: &str) -> Value {
+    json!({
+        "bucket": "timesheet-draft",
+        "timestamp": ts,
+        "duration_s": 3600.0,
+        "data": {
+            "start": ts,
+            "end": end,
+            "project_guess": "DRAFT-ONLY PROJECT",
+            "category": "Support",
+            "task": "draft work",
+            "comment": "",
+            "confidence": 0.9,
+            "sources": { "frame_sha16s": [], "session_ids": [2], "question_ids": [] }
+        }
+    })
+}
+
 // ------------------------------------------------------------------ assets
 
 #[tokio::test]
@@ -348,11 +391,95 @@ async fn calendar_groups_sessions_and_afk_by_day() {
     let afk = days[0]["afk"].as_array().expect("afk");
     assert_eq!(afk.len(), 1, "the duration-0 'afk' marker is skipped");
     assert_eq!(afk[0]["duration_s"], 2820.0);
+    // additive field (#48): present and empty while no approved rows exist
+    assert_eq!(
+        days[0]["approved"].as_array().expect("approved").len(),
+        0,
+        "absent bucket = empty approved array, never an error"
+    );
 
     assert_eq!(days[1]["date"], "2026-03-03");
     assert_eq!(days[1]["sessions"].as_array().expect("sessions").len(), 1);
     assert_eq!(days[1]["afk"].as_array().expect("afk").len(), 0);
     assert_eq!(days[1]["active_s"], 1800.0);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn calendar_surfaces_approved_activities_and_never_drafts() {
+    let (dir, state) = test_state("calendar-approved");
+    let app = build_router(state.clone());
+
+    seed(
+        &state,
+        "dev-laptop",
+        json!([
+            // the raw backbone the grey-uncovered rendering derives from
+            window_event("2026-03-02T14:00:00+08:00", 7200.0, "Code.exe", "web UI"),
+            // two approved blocks on 2026-03-02, one on another device that
+            // must not leak into the explicit-device query
+            approved_event(
+                "2026-03-02T14:00:00+08:00",
+                "2026-03-02T15:00:00+08:00",
+                "A1234 Client",
+                "Consulting"
+            ),
+            approved_event(
+                "2026-03-02T16:00:00+08:00",
+                "2026-03-02T17:30:00+08:00",
+                "C000P1 Internal",
+                "Management"
+            ),
+            // drafts exist alongside - and must stay invisible
+            draft_event("2026-03-02T18:00:00+08:00", "2026-03-02T19:00:00+08:00"),
+            afk_span_event("2026-03-02T20:00:00+08:00", 1800.0),
+        ]),
+    )
+    .await;
+    seed(
+        &state,
+        "dev-lab",
+        json!([approved_event(
+            "2026-03-02T09:00:00+08:00",
+            "2026-03-02T10:00:00+08:00",
+            "Other Device",
+            "QA"
+        )]),
+    )
+    .await;
+
+    let res = app
+        .oneshot(get(
+            "/api/calendar?from=2026-03-02&to=2026-03-02&device=dev-laptop",
+        ))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+
+    let day = &v["days"][0];
+    let approved = day["approved"].as_array().expect("approved array");
+    assert_eq!(approved.len(), 2, "only this device's approved rows");
+    assert_eq!(approved[0]["start"], "2026-03-02T14:00:00+08:00");
+    assert_eq!(approved[0]["end"], "2026-03-02T15:00:00+08:00");
+    assert_eq!(approved[0]["project"], "A1234 Client");
+    assert_eq!(approved[0]["category"], "Consulting");
+    assert_eq!(approved[0]["task"], "client work");
+    assert_eq!(approved[0]["confidence"], 0.87);
+    assert_eq!(approved[1]["category"], "Management");
+
+    // existing fields stay byte-identical (backwards compatibility)
+    assert_eq!(day["sessions"].as_array().expect("sessions").len(), 1);
+    assert_eq!(day["afk"].as_array().expect("afk").len(), 1);
+    assert_eq!(day["active_s"], 7200.0);
+
+    // drafts NEVER appear on the calendar (#48 acceptance): the payload is
+    // scanned whole so even an accidental extra field would fail this
+    let raw = serde_json::to_string(&v).expect("serialize");
+    assert!(
+        !raw.contains("DRAFT-ONLY PROJECT"),
+        "draft activities must never reach the calendar payload"
+    );
     drop(dir);
 }
 
@@ -403,6 +530,9 @@ async fn calendar_empty_range_is_an_empty_calendar_not_an_error() {
     let v = body_json(res).await;
     assert!(v["device"].is_null());
     assert_eq!(v["days"][0]["active_s"], 0.0);
+    // #48: the approved field is part of every day skeleton, even on an
+    // empty hub with no timesheet bucket at all
+    assert_eq!(v["days"][0]["approved"], json!([]));
     drop(dir);
 }
 

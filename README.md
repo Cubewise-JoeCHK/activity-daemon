@@ -107,21 +107,28 @@ tailnet, and the container image stays self-contained.
   per-bucket tags, plus hub facts (version, uptime, stored media bytes).
   The hub has no client heartbeat file, so "last seen" = the newest event
   arrival per device.
-- **Calendar view** (`#calendar`): Teams-style work-week grid of window
-  sessions + AFK spans (07:00-21:00, now-line, mini month with activity
-  dots). Shading classifies apps presentation-only (code/terminals dark,
-  meetings, browsers, comms); the shading retires once the timesheet AI
-  layer lands - the calendar will then show processed data: approved
-  activities (category colour, project label), unclassified active time
-  grey, AFK unchanged.
+- **Calendar view** (`#calendar`): Teams-style work-week grid (07:00-21:00,
+  now-line, mini month with activity dots) showing the **processed**
+  timesheet result, not raw sessions: owner-approved activities render as
+  coloured blocks (category colour scale, project label on the block),
+  active time not covered by an approved activity renders grey, AFK spans
+  stay dashed as before. Draft activities are never shown - only approved
+  rows from bucket `timesheet-approved` make it to the calendar. The old
+  presentation-only app shading (code/terminals dark, meetings, browsers,
+  comms) is retired; the timesheet classifier is the only authority.
 - **JSON APIs** (read-only, same open precedent as `GET /health`; writes
   stay token-guarded):
   - `GET /api/machines` - per-device summary + the 30 newest events each.
   - `GET /api/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&device=...]` - day
-    bucketed sessions/AFK, empty days included, range cap 62 days; without
-    `device` the busiest device in the range wins. AFK spans come from the
-    `state: "active"` events (start + duration); the `state: "afk"`
-    markers are ignored.
+    bucketed sessions/AFK plus approved activities, empty days included,
+    range cap 62 days; without `device` the busiest device in the range
+    wins. AFK spans come from the `state: "active"` events (start +
+    duration); the `state: "afk"` markers are ignored. Each day also
+    carries an additive `approved` array (`start`, `end`, `project`,
+    `category`, `task`, `confidence`) read from bucket
+    `timesheet-approved` - an empty or absent bucket simply yields empty
+    arrays, keeping the response backwards-compatible; `timesheet-draft`
+    rows are never queried.
 
 Day boundaries ("today", calendar bucketing) use the server's local
 timezone - a single-owner setup shares one timezone, and window events
