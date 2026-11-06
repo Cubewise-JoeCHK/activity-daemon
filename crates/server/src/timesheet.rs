@@ -25,14 +25,23 @@
 //!   asset embedded in `refiner-timesheet`, or the file pointed at by
 //!   `[timesheet] vocab_path` in the server config.
 //!
-//! Daily itinerary drafts (issue #45):
-//! - `GET /api/timesheet/draft?date=YYYY-MM-DD` - the day's current draft
-//!   activities (superseded ones hidden) plus status.
+//! Daily itinerary drafts (issue #45, approve-aware regeneration #60):
+//! - `GET /api/timesheet/draft?date=YYYY-MM-DD` - the day's draft
+//!   activities plus status. Every parseable draft row of the day is
+//!   listed with a `state` field: `approved` (carries the approve flow's
+//!   flag; stays listed across regenerations), `superseded` (replaced by
+//!   a regeneration - history, invisible to the review flow), or `new`
+//!   (awaiting review). `status.count` covers the current rows
+//!   (approved + new) only.
 //! - `POST /api/timesheet/draft?date=YYYY-MM-DD` - regenerate the day:
 //!   the compiler merges window sessions (backbone), frame analyses, AFK
-//!   spans and answered questions into fresh drafts (old drafts marked
-//!   `superseded_by`); optionally one Lemonade call titles/comments the
-//!   blocks (`use_llm_titles`, fail-soft to heuristics).
+//!   spans and answered questions into fresh drafts (old unapproved
+//!   drafts marked `superseded_by`); optionally one Lemonade call
+//!   titles/comments the blocks (`use_llm_titles`, fail-soft to
+//!   heuristics). Regeneration is approve-aware (issue #60): sessions
+//!   overlapping a `timesheet-approved` span are never re-drafted and
+//!   approved drafts are never superseded, so a
+//!   regenerate-then-reapprove loop cannot duplicate approved time.
 //!
 //! Owner writing style (issue #53):
 //! - `GET /api/timesheet/style` - the owner's `[timesheet.style]` section
@@ -56,9 +65,10 @@
 //!   loader as the worker and the export - one source of truth for what
 //!   the review UI's dropdowns offer.
 //! - `GET /api/timesheet/days?from=YYYY-MM-DD&to=YYYY-MM-DD` - per-day
-//!   counts of current drafts by review state (draft / reviewed /
-//!   approved) for the day list. Approved drafts keep their draft row
-//!   (flag, not tombstone), so one bucket query covers all three states.
+//!   counts of drafts by review state (draft / reviewed / approved /
+//!   superseded) for the day list. Approved drafts keep their draft row
+//!   (flag, not tombstone) and survive regeneration untouched (issue
+//!   #60), so one bucket query covers every state.
 //! - `PUT /api/timesheet/draft/{id}` - persist an owner edit (project,
 //!   category, task, comment) onto the stored draft and mark it
 //!   `reviewed`. Saved edits live on the draft, not in the approve call:
@@ -243,8 +253,13 @@ async fn api_post_draft(
     }
 }
 
-/// The GET payload: the day's current drafts (superseded ones hidden) plus
-/// status. `generated_at` is the newest batch stamp among them.
+/// The GET payload: the day's draft rows plus status (issue #60 payload).
+/// Every parseable row is listed with a `state` field - `approved`
+/// (approved time carried over across regenerations), `superseded`
+/// (replaced history), `new` (awaiting review) - so the review page can
+/// render the distinction; `status.count` covers the current rows
+/// (approved + new) and `generated_at` is the newest batch stamp among
+/// them.
 fn draft_payload(state: &AppState, day: NaiveDate) -> Result<Value, CoreError> {
     let rows = {
         let db = state
@@ -255,37 +270,53 @@ fn draft_payload(state: &AppState, day: NaiveDate) -> Result<Value, CoreError> {
         db.query_event_rows_in(Some(BUCKET_TIMESHEET_DRAFT), None, Some(&from), Some(&to))?
     };
     let mut drafts = Vec::new();
+    let mut current_count = 0usize;
     let mut latest_batch: Option<String> = None;
     for row in &rows {
-        if !row_in_day(row, day) || !is_current_draft(row) {
+        if !row_in_day(row, day) {
             continue;
         }
         let Ok(mut payload) = serde_json::from_str::<Value>(&row.data) else {
             continue;
         };
         // The stored payload IS the response shape (activity fields + the
-        // `batch` stamp + the review flags the UI renders); only the row id
-        // is added. The activity parse guards the shape: a JSON object that
-        // is not one of our drafts stays hidden, exactly like before.
+        // `batch` stamp + the review flags the UI renders); the row id and
+        // the lifecycle `state` are added. The activity parse guards the
+        // shape: a JSON object that is not one of our drafts stays hidden.
         if serde_json::from_value::<DraftActivity>(payload.clone()).is_err() {
             continue;
         }
-        if let Some(batch) = payload.get("batch").and_then(Value::as_str) {
-            if latest_batch
-                .as_ref()
-                .is_none_or(|latest| batch > latest.as_str())
-            {
-                latest_batch = Some(batch.to_string());
+        let superseded = payload.get("superseded_by").is_some();
+        let state = if row_approved(&payload) {
+            "approved"
+        } else if superseded {
+            "superseded"
+        } else {
+            "new"
+        };
+        // The review state wins (the same precedence as `row_approved`):
+        // a legacy row carrying both flags (an artefact of the original
+        // bug) still lists as approved and counts as current.
+        if state != "superseded" {
+            current_count += 1;
+            if let Some(batch) = payload.get("batch").and_then(Value::as_str) {
+                if latest_batch
+                    .as_ref()
+                    .is_none_or(|latest| batch > latest.as_str())
+                {
+                    latest_batch = Some(batch.to_string());
+                }
             }
         }
         payload["id"] = json!(row.id);
+        payload["state"] = json!(state);
         drafts.push(payload);
     }
     Ok(json!({
         "day": day.format("%Y-%m-%d").to_string(),
         "status": {
             "generated_at": latest_batch,
-            "count": drafts.len(),
+            "count": current_count,
         },
         "drafts": drafts,
     }))
@@ -316,6 +347,14 @@ fn regenerate_payload(
         let afk = db.query_event_rows_in(Some(BUCKET_AFK), None, Some(&from), Some(&to))?;
         let old_drafts =
             db.query_event_rows_in(Some(BUCKET_TIMESHEET_DRAFT), None, Some(&from), Some(&to))?;
+        // Approve-aware regeneration (issue #60): the approved bucket is
+        // the authoritative record of what must not be re-drafted.
+        let approved = db.query_event_rows_in(
+            Some(BUCKET_TIMESHEET_APPROVED),
+            None,
+            Some(&from),
+            Some(&to),
+        )?;
         let existing_questions: Vec<TsQuestion> = questions
             .list_questions(StatusFilter::All)?
             .into_iter()
@@ -327,6 +366,7 @@ fn regenerate_payload(
             analyses,
             afk,
             old_drafts,
+            approved,
         };
         let plan = plan_day(&input, &existing_questions, timesheet, titler);
         store_day(&db, &questions, &plan)?
@@ -1082,9 +1122,11 @@ pub struct DaysQuery {
     to: String,
 }
 
-/// Per-day review-state counts for the day list (issue #47): current
-/// drafts only, counted by state - `draft` (untouched), `reviewed` (owner
-/// edited it), `approved`. Days without current drafts are absent.
+/// Per-day review-state counts for the day list (issue #47, superseded
+/// count per issue #60): current drafts counted by state - `draft`
+/// (untouched), `reviewed` (owner edited it), `approved` (never removed
+/// by a regeneration) - plus `superseded` (rows replaced by
+/// regenerations). Days without any draft rows are absent.
 async fn api_days(State(state): State<AppState>, Query(query): Query<DaysQuery>) -> Response {
     let from = match parse_day(&query.from) {
         Ok(day) => day,
@@ -1123,9 +1165,10 @@ fn days_payload(state: &AppState, from: NaiveDate, to: NaiveDate) -> Result<Valu
             Some(&range_end),
         )?
     };
-    // (draft, reviewed, approved) per day, keyed by the row's own local
-    // date so a differently-offset device still lands on its own day.
-    let mut counts: std::collections::BTreeMap<NaiveDate, (u32, u32, u32)> =
+    // (draft, reviewed, approved, superseded) per day, keyed by the row's
+    // own local date so a differently-offset device still lands on its own
+    // day.
+    let mut counts: std::collections::BTreeMap<NaiveDate, (u32, u32, u32, u32)> =
         std::collections::BTreeMap::new();
     for row in &rows {
         let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&row.ts_start) else {
@@ -1138,12 +1181,13 @@ fn days_payload(state: &AppState, from: NaiveDate, to: NaiveDate) -> Result<Valu
         let Ok(data) = serde_json::from_str::<Value>(&row.data) else {
             continue;
         };
-        if data.get("superseded_by").is_some() {
-            continue;
-        }
         let entry = counts.entry(day).or_default();
+        // Same precedence as the draft payload's `state` (review state
+        // wins): approved, then superseded, then reviewed, then draft.
         if row_approved(&data) {
             entry.2 += 1;
+        } else if data.get("superseded_by").is_some() {
+            entry.3 += 1;
         } else if data
             .get("reviewed")
             .and_then(Value::as_bool)
@@ -1156,12 +1200,13 @@ fn days_payload(state: &AppState, from: NaiveDate, to: NaiveDate) -> Result<Valu
     }
     let days: Vec<Value> = counts
         .into_iter()
-        .map(|(day, (draft, reviewed, approved))| {
+        .map(|(day, (draft, reviewed, approved, superseded))| {
             json!({
                 "day": day.format("%Y-%m-%d").to_string(),
                 "draft": draft,
                 "reviewed": reviewed,
                 "approved": approved,
+                "superseded": superseded,
             })
         })
         .collect();
@@ -1668,6 +1713,332 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             "a configured vocabulary that fails to parse must not export with another"
         );
+    }
+
+    // ------------------ approve-aware regeneration (issue #60)
+
+    const ISSUE60_DAY: &str = "2026-11-06";
+    const ISSUE60_PROJECT: &str = "C000P003 - Cubewise - Timesheet Development";
+
+    /// RFC3339 stamp at `hour:min` of the fixture day in the LOCAL offset:
+    /// the day queries (`local_day_bounds`) and the compiler's own-offset
+    /// attribution then agree regardless of the test box's timezone.
+    fn issue60_ts(hour: u32, min: u32) -> String {
+        let date = parse_day(ISSUE60_DAY).expect("fixture day");
+        Local
+            .from_local_datetime(&date.and_hms_opt(hour, min, 0).expect("valid time"))
+            .earliest()
+            .expect("local time resolves")
+            .to_rfc3339()
+    }
+
+    fn issue60_session(hour: u32, min: u32) -> EventEnvelope {
+        EventEnvelope {
+            bucket: BUCKET_WINDOW.to_string(),
+            timestamp: issue60_ts(hour, min),
+            duration_s: 3600.0,
+            data: json!({"app": "Code.exe", "title": "window title"}),
+        }
+    }
+
+    fn issue60_analysis(id: i64, hour: u32, min: u32) -> EventEnvelope {
+        EventEnvelope {
+            bucket: BUCKET_FRAME_ANALYSIS.to_string(),
+            timestamp: issue60_ts(hour, min),
+            duration_s: 0.0,
+            data: json!({
+                "frame_sha16": format!("sha-{id:04}"),
+                "frame_path": "media/screen/2026/11/06/frame.jpg",
+                "activity": "working on the timesheet pipeline",
+                "project_guess": ISSUE60_PROJECT,
+                "category": "Management",
+                "confidence": 0.9,
+                "evidence": [],
+                "model": "qwen",
+                "sampled": true,
+            }),
+        }
+    }
+
+    /// Heuristic-titled app state (hermetic: no Lemonade call) plus the
+    /// temp dir that owns its database file - kept in scope by the caller
+    /// so the file outlives the connection.
+    fn issue60_setup(tag: &str) -> (ExportTempDir, AppState) {
+        let dir = ExportTempDir::new(tag);
+        let state = AppState::open_with_retention(
+            &dir.0.join("activity.db"),
+            dir.0.join("media"),
+            crate::AuthConfig::disabled(),
+            crate::retention::RetentionConfig::default(),
+            TimesheetConfig {
+                use_llm_titles: false,
+                ..TimesheetConfig::default()
+            },
+        )
+        .expect("state");
+        (dir, state)
+    }
+
+    fn issue60_seed(state: &AppState) {
+        // Two non-adjacent same-project sessions (the 1 h gap exceeds the
+        // adjacency limit, so no merging): two separate drafts per compile.
+        let db = state.db.lock().expect("db lock");
+        for envelope in [
+            issue60_session(10, 0),
+            issue60_session(12, 0),
+            issue60_analysis(1, 10, 30),
+            issue60_analysis(2, 12, 30),
+        ] {
+            db.insert_event(&envelope, "owner-laptop").expect("insert");
+        }
+    }
+
+    async fn post_json(app: Router, uri: &str, body: &Value) -> axum::http::Response<Body> {
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+    }
+
+    /// The regression core (issue #60 acceptance): approve a day,
+    /// regenerate, approve again - the export must hold exactly one row
+    /// per real span, with no warnings.
+    #[tokio::test]
+    async fn approve_regenerate_reapprove_never_double_counts() {
+        let (_dir, state) = issue60_setup("issue60-regen");
+        issue60_seed(&state);
+        let app = crate::build_router(state.clone());
+
+        // Compile day one: two fresh drafts.
+        let response = post_json(
+            app.clone(),
+            "/api/timesheet/draft?date=2026-11-06",
+            &json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["drafts"].as_array().expect("drafts").len(), 2);
+        for draft in payload["drafts"].as_array().expect("drafts") {
+            assert_eq!(draft["state"], "new");
+        }
+
+        // Approve everything.
+        let response = post_json(
+            app.clone(),
+            "/api/timesheet/approve",
+            &json!({"date": ISSUE60_DAY}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["approved"], 2);
+
+        // Regenerate after approval.
+        let response = post_json(
+            app.clone(),
+            "/api/timesheet/draft?date=2026-11-06",
+            &json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+
+        // The day still shows the two approved activities (state
+        // `approved`), and nothing was re-drafted on top of them.
+        let drafts = payload["drafts"].as_array().expect("drafts");
+        assert_eq!(drafts.len(), 2, "approved rows stay, nothing re-drafted");
+        for draft in drafts {
+            assert_eq!(draft["state"], "approved");
+            assert_eq!(draft["approved"], true);
+        }
+        assert_eq!(payload["status"]["count"], 2);
+        assert_eq!(payload["superseded"], 0, "approved drafts never superseded");
+
+        // Approve again: idempotent, no new approved events.
+        let response = post_json(
+            app.clone(),
+            "/api/timesheet/approve",
+            &json!({"date": ISSUE60_DAY}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["approved"], 0);
+        assert_eq!(
+            payload["already_approved_ids"]
+                .as_array()
+                .expect("ids")
+                .len(),
+            2
+        );
+
+        // The month export holds exactly one row per span - no duplicated
+        // hours - and the guard had nothing to warn about.
+        let response = get_export(app, "/api/timesheet/export?month=2026-11").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("X-Export-Warnings").expect("hdr"),
+            "0"
+        );
+        let bytes = response_bytes(response).await;
+        let mut book: calamine::Xlsx<_> =
+            calamine::open_workbook_from_rs(std::io::Cursor::new(bytes)).expect("workbook opens");
+        let upload = book.worksheet_range("upload").expect("upload sheet");
+        assert_eq!(upload.height(), 3, "header + exactly 2 rows");
+        // C000P* is internal: 1 h lands in NonBillable (col 7) per row.
+        assert_eq!(upload.get_value((1, 7)), Some(&Data::Float(1.0)));
+        assert_eq!(upload.get_value((2, 7)), Some(&Data::Float(1.0)));
+    }
+
+    #[tokio::test]
+    async fn approve_one_regenerate_approve_rest_keeps_one_row_per_span() {
+        let (_dir, state) = issue60_setup("issue60-mixed");
+        issue60_seed(&state);
+        let app = crate::build_router(state.clone());
+
+        // Compile, approve only the first draft.
+        let response = post_json(
+            app.clone(),
+            "/api/timesheet/draft?date=2026-11-06",
+            &json!({}),
+        )
+        .await;
+        let payload = response_json(response).await;
+        let first_id = payload["drafts"][0]["id"].as_i64().expect("draft id");
+        let response = post_json(
+            app.clone(),
+            "/api/timesheet/approve",
+            &json!({"date": ISSUE60_DAY, "draft_id": first_id}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Regenerate: the approved draft stays listed as `approved`, the
+        // unapproved span comes back as a fresh `new` draft, the replaced
+        // stale copy is exposed as `superseded`.
+        let response = post_json(
+            app.clone(),
+            "/api/timesheet/draft?date=2026-11-06",
+            &json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        let states: Vec<String> = payload["drafts"]
+            .as_array()
+            .expect("drafts")
+            .iter()
+            .map(|d| d["state"].as_str().expect("state").to_string())
+            .collect();
+        let mut sorted_states = states.clone();
+        sorted_states.sort();
+        assert_eq!(sorted_states, vec!["approved", "new", "superseded"]);
+        assert_eq!(payload["status"]["count"], 2, "current rows only");
+        assert_eq!(payload["superseded"], 1);
+
+        // The day list exposes the same distinction.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/timesheet/days?from=2026-11-06&to=2026-11-06")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        let day = &payload["days"][0];
+        assert_eq!(day["day"], ISSUE60_DAY);
+        assert_eq!(day["draft"], 1, "the fresh unapproved draft");
+        assert_eq!(day["reviewed"], 0);
+        assert_eq!(day["approved"], 1, "the approved draft stays counted");
+        assert_eq!(day["superseded"], 1, "the replaced stale copy");
+
+        // Approve the rest, export: one row per span, nothing doubled.
+        let response = post_json(
+            app.clone(),
+            "/api/timesheet/approve",
+            &json!({"date": ISSUE60_DAY}),
+        )
+        .await;
+        let payload = response_json(response).await;
+        assert_eq!(payload["approved"], 1, "only the fresh draft approves");
+
+        let response = get_export(app, "/api/timesheet/export?month=2026-11").await;
+        assert_eq!(
+            response.headers().get("X-Export-Warnings").expect("hdr"),
+            "0"
+        );
+        let bytes = response_bytes(response).await;
+        let mut book: calamine::Xlsx<_> =
+            calamine::open_workbook_from_rs(std::io::Cursor::new(bytes)).expect("workbook opens");
+        let upload = book.worksheet_range("upload").expect("upload sheet");
+        assert_eq!(upload.height(), 3, "header + exactly 2 rows");
+    }
+
+    #[tokio::test]
+    async fn export_dedups_overlapping_approved_rows_with_warning() {
+        // Defence-in-depth guard (issue #60, through the API): two
+        // identical approved events on the same project + category with
+        // different stamps keep the earliest and warn; a same-instant row
+        // on another project is untouched.
+        let dir = ExportTempDir::new("issue60-guard");
+        let state = AppState::open(&dir.0.join("activity.db"), dir.0.join("media")).expect("state");
+        let overlap = |project: &str, approved_at: &str| EventEnvelope {
+            bucket: BUCKET_TIMESHEET_APPROVED.to_string(),
+            timestamp: "2026-10-06T09:00:00+08:00".to_string(),
+            duration_s: 3600.0,
+            data: json!({
+                "start": "2026-10-06T09:00:00+08:00",
+                "end": "2026-10-06T10:00:00+08:00",
+                "project_guess": project,
+                "category": "Consulting",
+                "task": "duplicated span",
+                "comment": "",
+                "approved_at": approved_at,
+            }),
+        };
+        {
+            let db = state.db.lock().expect("db lock");
+            for envelope in [
+                overlap(ISSUE60_PROJECT, "2026-10-06T11:00:00.000Z"),
+                overlap(ISSUE60_PROJECT, "2026-10-06T10:00:00.000Z"),
+                overlap(
+                    "A143P010 - Frasers - H2 FH - BU Core",
+                    "2026-10-06T10:00:00.000Z",
+                ),
+            ] {
+                db.insert_event(&envelope, "owner-laptop").expect("insert");
+            }
+        }
+        let app = crate::build_router(state);
+        let response = get_export(app, "/api/timesheet/export?month=2026-10").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("X-Export-Warnings").expect("hdr"),
+            "1",
+            "the duplicated pair warns once"
+        );
+        let bytes = response_bytes(response).await;
+        let mut book: calamine::Xlsx<_> =
+            calamine::open_workbook_from_rs(std::io::Cursor::new(bytes)).expect("workbook opens");
+        let upload = book.worksheet_range("upload").expect("upload sheet");
+        assert_eq!(upload.height(), 3, "header + 2 rows (one per project)");
+        let warnings = book.worksheet_range("Warnings").expect("warnings sheet");
+        assert!(warnings
+            .get_value((1, 0))
+            .and_then(|v| v.as_string())
+            .expect("warning text")
+            .contains("duplicate row"));
     }
 
     // -------------------------------------------------- draft endpoints

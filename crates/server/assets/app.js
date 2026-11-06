@@ -711,7 +711,9 @@
     const sub = $("#ts-day-sub");
     const approveAll = $("#ts-approve-all");
     if (!state.tsDraft) { el.innerHTML = '<div class="empty">Loading…</div>'; return; }
-    const drafts = state.tsDraft.drafts || [];
+    // The payload lists superseded rows too (issue #60 state field); the
+    // review page renders current rows only.
+    const drafts = (state.tsDraft.drafts || []).filter((d) => d.state !== "superseded");
     const counts = { draft: 0, reviewed: 0, approved: 0 };
     for (const d of drafts) counts[rowState(d)]++;
     title.textContent = state.tsSelectedDay;

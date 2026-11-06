@@ -18,6 +18,12 @@
 //! vocabulary reference columns (categories A2.., projects C2..), and a
 //! `Warnings` sheet when there are warnings. No input file is ever
 //! written.
+//!
+//! Defence-in-depth dedup (issue #60): approved events that overlap in
+//! time on the same project + category would double-count hours, so the
+//! exporter keeps only the earliest-`approved_at` row of each overlapping
+//! group (missing stamps lose to known ones; equal stamps break to the
+//! earlier start, then input order) and warns on every dropped duplicate.
 
 use std::path::Path;
 
@@ -88,6 +94,10 @@ struct ApprovedActivity {
     comment: Option<String>,
     #[serde(default)]
     evidence_summary: Option<String>,
+    /// Approval stamp (issue #47): the overlap guard's keep-earliest key
+    /// (issue #60).
+    #[serde(default)]
+    approved_at: Option<String>,
 }
 
 /// A row that passed every check, ready for line-item numbering.
@@ -97,6 +107,13 @@ struct PickedActivity {
     date: NaiveDate,
     /// Parsed start, the secondary sort key within a day.
     start: DateTime<FixedOffset>,
+    /// True span end (unrounded): the overlap guard compares true spans so
+    /// quarter-hour rounding cannot invent overlaps between adjacent
+    /// activities.
+    end: DateTime<FixedOffset>,
+    /// Parsed approval stamp; `None` (missing or unparseable) sorts last
+    /// in the keep-earliest rule - known provenance beats unknown.
+    approved_at: Option<DateTime<FixedOffset>>,
     project: String,
     category: String,
     task: String,
@@ -106,6 +123,17 @@ struct PickedActivity {
     /// `true` = client code, hours go in Billable; `false` = internal
     /// (C000P*), hours go in NonBillable.
     billable: bool,
+}
+
+/// A row the overlap guard kept (issue #60): the `(project, category)`
+/// pair with its true span, plus the approval stamp named in the warning
+/// when a later duplicate is dropped.
+struct KeptSpan {
+    project: String,
+    category: String,
+    start: DateTime<FixedOffset>,
+    end: DateTime<FixedOffset>,
+    stamp: String,
 }
 
 /// `YYYY-MM` -> `(year, month)`. Strict: exactly 4 and 2 digits, month
@@ -158,6 +186,18 @@ fn round_to_quarter(hours: f64) -> f64 {
     (hours / 0.25).round() * 0.25
 }
 
+/// One locator line for warnings: the activity start, `YYYY-MM-DDTHH:MM:SS+off`.
+fn locator(start: DateTime<FixedOffset>) -> String {
+    start.format("%Y-%m-%dT%H:%M:%S%:z").to_string()
+}
+
+/// A parsed approval stamp for warning text; `None` prints as "unknown".
+fn stamp_display(stamp: Option<DateTime<FixedOffset>>) -> String {
+    stamp
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Build the month's upload rows from the bucket's approved activities.
 ///
 /// Reads every approved event (the bucket holds owner-approved rows only,
@@ -195,7 +235,7 @@ pub fn build_month_grid(
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .or_else(|| DateTime::parse_from_rfc3339(&event.timestamp).ok());
         let locator = start
-            .map(|ts| ts.format("%Y-%m-%dT%H:%M:%S%:z").to_string())
+            .map(locator)
             .unwrap_or_else(|| event.timestamp.clone());
 
         let Some(start) = start else {
@@ -234,6 +274,9 @@ pub fn build_month_grid(
             .end
             .as_deref()
             .and_then(|e| DateTime::parse_from_rfc3339(e).ok());
+        let true_end = end.unwrap_or_else(|| {
+            start + chrono::Duration::milliseconds((event.duration_s * 1000.0).round() as i64)
+        });
         let hours = match end {
             Some(end) => (end - start).num_seconds() as f64 / 3600.0,
             None => {
@@ -256,6 +299,11 @@ pub fn build_month_grid(
         picked.push(PickedActivity {
             date,
             start,
+            end: true_end,
+            approved_at: activity
+                .approved_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok()),
             project: project.to_string(),
             category: category.to_string(),
             task: activity.task.unwrap_or_default(),
@@ -268,6 +316,46 @@ pub fn build_month_grid(
             billable,
         });
     }
+
+    // Overlap guard (issue #60, defence in depth): approved events that
+    // overlap in time on the same project + category double-count hours.
+    // Keep the earliest approved_at (missing stamps lose to known ones;
+    // equal stamps break to the earlier start, then input order - a bulk
+    // day-approve stamps every row alike) and warn on every dropped
+    // duplicate. Spans compare unrounded so quarter-hour rounding cannot
+    // invent overlaps between adjacent activities.
+    picked.sort_by_key(|a| (a.approved_at.is_none(), a.approved_at, a.start));
+    let mut kept_spans: Vec<KeptSpan> = Vec::new();
+    let mut survivors = Vec::with_capacity(picked.len());
+    for activity in picked {
+        let duplicate = kept_spans.iter().find(|kept| {
+            kept.project == activity.project
+                && kept.category == activity.category
+                && activity.start < kept.end
+                && kept.start < activity.end
+        });
+        match duplicate {
+            Some(kept) => warnings.push(format!(
+                "duplicate row at {}: overlaps approved time for '{}' / '{}' already covered by the earlier approval (approved_at {}); dropped (this row's approved_at {})",
+                locator(activity.start),
+                activity.project,
+                activity.category,
+                kept.stamp,
+                stamp_display(activity.approved_at),
+            )),
+            None => {
+                kept_spans.push(KeptSpan {
+                    project: activity.project.clone(),
+                    category: activity.category.clone(),
+                    start: activity.start,
+                    end: activity.end,
+                    stamp: stamp_display(activity.approved_at),
+                });
+                survivors.push(activity);
+            }
+        }
+    }
+    let mut picked = survivors;
 
     // Stable sort: days ascending, starts within a day ascending, and
     // equal starts keep their bucket insertion order.
@@ -450,5 +538,197 @@ mod tests {
             .map(|col| range.get_value((0, col)).unwrap().to_string())
             .collect();
         assert_eq!(headers, UPLOAD_HEADERS.to_vec());
+    }
+
+    // ------------------ overlap guard fixtures (issue #60)
+
+    use activity_core::Event;
+
+    const GUARD_PROJECT: &str = "A143P010 - Frasers - H2 FH - BU Core";
+    const OTHER_PROJECT: &str = "C000P003 - Cubewise - Timesheet Development";
+
+    /// An approved `Event` for the guard fixtures: `project`/`category`
+    /// work from `start` to `end`, stamped `approved_at` (None = absent).
+    fn approved(
+        start: &str,
+        end: &str,
+        approved_at: Option<&str>,
+        project: &str,
+        category: &str,
+        task: &str,
+    ) -> Event {
+        Event {
+            bucket: BUCKET_TIMESHEET_APPROVED.to_string(),
+            timestamp: start.to_string(),
+            duration_s: 0.0,
+            data: serde_json::json!({
+                "start": start,
+                "end": end,
+                "project_guess": project,
+                "category": category,
+                "task": task,
+                "comment": "",
+                "approved_at": approved_at,
+            }),
+            device: "laptop".to_string(),
+        }
+    }
+
+    #[test]
+    fn duplicate_overlapping_approvals_keep_earliest_stamp_and_warn() {
+        let vocab = CubewiseVocab::embedded().clone();
+        let events = vec![
+            approved(
+                "2026-10-06T09:00:00+08:00",
+                "2026-10-06T10:00:00+08:00",
+                Some("2026-10-06T11:00:00.000Z"),
+                GUARD_PROJECT,
+                "Consulting",
+                "later copy",
+            ),
+            approved(
+                "2026-10-06T09:00:00+08:00",
+                "2026-10-06T10:00:00+08:00",
+                Some("2026-10-06T10:00:00.000Z"),
+                GUARD_PROJECT,
+                "Consulting",
+                "earlier copy",
+            ),
+        ];
+        let outcome = build_month_grid(2026, 10, &events, &vocab);
+        assert_eq!(
+            outcome.rows.len(),
+            1,
+            "the duplicated span must upload exactly once"
+        );
+        assert_eq!(
+            outcome.rows[0][4],
+            ExportCell::Text("earlier copy".to_string())
+        );
+        assert_eq!(outcome.rows[0][6], ExportCell::Number(1.0));
+        assert_eq!(outcome.warnings.len(), 1);
+        let warning = &outcome.warnings[0];
+        assert!(
+            warning.contains("duplicate row at 2026-10-06T09:00:00+08:00"),
+            "{warning}"
+        );
+        assert!(warning.contains(GUARD_PROJECT), "{warning}");
+        assert!(
+            warning.contains("2026-10-06T10:00:00+00:00"),
+            "kept stamp named in the warning: {warning}"
+        );
+    }
+
+    #[test]
+    fn same_span_on_different_projects_is_not_a_duplicate() {
+        let vocab = CubewiseVocab::embedded().clone();
+        let events = vec![
+            approved(
+                "2026-10-06T09:00:00+08:00",
+                "2026-10-06T10:00:00+08:00",
+                Some("2026-10-06T10:00:00.000Z"),
+                GUARD_PROJECT,
+                "Consulting",
+                "a",
+            ),
+            approved(
+                "2026-10-06T09:00:00+08:00",
+                "2026-10-06T10:00:00+08:00",
+                Some("2026-10-06T10:00:00.000Z"),
+                OTHER_PROJECT,
+                "Consulting",
+                "b",
+            ),
+        ];
+        let outcome = build_month_grid(2026, 10, &events, &vocab);
+        assert_eq!(outcome.rows.len(), 2);
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn touching_spans_do_not_overlap() {
+        let vocab = CubewiseVocab::embedded().clone();
+        let events = vec![
+            approved(
+                "2026-10-06T09:00:00+08:00",
+                "2026-10-06T10:00:00+08:00",
+                Some("2026-10-06T10:00:00.000Z"),
+                GUARD_PROJECT,
+                "Consulting",
+                "morning",
+            ),
+            approved(
+                "2026-10-06T10:00:00+08:00",
+                "2026-10-06T11:00:00+08:00",
+                Some("2026-10-06T10:00:00.000Z"),
+                GUARD_PROJECT,
+                "Consulting",
+                "follow-on",
+            ),
+        ];
+        let outcome = build_month_grid(2026, 10, &events, &vocab);
+        assert_eq!(outcome.rows.len(), 2);
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn missing_approved_at_loses_to_known_stamp() {
+        let vocab = CubewiseVocab::embedded().clone();
+        let events = vec![
+            approved(
+                "2026-10-06T09:00:00+08:00",
+                "2026-10-06T10:00:00+08:00",
+                None,
+                GUARD_PROJECT,
+                "Consulting",
+                "unstamped",
+            ),
+            approved(
+                "2026-10-06T09:00:00+08:00",
+                "2026-10-06T10:00:00+08:00",
+                Some("2026-10-06T10:00:00.000Z"),
+                GUARD_PROJECT,
+                "Consulting",
+                "stamped",
+            ),
+        ];
+        let outcome = build_month_grid(2026, 10, &events, &vocab);
+        assert_eq!(outcome.rows.len(), 1);
+        assert_eq!(outcome.rows[0][4], ExportCell::Text("stamped".to_string()));
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0].contains("unknown"),
+            "dropped unstamped row reported as unknown: {}",
+            outcome.warnings[0]
+        );
+    }
+
+    #[test]
+    fn overlap_uses_unrounded_true_spans() {
+        // True spans 09:00-09:40 and 09:42-10:30 do not overlap, but the
+        // quarter-hour-rounded hours (0.75 h from 09:00 -> 09:45) would
+        // swallow the 09:42 start: the guard must not drop real work.
+        let vocab = CubewiseVocab::embedded().clone();
+        let events = vec![
+            approved(
+                "2026-10-06T09:00:00+08:00",
+                "2026-10-06T09:40:00+08:00",
+                Some("2026-10-06T10:00:00.000Z"),
+                GUARD_PROJECT,
+                "Consulting",
+                "first",
+            ),
+            approved(
+                "2026-10-06T09:42:00+08:00",
+                "2026-10-06T10:30:00+08:00",
+                Some("2026-10-06T10:00:00.000Z"),
+                GUARD_PROJECT,
+                "Consulting",
+                "second",
+            ),
+        ];
+        let outcome = build_month_grid(2026, 10, &events, &vocab);
+        assert_eq!(outcome.rows.len(), 2);
+        assert!(outcome.warnings.is_empty());
     }
 }

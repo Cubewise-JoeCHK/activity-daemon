@@ -23,6 +23,14 @@
 //!   `device` = the day's majority session device, `data` = the activity
 //!   JSON (plus a `batch` stamp). Regenerating a day marks the old current
 //!   drafts superseded via the data field `superseded_by` (batch id).
+//! - Approve-aware regeneration (issue #60): approved time is never
+//!   re-drafted. Sessions overlapping a `timesheet-approved` span of the
+//!   day are skipped entirely (SKIP semantics - the alternative
+//!   link-and-update-in-place design was rejected: it couples the approve
+//!   flow to regeneration and rewrites approved history), and approved
+//!   draft rows are excluded from supersession so they stay the day's
+//!   visible record of what is already approved. Re-approving a
+//!   regenerated day therefore cannot produce duplicate approved events.
 //!
 //! Rows are attributed to the day by their own UTC offset (the device's
 //! local date of `ts_start`), so a hub in a different timezone than the
@@ -121,8 +129,12 @@ pub struct DayInput {
     /// `afk-watcher` rows (break merge adjacency; never activities).
     pub afk: Vec<EventRow>,
     /// `timesheet-draft` rows currently stored for the day (superseded on
-    /// regeneration).
+    /// regeneration; approved ones are kept - issue #60).
     pub old_drafts: Vec<EventRow>,
+    /// `timesheet-approved` rows overlapping the day (issue #60): any
+    /// session overlapping one of these spans is never re-drafted, so a
+    /// regenerate-then-reapprove loop cannot duplicate approved time.
+    pub approved: Vec<EventRow>,
 }
 
 /// One merge group as the titler sees it: only what a task/comment can be
@@ -228,9 +240,11 @@ pub struct DayPlan {
     pub device: String,
     /// Input rows skipped as malformed (unparseable timestamp/data).
     pub skipped_rows: usize,
-    /// Current (non-superseded) draft rows the storage step must mark
-    /// superseded - kept as full rows so `store_day` can rewrite their
-    /// data payload in place without re-reading.
+    /// Current (non-superseded, non-approved) draft rows the storage step
+    /// must mark superseded - kept as full rows so `store_day` can rewrite
+    /// their data payload in place without re-reading. Approved drafts are
+    /// never superseded (issue #60): they stay the day's carried-over
+    /// record of approved time.
     pub supersede_rows: Vec<EventRow>,
 }
 
@@ -563,6 +577,32 @@ fn draft_object(row: &EventRow) -> Option<serde_json::Map<String, serde_json::Va
     }
 }
 
+/// A draft payload's approved flag (ADR addendum on #16: drafts carry
+/// `approved_at` + the approved flag once approved). The review state wins:
+/// an approved draft is never superseded by a regeneration (issue #60).
+fn approved_flag(data: &serde_json::Map<String, serde_json::Value>) -> bool {
+    data.get("approved")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+/// The time span an approved event covers (issue #60): the activity's own
+/// `start`/`end` when both parse (the approve flow stores the draft JSON
+/// verbatim), the envelope's timestamp + duration otherwise. `None` marks
+/// a row whose envelope timestamp does not even parse - only that case
+/// shields nothing (insert validation makes it impossible for rows the
+/// hub wrote; the export's overlap guard remains the defence in depth).
+fn approved_span(row: &EventRow) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    let data = serde_json::from_str::<serde_json::Value>(&row.data).ok()?;
+    let parse = |value: Option<&str>| value.and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+    if let (Some(start), Some(end)) = (parse(data["start"].as_str()), parse(data["end"].as_str())) {
+        return Some((start, end));
+    }
+    let ts = row_ts(row)?;
+    let end = ts + Duration::milliseconds((row.duration_s * 1000.0).round() as i64);
+    Some((ts, end))
+}
+
 /// Compile one day's raw material into a [`DayPlan`] (activities, question
 /// hand-offs, supersession set). Deterministic; the only external influence
 /// is the injected [`BlockTitler`].
@@ -580,23 +620,49 @@ pub fn plan_day(
     skipped += afk_skipped;
     let day_str = day.format("%Y-%m-%d").to_string();
 
-    // Supersession set: current (non-superseded) draft rows of this day.
+    // Supersession set: current (non-superseded, non-approved) draft rows
+    // of this day. Approved drafts are excluded (issue #60): regeneration
+    // never tombstones approved time, the approved rows stay current so the
+    // review page keeps showing what is already approved.
     let supersede_rows: Vec<EventRow> = input
         .old_drafts
         .iter()
         .filter(|row| match row_ts(row) {
             Some(ts) if own_offset_date(ts) == day => draft_object(row)
-                .map(|data| !data.contains_key("superseded_by"))
+                .map(|data| !data.contains_key("superseded_by") && !approved_flag(&data))
                 .unwrap_or(false),
             _ => false,
         })
         .cloned()
         .collect();
 
+    // Approved spans of the day (issue #60), extracted from the
+    // `timesheet-approved` bucket rows the caller gathered. Reading the
+    // bucket (not just draft flags) also shields the crash window where an
+    // approved event exists but its draft flag write never landed.
+    let approved_spans: Vec<(DateTime<FixedOffset>, DateTime<FixedOffset>)> = input
+        .approved
+        .iter()
+        .filter(|row| matches!(row_ts(row), Some(ts) if own_offset_date(ts) == day))
+        .filter_map(approved_span)
+        .collect();
+
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut planned_questions: Vec<PlannedQuestion> = Vec::new();
 
     for session in &sessions {
+        // Approve-aware regeneration (issue #60): a session overlapping an
+        // approved span is already carried by the `timesheet-approved`
+        // bucket - re-drafting it would let a second approval duplicate
+        // approved time (the export would double-count). Skip it entirely;
+        // the residual unapproved time of a straddling session is left to
+        // the export's overlap guard rather than re-drafted.
+        if approved_spans
+            .iter()
+            .any(|(start, end)| session.start < *end && session.end > *start)
+        {
+            continue;
+        }
         // Analyses inside [start, end): the frame at a session's end
         // instant belongs to the next session (sessions tile the day).
         let attached: Vec<&AnalysisRec> = analyses
@@ -841,8 +907,9 @@ fn now_rfc3339() -> String {
 
 /// Write a [`DayPlan`] to the hub stores: create planned questions through
 /// the issue #44 store, mark the old current drafts superseded
-/// (`superseded_by` = this batch), insert the new drafts into the
-/// `timesheet-draft` bucket (and mark them synced - hub rows are terminal).
+/// (`superseded_by` = this batch; approved drafts are never marked -
+/// issue #60), insert the new drafts into the `timesheet-draft` bucket
+/// (and mark them synced - hub rows are terminal).
 pub fn store_day(
     db: &Db,
     questions: &TsQuestionStore,
@@ -979,6 +1046,66 @@ mod tests {
         )
     }
 
+    /// A stored draft row (issue #60 fixtures): optionally carrying the
+    /// approve flow's flags (`approved` + `approved_at`).
+    fn draft_row(id: i64, hour: u32, dur_s: f64, approved: bool) -> EventRow {
+        let start = format!("2026-11-06T{hour:02}:00:00{OFF}");
+        let end = format!(
+            "2026-11-06T{:02}:{:02}:00{OFF}",
+            hour + (dur_s as u32) / 3600,
+            (dur_s as u32 % 3600) / 60
+        );
+        let mut data = serde_json::json!({
+            "start": start,
+            "end": end,
+            "project_guess": "C1234",
+            "category": "Consulting",
+            "task": "Working on C1234",
+            "comment": "evidence",
+            "confidence": 0.9,
+            "sources": {
+                "frame_sha16s": [], "session_ids": [], "question_ids": []
+            },
+            "batch": "2026-11-06T08:00:00.000Z",
+        });
+        if approved {
+            data["approved"] = serde_json::json!(true);
+            data["approved_at"] = serde_json::json!("2026-11-06T18:00:00.000Z");
+            data["approved_event_id"] = serde_json::json!(900 + id);
+        }
+        row(id, BUCKET_TIMESHEET_DRAFT, &start, dur_s, data)
+    }
+
+    /// A stored approved event (issue #60 fixtures): the approve flow's
+    /// `timesheet-approved` insert (draft JSON verbatim + `approved_at`).
+    fn approved_event(id: i64, hour: u32, dur_s: f64) -> EventRow {
+        let start = format!("2026-11-06T{hour:02}:00:00{OFF}");
+        let end = format!(
+            "2026-11-06T{:02}:{:02}:00{OFF}",
+            hour + (dur_s as u32) / 3600,
+            (dur_s as u32 % 3600) / 60
+        );
+        row(
+            id,
+            crate::export::BUCKET_TIMESHEET_APPROVED,
+            &start,
+            dur_s,
+            serde_json::json!({
+                "start": start,
+                "end": end,
+                "project_guess": "C1234",
+                "category": "Consulting",
+                "task": "Working on C1234",
+                "comment": "evidence",
+                "confidence": 0.9,
+                "sources": {
+                    "frame_sha16s": [], "session_ids": [], "question_ids": []
+                },
+                "approved_at": "2026-11-06T18:00:00.000Z",
+            }),
+        )
+    }
+
     fn cfg() -> TimesheetConfig {
         TimesheetConfig::default()
     }
@@ -998,6 +1125,7 @@ mod tests {
                 BUCKET_FRAME_ANALYSIS => input.analyses.push(r),
                 "afk-watcher" => input.afk.push(r),
                 BUCKET_TIMESHEET_DRAFT => input.old_drafts.push(r),
+                crate::export::BUCKET_TIMESHEET_APPROVED => input.approved.push(r),
                 other => panic!("fixture bucket {other}"),
             }
         }
@@ -1369,6 +1497,176 @@ mod tests {
         third_input.old_drafts = draft_rows(&db);
         let third = store_day(&db, &questions, &plan(&third_input)).expect("store 3");
         assert_eq!(third.superseded_ids, vec![second.draft_ids[0]]);
+    }
+
+    // ------------------ fixture: approve-aware regeneration (issue #60)
+
+    #[test]
+    fn regeneration_skips_approved_spans_and_keeps_approved_drafts() {
+        let db = Db::open_in_memory().expect("db");
+        let questions = TsQuestionStore::open_in_memory().expect("store");
+        // The day as first compiled: two non-adjacent sessions, two
+        // drafts (the 1 h gap exceeds the adjacency limit, so the default
+        // 2 h max block cannot merge them).
+        let raw = input_for(vec![
+            session(1, 9, 0, 3600.0, "Code.exe"),  // 09:00-10:00
+            session(2, 11, 0, 3600.0, "Code.exe"), // 11:00-12:00
+            analysis(10, 9, 30, "C1234", "Consulting", 0.9),
+            analysis(11, 11, 30, "C1234", "Consulting", 0.9),
+        ]);
+        let first = store_day(&db, &questions, &plan(&raw)).expect("store 1");
+        assert_eq!(first.draft_ids.len(), 2);
+
+        // The owner approves both drafts (approve flow: draft flags + one
+        // `timesheet-approved` event per draft).
+        for draft_id in &first.draft_ids {
+            let rows = draft_rows(&db);
+            let row = rows.iter().find(|r| r.id == *draft_id).expect("draft");
+            let mut data: serde_json::Value = serde_json::from_str(&row.data).expect("json");
+            data["approved"] = serde_json::json!(true);
+            data["approved_at"] = serde_json::json!("2026-11-06T18:00:00.000Z");
+            db.update_event_data(row.id, &data.to_string())
+                .expect("flag");
+            db.insert_event(
+                &activity_core::EventEnvelope {
+                    bucket: crate::export::BUCKET_TIMESHEET_APPROVED.to_string(),
+                    timestamp: row.ts_start.clone(),
+                    duration_s: row.duration_s,
+                    data: data.clone(),
+                },
+                "laptop",
+            )
+            .expect("approved event");
+        }
+
+        // Regeneration after approval: the caller re-gathers every bucket,
+        // approved included, exactly like the server endpoint.
+        let mut regen_input = raw.clone();
+        regen_input.old_drafts = draft_rows(&db);
+        regen_input.approved = db
+            .query_event_rows_in(
+                Some(crate::export::BUCKET_TIMESHEET_APPROVED),
+                None,
+                None,
+                None,
+            )
+            .expect("query approved");
+        let plan = plan(&regen_input);
+        assert!(
+            plan.activities.is_empty(),
+            "every session is already approved: nothing re-drafted"
+        );
+        assert!(
+            plan.supersede_rows.is_empty(),
+            "approved drafts are never superseded"
+        );
+        assert!(plan.questions.is_empty());
+
+        let second = store_day(&db, &questions, &plan).expect("store 2");
+        assert!(second.draft_ids.is_empty());
+        assert!(second.superseded_ids.is_empty());
+
+        // Both approved drafts remain current (the review page keeps
+        // showing them) and the approved bucket still holds exactly one
+        // event per span - re-approving cannot double-count.
+        let rows = draft_rows(&db);
+        let current_count = rows
+            .iter()
+            .filter(|r| current_draft_from_row(r).is_some())
+            .count();
+        assert_eq!(current_count, 2);
+        let approved_count = db
+            .query_event_rows_in(
+                Some(crate::export::BUCKET_TIMESHEET_APPROVED),
+                None,
+                None,
+                None,
+            )
+            .expect("query approved")
+            .len();
+        assert_eq!(approved_count, 2);
+    }
+
+    #[test]
+    fn regeneration_redrafts_only_unapproved_time() {
+        // Span 1 (09:00-10:00) is approved; span 2 (10:00-11:00) is not.
+        // Regeneration must keep the approved draft, supersede the stale
+        // unapproved one, and re-draft only the unapproved session.
+        let approved_draft = draft_row(50, 9, 3600.0, true);
+        let stale_draft = draft_row(51, 10, 3600.0, false);
+        let expected_stale = stale_draft.clone();
+        let input = input_for(vec![
+            session(1, 9, 0, 3600.0, "Code.exe"),
+            session(2, 10, 0, 3600.0, "Code.exe"),
+            analysis(10, 9, 30, "C1234", "Consulting", 0.9),
+            analysis(11, 10, 30, "C1234", "Consulting", 0.9),
+            approved_draft,
+            stale_draft,
+            approved_event(60, 9, 3600.0),
+        ]);
+        let planned = plan(&input);
+        assert_eq!(planned.activities.len(), 1, "only 10:00-11:00 re-drafted");
+        assert_eq!(planned.activities[0].start, "2026-11-06T10:00:00+08:00");
+        assert_eq!(planned.supersede_rows, vec![expected_stale]);
+    }
+
+    #[test]
+    fn session_straddling_an_approved_span_is_skipped_entirely() {
+        // The approved span 10:00-11:00 (as stored) and a session that
+        // starts inside it: partial overlap still skips - re-drafting any
+        // part of it would duplicate approved time once re-approved.
+        let input = input_for(vec![
+            EventRow {
+                ts_start: "2026-11-06T10:30:00+08:00".to_string(),
+                ..session(1, 10, 0, 3600.0, "Code.exe") // 10:30-11:30
+            },
+            analysis(10, 10, 40, "C1234", "Consulting", 0.9),
+            approved_event(60, 10, 3600.0), // 10:00-11:00
+        ]);
+        let planned = plan(&input);
+        assert!(planned.activities.is_empty());
+    }
+
+    #[test]
+    fn approved_rows_with_unparseable_timestamp_shield_nothing() {
+        // The only row approved_span rejects is one whose envelope
+        // timestamp does not parse: it yields no span, so the session is
+        // re-drafted (the export overlap guard is the defence in depth for
+        // anything that slips through and gets approved twice).
+        let broken = row(
+            60,
+            crate::export::BUCKET_TIMESHEET_APPROVED,
+            "not-a-timestamp",
+            3600.0,
+            serde_json::json!({ "start": "2026-11-06T09:00:00+08:00" }),
+        );
+        let input = input_for(vec![
+            session(1, 9, 0, 3600.0, "Code.exe"),
+            analysis(10, 9, 30, "C1234", "Consulting", 0.9),
+            broken,
+        ]);
+        let planned = plan(&input);
+        assert_eq!(planned.activities.len(), 1, "session still re-drafted");
+    }
+
+    #[test]
+    fn approved_span_falls_back_to_envelope_timestamp_and_duration() {
+        // An approved event whose data lost its start/end fields still
+        // shields its span via the envelope (ts_start + duration_s).
+        let approved = row(
+            60,
+            crate::export::BUCKET_TIMESHEET_APPROVED,
+            "2026-11-06T09:00:00+08:00",
+            3600.0,
+            serde_json::json!({ "task": "reconstructed" }),
+        );
+        let input = input_for(vec![
+            session(1, 9, 0, 3600.0, "Code.exe"),
+            analysis(10, 9, 30, "C1234", "Consulting", 0.9),
+            approved,
+        ]);
+        let planned = plan(&input);
+        assert!(planned.activities.is_empty(), "span shielded by envelope");
     }
 
     // ------------------------------------- defensive parsing
