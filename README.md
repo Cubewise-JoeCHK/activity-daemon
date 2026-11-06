@@ -155,8 +155,16 @@ What happens on a newer release (safety order matters):
 4. Shut down gracefully (same path as Ctrl+C: workers join, the window
    watcher flushes its open session) and relaunch - via the "ActivityDaemon"
    Task Scheduler task when installed, otherwise the new exe is spawned
-   detached. The new version starts, finds no newer release, and the cycle
-   repeats on the next release.
+   detached.
+5. Verify the relaunch (issue #37): the exiting daemon waits up to 15 s for
+   the new instance's first heartbeat beat - the pid must CHANGE, because
+   the old daemon's final shutdown beat is fresh but carries the old pid.
+   When the new exe never comes up (e.g. an EDR kills it on sight -
+   observed live on 2026-11-06, silently killing capture for the rest of
+   the day), the update rolls back automatically: the failed exe moves to
+   `<exe>.bad`, the `.old` copy returns to the canonical path, the previous
+   version is relaunched and the rollback is printed loudly. The watchdog
+   service (issue #36) stays as the second layer of defence.
 
 Manual commands: `activity-daemon update` (check now + apply; when the
 daemon is running it is asked to restart gracefully via the
@@ -164,8 +172,10 @@ daemon is running it is asked to restart gracefully via the
 and `activity-daemon update check` (report only: current version, latest
 release, whether it would apply).
 
-**Rollback**: stop the daemon (Ctrl+C or `startup uninstall`) and copy the
-old binary back over the new one - the rollback copy sits next to your exe
+**Rollback**: a failed relaunch rolls itself back automatically (step 5
+above; the failed exe is kept as `<exe>.bad`). Manual rollback still works:
+stop the daemon (Ctrl+C or `startup uninstall`) and copy the old binary
+back over the new one - the rollback copy sits next to your exe
 (e.g. `C:\tools\activity-daemon.exe.old`):
 
 ```

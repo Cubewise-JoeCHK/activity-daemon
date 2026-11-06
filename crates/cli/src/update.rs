@@ -59,6 +59,14 @@ pub const UPDATE_DIR_NAME: &str = "update";
 pub const RESTART_REQUEST_FILE: &str = "restart.request";
 /// Suffix of the rollback copy kept next to the exe.
 pub const OLD_SUFFIX: &str = ".old";
+/// Suffix of a rolled-back (failed) new exe, kept next to the exe for the
+/// post-mortem. Exactly one exists between incidents (issue #37).
+pub const BAD_SUFFIX: &str = ".bad";
+/// How long the relaunch waits for the NEW daemon's first heartbeat beat
+/// before declaring the update failed and rolling back (issue #37). The
+/// new instance beats within ~1s of spawning; the scheduled-task path is
+/// slower, so this is generous on purpose.
+pub const RELAUNCH_VERIFY: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Guard so two updates can never be in flight in one process (within the
 /// daemon the check runs on the main loop thread only; the guard also
@@ -94,6 +102,13 @@ pub fn select_assets(assets: &[Asset]) -> Result<SelectedAssets> {
 pub fn old_path(exe: &Path) -> PathBuf {
     let mut name = exe.file_name().unwrap_or(exe.as_os_str()).to_os_string();
     name.push(OLD_SUFFIX);
+    exe.with_file_name(name)
+}
+
+/// Failed-update keep-forever-for-the-post-mortem copy: `<exe>.bad`.
+pub fn bad_path(exe: &Path) -> PathBuf {
+    let mut name = exe.file_name().unwrap_or(exe.as_os_str()).to_os_string();
+    name.push(BAD_SUFFIX);
     exe.with_file_name(name)
 }
 
@@ -338,10 +353,82 @@ pub fn relaunch_mode(task_exists: bool) -> RelaunchMode {
     }
 }
 
+/// Wait for the NEW daemon's first heartbeat beat (issue #37).
+///
+/// The exiting process wrote a FINAL beat on shutdown - fresh, but carrying
+/// the old pid - so freshness alone proves nothing: only a beat with a
+/// DIFFERENT pid proves the new instance is alive (heartbeat.rs has carried
+/// the pid for exactly this). Returns `false` on timeout.
+pub fn wait_for_relaunch_beat(data_dir: &Path, old_pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(hb) = crate::heartbeat::read(data_dir) {
+            if hb.pid != old_pid && hb.age_s < crate::heartbeat::MAX_AGE_S {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Roll a failed update back (issue #37): the new exe (currently at the
+/// canonical path) moves to `<exe>.bad` - allowed on Windows even when a
+/// wedged new process still runs - and the `.old` copy returns to the
+/// canonical path. A previous `.bad` is removed first (exactly one exists
+/// between incidents). Restores nothing on failure of the second rename:
+/// the error carries the manual-recovery path, mirroring `swap_in_place`.
+pub fn rollback_update(exe: &Path) -> Result<()> {
+    let bad = bad_path(exe);
+    if bad.exists() {
+        std::fs::remove_file(&bad).with_context(|| {
+            format!(
+                "cannot remove the previous failed-update copy {}",
+                bad.display()
+            )
+        })?;
+    }
+    std::fs::rename(exe, &bad)
+        .with_context(|| format!("cannot move the failed exe to {}", bad.display()))?;
+    let old = old_path(exe);
+    if let Err(e) = std::fs::rename(&old, exe) {
+        // Put the failed exe back so the canonical path is not empty.
+        match std::fs::rename(&bad, exe) {
+            Ok(()) => bail!(
+                "cannot restore the rollback copy ({e}); the failed exe is back at {} - \
+                 restore {} manually",
+                exe.display(),
+                old.display()
+            ),
+            Err(restore_err) => bail!(
+                "cannot restore the rollback copy ({e}); the restore failed too ({restore_err}): \
+                 the old binary is at {} - move it back manually",
+                old.display()
+            ),
+        }
+    }
+    log::info!(
+        "rollback: {} restored; failed update kept as {}",
+        exe.display(),
+        bad.display()
+    );
+    Ok(())
+}
+
 /// Relaunch the (updated) daemon: through the "ActivityDaemon" Task
 /// Scheduler task when it exists, otherwise detached with `run`.
-pub fn relaunch_after_update() -> Result<()> {
+///
+/// Issue #37: the relaunch is then VERIFIED - the exiting daemon waits for
+/// the new instance's first heartbeat beat (a beat with a different pid).
+/// A relaunch that never beats rolls the update back to the `.old` copy
+/// and relaunches the old version loudly. This is the 2026-11-06 incident
+/// fix: the new exe was swapped in, never came up (EDR suspect), and the
+/// machine silently lost the rest of the day.
+pub fn relaunch_after_update(data_dir: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("cannot resolve the current exe path")?;
+    let old_pid = std::process::id();
     match relaunch_mode(task_exists()) {
         RelaunchMode::ScheduledTask => {
             log::info!("relaunch: starting the scheduled task {TASK_NAME}");
@@ -354,7 +441,45 @@ pub fn relaunch_after_update() -> Result<()> {
             println!("relaunched {} detached", exe.display());
         }
     }
-    Ok(())
+
+    // Verify the new daemon actually beats (issue #37). The lock is
+    // already released (run.rs) - the new instance can acquire it and
+    // write its first beat immediately.
+    if wait_for_relaunch_beat(data_dir, old_pid, RELAUNCH_VERIFY) {
+        println!("relaunch verified: the new daemon is beating");
+        return Ok(());
+    }
+
+    // The new exe never came up. Roll back loudly - this is exactly the
+    // failure mode that silently killed capture on 2026-11-06.
+    println!(
+        "WARNING: the updated exe did not start within {}s - rolling the update back",
+        RELAUNCH_VERIFY.as_secs()
+    );
+    log::warn!("update rollback: the relaunched daemon produced no heartbeat beat");
+    rollback_update(&exe)?;
+    match relaunch_mode(task_exists()) {
+        RelaunchMode::ScheduledTask => {
+            schtasks_run().context("rollback: cannot start the scheduled task")?;
+        }
+        RelaunchMode::DetachedSpawn => {
+            spawn_detached(&exe).context("rollback: cannot spawn the restored exe")?;
+        }
+    }
+    if wait_for_relaunch_beat(data_dir, old_pid, RELAUNCH_VERIFY) {
+        println!(
+            "rolled back: the previous version is running again (failed exe kept as {})",
+            bad_path(&exe).display()
+        );
+        Ok(())
+    } else {
+        bail!(
+            "rolled back to {} but it did not beat either - the watchdog (issue #36) or the \
+             next logon must recover; failed exe kept as {}",
+            exe.display(),
+            bad_path(&exe).display()
+        )
+    }
 }
 
 /// Whether the "ActivityDaemon" scheduled task exists; any `schtasks
@@ -912,5 +1037,86 @@ mod tests {
         assert_eq!(relaunch_mode(true), RelaunchMode::ScheduledTask);
         assert_eq!(relaunch_mode(false), RelaunchMode::DetachedSpawn);
         assert!(user_agent().starts_with("activity-daemon/"));
+    }
+
+    /// The relaunch verifier (issue #37) keys on the PID CHANGE, not on
+    /// freshness alone: the old daemon's final shutdown beat is fresh but
+    /// carries the old pid, and only a different pid proves the new
+    /// instance is alive.
+    #[test]
+    fn relaunch_beat_requires_a_pid_change() {
+        let dir = temp_dir("relaunch-beat");
+        let old_pid = std::process::id();
+        let new_pid = 999_999; // cannot exist anywhere
+
+        // No heartbeat at all: timeout (kept tiny so the test is fast).
+        assert!(!wait_for_relaunch_beat(
+            &dir,
+            old_pid,
+            std::time::Duration::from_millis(250)
+        ));
+
+        // The old daemon's final beat (fresh, but OUR pid): must NOT count
+        // as the new instance coming up.
+        crate::heartbeat::write(&dir).expect("write old final beat");
+        let started = std::time::Instant::now();
+        assert!(
+            !wait_for_relaunch_beat(&dir, old_pid, std::time::Duration::from_millis(400)),
+            "our own fresh final beat is not a new instance"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(350),
+            "waited"
+        );
+
+        // A fresh beat from a different pid: the new daemon is alive.
+        let ts = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        std::fs::write(
+            crate::heartbeat::heartbeat_path(&dir),
+            format!("{ts} {new_pid}\n"),
+        )
+        .expect("write new-instance beat");
+        assert!(wait_for_relaunch_beat(
+            &dir,
+            old_pid,
+            std::time::Duration::from_secs(5)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rollback dance (issue #37): the failed exe moves to `<exe>.bad`,
+    /// the `.old` copy returns to the canonical path. With no `.old` present
+    /// the rollback fails and the failed exe is PUT BACK (the canonical path
+    /// is never left empty).
+    #[test]
+    fn rollback_update_restores_the_old_exe_and_keeps_the_bad_one() {
+        let dir = temp_dir("rollback");
+        let exe = dir.join("activity-daemon.exe");
+        std::fs::write(&exe, "NEW BROKEN BUILD").expect("write new exe");
+        std::fs::write(old_path(&exe), "OLD GOOD BUILD").expect("write old exe");
+
+        rollback_update(&exe).expect("rollback");
+        assert_eq!(
+            std::fs::read_to_string(&exe).expect("canonical path"),
+            "OLD GOOD BUILD",
+            "the old exe is back at the canonical path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bad_path(&exe)).expect("bad copy"),
+            "NEW BROKEN BUILD",
+            "the failed exe is kept for the post-mortem"
+        );
+        assert!(!old_path(&exe).exists(), "exactly one .old contract");
+
+        // No .old present any more (the first rollback consumed it): the
+        // rollback must fail WITHOUT emptying the canonical path.
+        std::fs::write(&exe, "SECOND BROKEN BUILD").expect("write new exe");
+        assert!(rollback_update(&exe).is_err(), "no .old to restore");
+        assert_eq!(
+            std::fs::read_to_string(&exe).expect("canonical path intact"),
+            "SECOND BROKEN BUILD",
+            "the failed exe was put back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -29,7 +29,8 @@
 //!   `record.json` control file (atomic write, `trigger: "cli"`).
 //! - `update` / `update check` - self-update from GitHub Releases (issue
 //!   #17): sha256-verified download, `<exe>.old` rollback copy, graceful
-//!   restart and relaunch.
+//!   restart, then a verified relaunch - when the new instance produces no
+//!   heartbeat beat within 15s the update rolls itself back (issue #37).
 //! - `usage` - per-feature usage counts over today / 7d / 30d / all-time
 //!   (issue #27); every user-initiated action above logs one `usage` event
 //!   (fire-and-forget), automatic features never log.

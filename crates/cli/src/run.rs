@@ -111,7 +111,7 @@ pub fn cmd_run(config_override: Option<&Path>) -> Result<()> {
         }
         ExitAction::Restart => {
             println!("daemon stopped cleanly; relaunching on the updated version...");
-            update::relaunch_after_update()
+            update::relaunch_after_update(&data_dir)
         }
     }
 }

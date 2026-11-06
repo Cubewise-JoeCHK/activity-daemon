@@ -22,8 +22,9 @@ need; the owner queries when filling a timesheet or reflecting.
 - Collection is self-healing: one command takes a machine from bare install
   to fully supervised capture - autostart, a watchdog that notices a dead
   or wedged daemon and restarts it, no accidental sleep - without the owner
-  hand-wiring schedulers or babysitting services. A silent daemon must
-  never cost a day of data again (issue #36).
+  hand-wiring schedulers or babysitting services. An update that fails to
+  come up rolls itself back. A silent daemon must never cost a day of data
+  again (issues #36, #37).
 - Every byte flows to the WSL central hub over Tailscale. Nothing ever
   leaves the owner's tailnet. No third-party services, ever.
 - The WSL box is the central data hub: the central store, all AI activity
