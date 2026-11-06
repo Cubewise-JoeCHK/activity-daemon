@@ -52,6 +52,8 @@ pub const ACTION_CHECK: &str = "check";
 // Windows-only; on other platforms these exist for the pinned taxonomy test
 // (the bin target would otherwise flag them as dead code).
 #[cfg_attr(not(windows), allow(dead_code))]
+pub const ACTION_OPEN_DASHBOARD: &str = "open-dashboard";
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const ACTION_UPDATE_NOW: &str = "update-now";
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const ACTION_QUIT: &str = "quit";
@@ -343,6 +345,7 @@ mod tests {
         assert_eq!(ACTION_UNINSTALL, "uninstall");
         assert_eq!(ACTION_APPLY, "apply");
         assert_eq!(ACTION_CHECK, "check");
+        assert_eq!(ACTION_OPEN_DASHBOARD, "open-dashboard");
         assert_eq!(ACTION_UPDATE_NOW, "update-now");
         assert_eq!(ACTION_QUIT, "quit");
     }

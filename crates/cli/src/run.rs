@@ -154,11 +154,12 @@ fn run_locked(data_dir: &Path, cfg: &activity_core::Config) -> Result<ExitAction
     let heartbeat_handle = heartbeat::spawn_writer(data_dir, &SHUTDOWN);
     install_ctrl_handler();
     // Issue #30: presence without a console - the tray thread reports
-    // health and offers Update now / Quit. A tray failure never blocks the
-    // daemon (logged, skipped).
+    // health and offers Open dashboard / Update now / Quit. A tray failure
+    // never blocks the daemon (logged, skipped).
     let _tray = tray::spawn_tray(
         data_dir.to_path_buf(),
         cfg.sync.device_name.clone(),
+        tray::dashboard_url(&cfg.sync.server_url),
         &SHUTDOWN,
     );
 

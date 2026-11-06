@@ -14,10 +14,13 @@
 //!   the heartbeat is stale (assets/README.md). The taskbar theme picks the
 //!   dark- or light-bg variant once at startup; the size follows the
 //!   system small-icon metric.
-//! - Right-click menu: `Update now` (a one-shot flag the run loop consumes -
-//!   the same update path as the manual `update` command) and `Quit` (sets
-//!   the same [`SHUTDOWN`] flag as Ctrl+C - graceful worker join). Left
-//!   click is a no-op (the pause switch stays with issue #14).
+//! - Right-click menu: `Open dashboard` (the hub web UI at the configured
+//!   `[sync] server_url`, opened in the default browser via ShellExecuteW -
+//!   no URL to remember), `Update now` (a one-shot flag the run loop
+//!   consumes - the same update path as the manual `update` command) and
+//!   `Quit` (sets the same [`SHUTDOWN`] flag as Ctrl+C - graceful worker
+//!   join). Left click is the same one-click dashboard shortcut (the pause
+//!   switch stays with issue #14).
 //! - The tray only ever *reads* daemon state and *writes* the two atomics;
 //!   it never touches the workers directly, so a tray failure can never
 //!   take the daemon down (spawn failures are logged and skipped).
@@ -106,6 +109,20 @@ pub fn latest_meeting_audio_is_recording(events: &[Event]) -> bool {
         .filter_map(|event| event.data.get("state").and_then(|s| s.as_str()))
         .next_back()
         .is_some_and(|state| state == "start")
+}
+
+/// The dashboard URL the tray opens, derived from `[sync] server_url` (the
+/// hub serves the web UI at its root). `None` when the setting is blank or
+/// whitespace (sync not configured - no menu item, left click stays a
+/// no-op). A trailing slash is trimmed so the browser lands on `/` cleanly.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn dashboard_url(server_url: &str) -> Option<String> {
+    let trimmed = server_url.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.trim_end_matches('/').to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,9 +233,11 @@ const TIMER_ID: usize = 1;
 const TIMER_INTERVAL_MS: u32 = 1000;
 /// Popup menu command ids.
 #[cfg(windows)]
-const MENU_UPDATE_NOW: u32 = 1;
+const MENU_OPEN_DASHBOARD: u32 = 1;
 #[cfg(windows)]
-const MENU_QUIT: u32 = 2;
+const MENU_UPDATE_NOW: u32 = 2;
+#[cfg(windows)]
+const MENU_QUIT: u32 = 3;
 
 /// HWND of the live tray window (0 = none). Set by the wndproc on
 /// WM_CREATE, cleared on WM_DESTROY; lets the daemon shutdown path ask the
@@ -233,6 +252,9 @@ static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsiz
 struct TrayCtx {
     data_dir: PathBuf,
     device: String,
+    /// Hub web UI base URL (`[sync] server_url`); `None` = no dashboard
+    /// menu item and left click stays a no-op.
+    dashboard_url: Option<String>,
     shutdown: &'static AtomicBool,
     /// Own Db connection (same threading contract as the four workers:
     /// each thread opens its own; recording-state reads never block them).
@@ -254,6 +276,7 @@ thread_local! {
 pub fn spawn_tray(
     data_dir: PathBuf,
     device: String,
+    dashboard_url: Option<String>,
     shutdown: &'static AtomicBool,
 ) -> Option<JoinHandle<()>> {
     #[cfg(windows)]
@@ -261,7 +284,9 @@ pub fn spawn_tray(
         std::thread::Builder::new()
             .name("tray".to_string())
             .spawn(move || {
-                if let Err(e) = win_impl::run_message_loop(data_dir, device, shutdown) {
+                if let Err(e) =
+                    win_impl::run_message_loop(data_dir, device, dashboard_url, shutdown)
+                {
                     log::warn!("tray icon unavailable (continuing without it): {e:#}");
                 }
             })
@@ -270,7 +295,7 @@ pub fn spawn_tray(
     #[cfg(not(windows))]
     {
         // No tray on non-Windows; parameters exist for signature parity.
-        let _ = (data_dir, device, shutdown);
+        let _ = (data_dir, device, dashboard_url, shutdown);
         None
     }
 }
@@ -314,23 +339,24 @@ mod win_impl {
     use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
     use windows::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-        NIM_SETVERSION, NOTIFYICONDATAW,
+        ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+        NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
         DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
         KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
         TrackPopupMenu, TranslateMessage, HICON, HWND_MESSAGE, LR_DEFAULTCOLOR, MF_STRING, MSG,
-        SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CREATE,
-        WM_DESTROY, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+        SM_CXSMICON, SM_CYSMICON, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+        WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
     };
 
     use super::{
         latest_meeting_audio_is_recording, nearest_tray_size, state_index, tray_state,
-        tray_tooltip, MenuCommand, TrayCtx, TrayState, MENU_QUIT, MENU_UPDATE_NOW, TIMER_ID,
-        TIMER_INTERVAL_MS, TRAY_CTX, TRAY_HWND, TRAY_ICON_ID, TRAY_PNG_DARK, TRAY_PNG_LIGHT,
-        TRAY_SIZES, TRAY_UPDATE_REQUEST, TRAY_VERSION, WM_TRAY_CALLBACK, WM_TRAY_TEARDOWN,
+        tray_tooltip, MenuCommand, TrayCtx, TrayState, MENU_OPEN_DASHBOARD, MENU_QUIT,
+        MENU_UPDATE_NOW, TIMER_ID, TIMER_INTERVAL_MS, TRAY_CTX, TRAY_HWND, TRAY_ICON_ID,
+        TRAY_PNG_DARK, TRAY_PNG_LIGHT, TRAY_SIZES, TRAY_UPDATE_REQUEST, TRAY_VERSION,
+        WM_TRAY_CALLBACK, WM_TRAY_TEARDOWN,
     };
     use crate::heartbeat::{self, HeartbeatState};
     use crate::usage_log;
@@ -342,6 +368,7 @@ mod win_impl {
     pub(super) fn run_message_loop(
         data_dir: std::path::PathBuf,
         device: String,
+        dashboard_url: Option<String>,
         shutdown: &'static AtomicBool,
     ) -> anyhow::Result<()> {
         // Own Db connection for recording-state queries (best effort; the
@@ -359,6 +386,7 @@ mod win_impl {
             *cell.borrow_mut() = Some(TrayCtx {
                 data_dir,
                 device,
+                dashboard_url,
                 shutdown,
                 db,
                 last_state: None,
@@ -433,7 +461,9 @@ mod win_impl {
             let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
             SetTimer(Some(hwnd), TIMER_ID, TIMER_INTERVAL_MS, None);
         }
-        log::info!("tray icon installed (right-click: Update now / Quit)");
+        log::info!(
+            "tray icon installed (Open dashboard / Update now / Quit; left click = dashboard)"
+        );
 
         let mut msg = MSG::default();
         loop {
@@ -471,9 +501,11 @@ mod win_impl {
                 let mouse = (lparam.0 & 0xFFFF) as u32;
                 if mouse == WM_RBUTTONUP {
                     show_context_menu(hwnd);
+                } else if mouse == WM_LBUTTONUP {
+                    // One-click dashboard shortcut (the menu item is the
+                    // discoverable twin; the pause switch stays with #14).
+                    open_dashboard();
                 }
-                // WM_LBUTTONUP and everything else: no-op by design (issue
-                // #30 leaves the pause switch with issue #14).
                 LRESULT(0)
             }
             WM_TRAY_TEARDOWN => {
@@ -518,8 +550,9 @@ mod win_impl {
         }
     }
 
-    /// Build + track the right-click context menu (`Update now` / `Quit`).
-    /// The tray context is taken out of its thread_local for the modal
+    /// Build + track the right-click context menu (`Open dashboard` when a
+    /// dashboard URL is configured / `Update now` / `Quit`). The tray
+    /// context is taken out of its thread_local for the modal
     /// `TrackPopupMenu` call so a concurrent timer tick cannot double-borrow
     /// it; the menu action runs after the menu returns.
     unsafe fn show_context_menu(hwnd: HWND) {
@@ -535,6 +568,15 @@ mod win_impl {
                 return;
             }
         };
+        if ctx.dashboard_url.is_some() {
+            let dashboard_label = wide("Open dashboard");
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                MENU_OPEN_DASHBOARD as usize,
+                PCWSTR::from_raw(dashboard_label.as_ptr()),
+            );
+        }
         let update_label = wide("Update now");
         let quit_label = wide("Quit");
         let _ = AppendMenuW(
@@ -568,6 +610,13 @@ mod win_impl {
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
 
         match MenuCommand::from_id(u32::try_from(choice.0).unwrap_or(0)) {
+            Some(MenuCommand::OpenDashboard) => {
+                // User-initiated: logs {tray, open-dashboard}
+                // (fire-and-forget), then opens the hub web UI. Uses the
+                // taken-out ctx directly - TRAY_CTX is empty while the
+                // menu is open.
+                open_dashboard_from_ctx(&ctx);
+            }
             Some(MenuCommand::UpdateNow) => {
                 // User-initiated: logs {tray, update-now} (fire-and-forget),
                 // then asks the run loop for an update via the one-shot flag
@@ -597,6 +646,48 @@ mod win_impl {
         }
 
         TRAY_CTX.with(|cell| *cell.borrow_mut() = Some(ctx));
+    }
+
+    /// Open the hub web UI in the default browser (ShellExecuteW "open" -
+    /// zero dependencies, the same verb Explorer uses). Shared by both
+    /// entry points (menu item + left click); records the usage row here so
+    /// each activation logs exactly once. A blank `[sync] server_url` is a
+    /// logged no-op.
+    fn open_dashboard_from_ctx(ctx: &TrayCtx) {
+        let Some(url) = &ctx.dashboard_url else {
+            log::info!("tray: no dashboard URL configured ([sync] server_url is empty)");
+            return;
+        };
+        usage_log::record(
+            &ctx.data_dir,
+            &ctx.device,
+            usage_log::FEATURE_TRAY,
+            usage_log::ACTION_OPEN_DASHBOARD,
+        );
+        let verb = wide("open");
+        let target = wide(url);
+        // SAFETY: all strings are NUL-terminated buffers that outlive the
+        // call; the returned HINSTANCE (DDE handle) is discarded.
+        unsafe {
+            let _ = ShellExecuteW(
+                None,
+                PCWSTR::from_raw(verb.as_ptr()),
+                PCWSTR::from_raw(target.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            );
+        }
+        log::info!("tray: dashboard opened ({url})");
+    }
+
+    /// Left-click entry point: forwards to [`open_dashboard_from_ctx`] via
+    /// the thread_local (a no-op if the tray context is gone).
+    fn open_dashboard() {
+        let handled = TRAY_CTX.with(|cell| cell.borrow().as_ref().map(open_dashboard_from_ctx));
+        if handled.is_none() {
+            log::info!("tray: no dashboard URL configured ([sync] server_url is empty)");
+        }
     }
 
     /// Null-terminated UTF-16 for Win32 string parameters (NUL included).
@@ -764,7 +855,9 @@ mod win_impl {
 /// Which popup menu command `TrackPopupMenu` returned (`None` = dismissed
 /// without a selection).
 #[cfg(windows)]
+#[derive(Debug, PartialEq)]
 enum MenuCommand {
+    OpenDashboard,
     UpdateNow,
     Quit,
 }
@@ -773,6 +866,7 @@ enum MenuCommand {
 impl MenuCommand {
     fn from_id(id: u32) -> Option<MenuCommand> {
         match id {
+            MENU_OPEN_DASHBOARD => Some(MenuCommand::OpenDashboard),
             MENU_UPDATE_NOW => Some(MenuCommand::UpdateNow),
             MENU_QUIT => Some(MenuCommand::Quit),
             _ => None,
@@ -880,6 +974,44 @@ mod tests {
         TRAY_UPDATE_REQUEST.store(true, Ordering::Relaxed);
         assert!(take_update_request());
         assert!(!take_update_request(), "exactly once");
+    }
+
+    #[test]
+    fn dashboard_url_derives_from_sync_server_url() {
+        assert_eq!(
+            dashboard_url("http://activity-hub:8080"),
+            Some("http://activity-hub:8080".to_string())
+        );
+        // trailing slash is trimmed so the browser lands on `/` cleanly
+        assert_eq!(
+            dashboard_url("http://activity-hub:8080/"),
+            Some("http://activity-hub:8080".to_string())
+        );
+        // surrounding whitespace tolerated, interior kept verbatim
+        assert_eq!(
+            dashboard_url("  http://hub:8080/tailscale  "),
+            Some("http://hub:8080/tailscale".to_string())
+        );
+        // blank / whitespace-only: no dashboard (no menu item, no-op click)
+        assert_eq!(dashboard_url(""), None);
+        assert_eq!(dashboard_url("   "), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn menu_command_ids_map() {
+        use super::{MENU_OPEN_DASHBOARD, MENU_QUIT, MENU_UPDATE_NOW};
+        assert_eq!(
+            MenuCommand::from_id(MENU_OPEN_DASHBOARD),
+            Some(MenuCommand::OpenDashboard)
+        );
+        assert_eq!(
+            MenuCommand::from_id(MENU_UPDATE_NOW),
+            Some(MenuCommand::UpdateNow)
+        );
+        assert_eq!(MenuCommand::from_id(MENU_QUIT), Some(MenuCommand::Quit));
+        assert_eq!(MenuCommand::from_id(0), None, "dismissed menu");
+        assert_eq!(MenuCommand::from_id(99), None, "unknown id");
     }
 
     #[test]

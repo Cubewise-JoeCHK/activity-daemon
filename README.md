@@ -247,11 +247,14 @@ instead:
     `activity-daemon v0.1.2: recording` (while the meeting-audio watcher is
     recording), or `activity-daemon v0.1.2: heartbeat stale` (no fresh
     heartbeat file - refreshed every second),
-  - right-click menu: **Update now** (runs the same update path as the
-    manual `update` command; the daemon restarts gracefully onto the new
-    version) and **Quit** (the same graceful shutdown as Ctrl+C - workers
-    join, the open window session flushes). Left-click is a no-op for now
-    (a pause switch stays with issue #14).
+  - right-click menu: **Open dashboard** (the hub web UI at the configured
+    `[sync] server_url`, opened in the default browser - no URL to
+    remember), **Update now** (runs the same update path as the manual
+    `update` command; the daemon restarts gracefully onto the new version)
+    and **Quit** (the same graceful shutdown as Ctrl+C - workers join, the
+    open window session flushes). Left-click is the same one-click
+    dashboard shortcut (a pause switch stays with issue #14); with no
+    `server_url` configured both are a logged no-op.
   - the tray never blocks the daemon: if it cannot start (e.g. Explorer is
     not running), the reason is logged and `run` continues without it.
 
@@ -279,6 +282,7 @@ today / 7d / 30d / all-time from the local store (`--json` for machines);
 | `startup` | `uninstall` | `startup uninstall` (non-dry-run; the `startup status` query does NOT log) |
 | `update` | `apply` | manual `update` only - the automatic scheduled check NEVER logs |
 | `update` | `check` | manual `update check` only - never the scheduled check |
+| `tray` | `open-dashboard` | the tray menu's `Open dashboard` / tray left-click (opens the hub web UI) |
 | `tray` | `update-now` | the tray menu's `Update now` (issue #30) |
 | `tray` | `quit` | the tray menu's `Quit` (issue #30) |
 | `usage` | `view` | the `usage` report itself (honest meta-signal) |
