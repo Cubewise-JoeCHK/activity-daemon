@@ -6,13 +6,20 @@ file. If it does not, it does not get built.
 
 ## Primary uses
 
-1. Timesheet / report filling - reconstruct what was worked on, for how long.
+1. Timesheet / report filling - reconstruct what was worked on, for how
+   long. Concrete contract: the hub compiles a daily itinerary draft; the
+   owner reviews it and comments per activity; approved activities export
+   at month end into the Cubewise offline template.
 2. Self-reflection on work state - work hours, overtime signals.
 
 ## Consumption pattern
 
-Ad-hoc, on demand. There is no dashboard habit and no scheduled reporting
-need; the owner queries when filling a timesheet or reflecting.
+Amended (ADR addendum on #16, 2026-11-06): no longer purely ad-hoc. The hub
+analyses new screen frames as they arrive (event-driven) and compiles a
+daily itinerary draft automatically; the owner reviews the draft, comments
+per activity and approves in the hub web UI; approved activities export at
+month end. Beyond that there is still no dashboard habit and no
+scheduled-report need; the owner queries ad-hoc when reflecting.
 
 ## Collection pattern
 
@@ -27,8 +34,13 @@ need; the owner queries when filling a timesheet or reflecting.
   again (issues #36, #37).
 - Every byte flows to the WSL central hub over Tailscale. Nothing ever
   leaves the owner's tailnet. No third-party services, ever.
-- The WSL box is the central data hub: the central store, all AI activity
-  and all analysis happen there.
+- The WSL box is the central data hub: the central store, the archive and
+  all pipeline orchestration live there. Amended (ADR addendum on #16,
+  2026-11-06): model inference runs on the owner's Windows GPU box via
+  Lemonade Server, not on the hub - the Windows box is the only GPU in the
+  tailnet, the frames are already on the hub for the pipeline to
+  orchestrate, and the hub calls the GPU box over Tailscale so nothing
+  ever leaves the tailnet.
 - Hub upkeep is not a chore: hub software stays current and the container
   comes back after a crash without the owner SSH-ing in to babysit it
   (same self-update contract as the clients; issue #32).
@@ -52,5 +64,5 @@ need; the owner queries when filling a timesheet or reflecting.
 
 Single user. Minimal moving parts. Every feature must trace to a stated
 need in this file. Raw data is collected first; refinement (OCR, STT,
-classification, summaries) happens later as separate stages on the hub -
-never at the cost of raw data fidelity.
+classification, summaries) happens later as separate stages orchestrated
+on the hub - never at the cost of raw data fidelity.
