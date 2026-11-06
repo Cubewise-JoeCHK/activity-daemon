@@ -14,5 +14,6 @@ pub use config::{
     AudioConfig, Config, HideConsole, RunConfig, ScreenConfig, ScreenMonitors, SyncConfig,
 };
 pub use storage::{
-    CoreError, Db, Event, EventEnvelope, EventRow, BUCKET_AFK, BUCKET_MEDIA, BUCKET_WINDOW,
+    CoreError, Db, Event, EventEnvelope, EventRow, BUCKET_AFK, BUCKET_FRAME_ANALYSIS, BUCKET_MEDIA,
+    BUCKET_WINDOW,
 };

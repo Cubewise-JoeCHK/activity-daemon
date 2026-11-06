@@ -59,6 +59,12 @@
 //! question queue (`refiner-timesheet` crate) opens the same database file:
 //! its `ts_questions` table lives beside the `events` table on the hub.
 //!
+//! Background worker (issue #43): with `[timesheet]` enabled (the TOML file
+//! named by `ACTIVITY_CONFIG`), the server binary also runs the
+//! refiner-timesheet frame-analysis worker over this same store; see that
+//! crate for the pipeline. It stops with the same shutdown signal as the
+//! HTTP server.
+//!
 //! Web UI (read-only, `web` module): `GET /` serves the embedded Graphite
 //! UI (machine status + behaviour calendar), backed by `GET /api/machines`
 //! and `GET /api/calendar`. `/api` reads follow the `/health` precedent:
@@ -180,6 +186,27 @@ impl AppState {
     /// with auth disabled (tailnet-trust; used by tests and embedding).
     pub fn open(db_path: &Path, media_dir: PathBuf) -> Result<AppState, CoreError> {
         AppState::open_with_auth(db_path, media_dir, AuthConfig::disabled())
+    }
+
+    /// Shared handle to the central store for background workers: the
+    /// timesheet frame-analysis worker (#43) runs in its own tokio task on
+    /// the same Db.
+    pub fn db_handle(&self) -> Arc<Mutex<Db>> {
+        self.db.clone()
+    }
+
+    /// The media root (`<data>/media`) for background workers; media event
+    /// paths are relative to the data root (`media/...`), so workers strip
+    /// that prefix and join onto this directory.
+    pub fn media_dir(&self) -> &Path {
+        &self.media_dir
+    }
+
+    /// Shared handle to the question queue for background workers: the
+    /// timesheet frame-analysis worker (#43) creates low-confidence
+    /// questions on the same store the hub API serves (#44).
+    pub fn ts_questions(&self) -> Arc<Mutex<TsQuestionStore>> {
+        self.ts_questions.clone()
     }
 
     /// [`AppState::open`] with an explicit auth configuration.

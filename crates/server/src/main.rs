@@ -8,7 +8,8 @@
 //! | `ACTIVITY_DB`     | `./data/activity.db`    | central SQLite store          |
 //! | `ACTIVITY_DATA`   | `./data`                | media root (`$DATA/media`)    |
 //! | `ACTIVITY_TOKEN`  | unset                   | require `X-Activity-Token`    |
-//! | `ACTIVITY_CONFIG` | `$ACTIVITY_DATA/config.toml` | server config (`[retention]`) |
+//! | `ACTIVITY_CONFIG` | `$ACTIVITY_DATA/config.toml` | server config (`[retention]`, `[timesheet]`) |
+//! | `RUST_LOG`        | `info`                  | log filter for library logs (env_logger) |
 //!
 //! Flags: `--version` (print and exit), `--dry-run` (print the retention
 //! action plan for the store and exit - nothing is written or deleted,
@@ -19,6 +20,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::Local;
+use refiner_timesheet::{TimesheetConfig, WorkerContext};
 use server::retention::{self, RetentionStore};
 use server::{AppState, AuthConfig};
 
@@ -46,9 +48,10 @@ fn main() {
     let db_path = PathBuf::from(env_or("ACTIVITY_DB", "./data/activity.db"));
     let data_dir = PathBuf::from(env_or("ACTIVITY_DATA", "./data"));
 
-    // Server config: missing file means all defaults (retention disabled);
-    // an unparsable file must not start the hub (a typo must not silently
-    // run with different settings than the owner wrote down).
+    // Server config: missing file means all defaults (retention disabled,
+    // timesheet defaults); an unparsable file must not start the hub (a
+    // typo must not silently run with different settings than the owner
+    // wrote down).
     let config_path = retention::config_path_or_default(&data_dir);
     let server_config = match retention::load_server_config(&config_path) {
         Ok(cfg) => cfg,
@@ -56,6 +59,19 @@ fn main() {
             eprintln!("{e}");
             std::process::exit(1);
         }
+    };
+    // The `[timesheet]` section of the same file (frame-analysis worker,
+    // issue #43); same typo policy as above - a broken section stops the
+    // hub instead of silently running with defaults.
+    let ts_cfg = match std::fs::read_to_string(&config_path) {
+        Ok(text) => match TimesheetConfig::from_toml_str(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+        Err(_) => TimesheetConfig::default(),
     };
     if !config_path.exists() {
         println!(
@@ -94,6 +110,10 @@ fn main() {
     let auth = AuthConfig::detect();
     println!("auth mode: {}", auth.describe());
 
+    // Library logs (the timesheet worker, issue #43) need a backend:
+    // default to info, `RUST_LOG` overrides per env_logger convention.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let state = AppState::open_with_retention(
         &db_path,
         data_dir.join("media"),
@@ -104,6 +124,38 @@ fn main() {
         eprintln!("failed to open central store at {}: {e}", db_path.display());
         std::process::exit(1);
     });
+
+    // Timesheet frame-analysis worker (issue #43): same store, own tokio
+    // task, stopped by the same shutdown signal as the HTTP server. A
+    // broken vocabulary must not take ingestion down - the worker just
+    // does not start (fail-soft), loudly.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = if ts_cfg.enabled {
+        match WorkerContext::build(
+            state.media_dir().to_path_buf(),
+            state.ts_questions(),
+            ts_cfg.clone(),
+        ) {
+            Ok(ctx) => {
+                println!(
+                    "timesheet worker: enabled (mode {:?}, max/hour {}, lemonade {} model {})",
+                    ts_cfg.sampling_mode,
+                    ts_cfg.max_per_hour,
+                    ts_cfg.lemonade_base_url,
+                    ts_cfg.lemonade_model
+                );
+                Some((state.db_handle(), ctx, shutdown_rx))
+            }
+            Err(e) => {
+                println!("timesheet worker: NOT started ({e})");
+                None
+            }
+        }
+    } else {
+        println!("timesheet worker: disabled ([timesheet] enabled = false)");
+        None
+    };
+
     let app = server::build_router(state);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -135,11 +187,22 @@ fn main() {
             "activity-daemon central hub listening on http://{addr} (version {})",
             server::VERSION
         );
+        if let Some((worker_db, worker_ctx, shutdown_rx)) = worker {
+            tokio::spawn(refiner_timesheet::run_worker(
+                worker_db,
+                worker_ctx,
+                shutdown_rx,
+            ));
+        }
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // release the timesheet worker too (issue #43)
+            let _ = shutdown_tx.send(true);
+        })
         .await
         .expect("server error");
     });
