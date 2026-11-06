@@ -51,10 +51,15 @@ First `run` creates a fully commented config template with defaults at
 (`server_url`, `device_name`) once the hub exists.
 
 - **Where data lives**: `%APPDATA%\activity-daemon\data` by default -
-  `activity.db` (SQLite, WAL), `media\frames` + `media\audio` (rolling
-  retention budgets), `heartbeat` (liveness, rewritten every 5 s),
-  `daemon.lock` (single instance), `daemon.log` (+ `logs\audio.log`).
-  Stop with Ctrl+C; the window watcher flushes its open session.
+  `activity.db` (SQLite, WAL), `media\frames` + `media\audio` (held only
+  until the hub acks the upload - delete-on-ack pass-through; the rolling
+  retention budgets stay on as an upload-failure backstop), `heartbeat`
+  (liveness, rewritten every 5 s), `daemon.lock` (single instance),
+  `daemon.log` (+ `logs\audio.log`). The hub holds raw media hot for 365
+  days as monthly `tar.zst` bundles, then the bundles move to MinIO
+  (`blob.joechowhk.internal`, inside the tailnet) as the permanent tier
+  (v1.2 target lifecycle). Stop with Ctrl+C; the window watcher flushes its
+  open session.
 - **Multi-monitor**: `screen.monitors` picks what the frame watcher
   captures - `all` (default, one frame per connected monitor) or
   `primary` (the v0.1 behavior). Frame files carry their monitor in the
