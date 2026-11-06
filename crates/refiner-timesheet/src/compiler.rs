@@ -5,10 +5,17 @@
 //! - Window sessions are the duration backbone: every draft activity's
 //!   start/end comes from a session (`ts_start` .. `ts_start + duration_s`).
 //!   Gaps and AFK time never become activities.
-//! - Frame analyses whose timestamp falls inside a session classify it:
-//!   the highest-confidence analysis wins (earliest wins ties) and provides
-//!   `project_guess` / `category` / confidence; all attached analyses'
-//!   frame hashes join the evidence sources.
+//! - Frame analyses classify a session by nearest in time (issue #63): the
+//!   analysis whose instant sits closest to the session's span provides
+//!   `project_guess` / `category` / confidence - distance 0 inside the
+//!   span, the earliest analysis wins distance ties - as long as it is
+//!   within `classify_window_s` (default 600 s) of the span. One keyframe
+//!   therefore classifies the surrounding minutes instead of only the
+//!   single short session containing its instant, so flip-flop chains of
+//!   adjacent classifications coalesce into reviewable blocks; sessions
+//!   with no analysis inside the window stay unclassified (grey question
+//!   hand-off). All in-window analyses' frame hashes join the evidence
+//!   sources.
 //! - Adjacent sessions with the same project + category merge up to
 //!   `max_block_min` (default 2 h). "Adjacent" means the gap between the
 //!   spans is at most [`ADJACENT_GAP_MAX_S`] and no AFK span covers the
@@ -418,6 +425,27 @@ struct Candidate {
     mergeable: bool,
 }
 
+/// Absolute gap in whole milliseconds between an instant and a session's
+/// span: 0 when the instant falls inside `[start, end)`, otherwise the
+/// distance to the nearer edge. This is the metric the classification
+/// window (`classify_window_s`, issue #63) is applied to.
+fn span_distance_ms(session: &SessionRec, ts: DateTime<FixedOffset>) -> i64 {
+    if ts < session.start {
+        (session.start - ts).num_milliseconds()
+    } else if ts >= session.end {
+        (ts - session.end).num_milliseconds()
+    } else {
+        0
+    }
+}
+
+/// The classification window in whole milliseconds (`classify_window_s`,
+/// issue #63). An analysis at span distance 0 (inside the session) is
+/// always within it.
+fn classification_window_ms(cfg: &TimesheetConfig) -> i64 {
+    i64::try_from(cfg.classify_window_s.saturating_mul(1000)).unwrap_or(i64::MAX)
+}
+
 /// The `(project_guess, category)` pair a session's best analysis implies,
 /// with the documented fallbacks when fields are empty.
 fn classify_labels(best: Option<&AnalysisRec>) -> (String, String) {
@@ -649,6 +677,7 @@ pub fn plan_day(
 
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut planned_questions: Vec<PlannedQuestion> = Vec::new();
+    let window_ms = classification_window_ms(cfg);
 
     for session in &sessions {
         // Approve-aware regeneration (issue #60): a session overlapping an
@@ -663,25 +692,37 @@ pub fn plan_day(
         {
             continue;
         }
-        // Analyses inside [start, end): the frame at a session's end
-        // instant belongs to the next session (sessions tile the day).
-        let attached: Vec<&AnalysisRec> = analyses
-            .iter()
-            .filter(|a| a.ts >= session.start && a.ts < session.end)
-            .collect();
-        // Highest confidence wins; earliest ts breaks ties (attached is
-        // ts-sorted, so scanning with strictly-greater keeps the earliest).
-        let best: Option<&AnalysisRec> =
-            attached
-                .iter()
-                .copied()
-                .fold(
-                    None,
-                    |winner: Option<&AnalysisRec>, analysis| match winner {
-                        Some(w) if analysis.confidence <= w.confidence => Some(w),
-                        _ => Some(analysis),
-                    },
-                );
+        // Nearest-in-time classification (issue #63): the analysis closest
+        // to the session's span classifies it while it stays within the
+        // configured window, so one keyframe covers the surrounding
+        // minutes. `attached` gathers every in-window analysis (evidence
+        // sources and question hand-off); `best` is the single nearest one.
+        // Analyses are (ts, sha)-sorted, so scanning keeps the earliest on
+        // distance ties ("ties -> earlier analysis"); a same-instant frame
+        // with higher confidence replaces the winner deterministically.
+        let mut attached: Vec<&AnalysisRec> = Vec::new();
+        let mut best: Option<&AnalysisRec> = None;
+        let mut best_distance_ms = i64::MAX;
+        for analysis in &analyses {
+            let distance_ms = span_distance_ms(session, analysis.ts);
+            if distance_ms > window_ms {
+                continue;
+            }
+            attached.push(analysis);
+            let wins = match best {
+                None => true,
+                Some(winner) => {
+                    distance_ms < best_distance_ms
+                        || (distance_ms == best_distance_ms
+                            && analysis.ts == winner.ts
+                            && analysis.confidence > winner.confidence)
+                }
+            };
+            if wins {
+                best = Some(analysis);
+                best_distance_ms = distance_ms;
+            }
+        }
         let mut shas: Vec<String> = Vec::new();
         for analysis in &attached {
             if !shas.contains(&analysis.frame_sha16) {
@@ -1197,9 +1238,10 @@ mod tests {
     }
 
     #[test]
-    fn analysis_at_session_end_belongs_to_next_session() {
-        // Frame at exactly 10:00 (session 1's end / session 2's start)
-        // must classify session 2, not session 1.
+    fn boundary_frame_classifies_both_adjacent_sessions() {
+        // A frame exactly at a shared boundary sits at span distance 0 for
+        // both neighbours (issue #63 nearest-in-time semantics), so both
+        // are classified by it and - same labels - merge into one block.
         let input = input_for(vec![
             session(1, 9, 0, 3600.0, "Code.exe"),
             session(2, 10, 0, 3600.0, "Excel.exe"),
@@ -1207,9 +1249,249 @@ mod tests {
         ]);
         let planned = plan(&input);
         assert_eq!(planned.activities.len(), 1);
-        assert_eq!(planned.activities[0].sources.session_ids, vec![2]);
-        assert_eq!(planned.activities[0].project_guess, "C9999");
-        // session 1 had no analyses: question item
+        let activity = &planned.activities[0];
+        assert_eq!(activity.sources.session_ids, vec![1, 2]);
+        assert_eq!(activity.project_guess, "C9999");
+        assert_eq!(planned.questions.len(), 0);
+    }
+
+    // ------------------ fixture: nearest-in-time classification (#63)
+
+    /// RFC3339 timestamp `offset_s` seconds after 15:00:00 (+08:00).
+    fn offset_ts(offset_s: i64) -> String {
+        format!(
+            "2026-11-06T{:02}:{:02}:{:02}+08:00",
+            15 + offset_s / 3600,
+            (offset_s % 3600) / 60,
+            offset_s % 60
+        )
+    }
+
+    /// A 10 s window session starting `offset_s` seconds after 15:00:00
+    /// (+08:00) - the pilot-day poll cadence (issue #63 fixtures).
+    fn poll_session(id: i64, offset_s: i64) -> EventRow {
+        row(
+            id,
+            "window-watcher",
+            &offset_ts(offset_s),
+            10.0,
+            serde_json::json!({"app": "Code.exe", "title": "window title"}),
+        )
+    }
+
+    /// A frame analysis at `offset_s` seconds after 15:00:00 (+08:00).
+    fn offset_analysis(
+        id: i64,
+        offset_s: i64,
+        project: &str,
+        category: &str,
+        confidence: f64,
+    ) -> EventRow {
+        row(
+            id,
+            BUCKET_FRAME_ANALYSIS,
+            &offset_ts(offset_s),
+            0.0,
+            serde_json::json!({
+                "frame_sha16": format!("sha-{id:04}"),
+                "frame_path": format!("media/screen/2026/11/06/f{id}.jpg"),
+                "activity": format!("working on {project}"),
+                "project_guess": project,
+                "category": category,
+                "confidence": confidence,
+                "evidence": [],
+                "model": "qwen",
+                "sampled": true,
+            }),
+        )
+    }
+
+    fn span_seconds(activity: &DraftActivity) -> i64 {
+        let start = DateTime::parse_from_rfc3339(&activity.start).expect("start");
+        let end = DateTime::parse_from_rfc3339(&activity.end).expect("end");
+        (end - start).num_seconds()
+    }
+
+    #[test]
+    fn flip_flop_keyframes_coalesce_into_order_of_ten_blocks() {
+        // Pilot-day cadence (issue #63): 10 s poll sessions tiling one
+        // hour, 8 keyframes/hour whose labels flip-flop between two
+        // project/category pairs. Containment classified only the ~10 s
+        // session containing each frame (8 sub-minute drafts + ~352
+        // questions); nearest-in-time gives one ~7.5 min block per
+        // keyframe zone - order of ten, no sub-minute draft.
+        let mut rows = Vec::new();
+        for k in 0..360 {
+            rows.push(poll_session(k + 1, k * 10));
+        }
+        let keyframes = [0_i64, 450, 900, 1350, 1800, 2250, 2700, 3150];
+        for (k, offset) in keyframes.iter().enumerate() {
+            let (project, category) = if k % 2 == 0 {
+                ("C1234", "Consulting")
+            } else {
+                ("C9999", "QA")
+            };
+            rows.push(offset_analysis(
+                1000 + k as i64,
+                *offset,
+                project,
+                category,
+                0.9,
+            ));
+        }
+        let planned = plan(&input_for(rows));
+        assert_eq!(planned.activities.len(), 8, "one block per keyframe zone");
+        assert!(planned.questions.is_empty());
+        for activity in &planned.activities {
+            assert!(
+                span_seconds(activity) >= 60,
+                "sub-minute draft in a flip-flop hour"
+            );
+        }
+        // zones alternate, so neighbours never merge
+        assert_eq!(planned.activities[0].project_guess, "C1234");
+        assert_eq!(planned.activities[1].project_guess, "C9999");
+        assert_eq!(planned.activities[2].project_guess, "C1234");
+    }
+
+    #[test]
+    fn pilot_day_burst_stays_bounded_with_sub_minute_exception() {
+        // The 15:07 pattern from issue #63: a burst of five analyses
+        // seconds apart answering five different project/category pairs,
+        // embedded in a calm hour of stable keyframes. The day compiles
+        // to a handful of reviewable blocks; only the burst's flip-flop
+        // slivers stay sub-minute.
+        let mut rows = Vec::new();
+        for k in 0..360 {
+            rows.push(poll_session(k + 1, k * 10));
+        }
+        let mut id = 1000_i64;
+        for offset in [0_i64, 450, 900] {
+            rows.push(offset_analysis(id, offset, "C1234", "Consulting", 0.9));
+            id += 1;
+        }
+        let burst = [
+            ("C000P021", "QA"),
+            ("C000P001", "Pre-Sales"),
+            ("C000P027", "Consulting"),
+            ("C000P001", "Consulting"),
+            ("C000P027", "QA"),
+        ];
+        for (frame, (project, category)) in burst.iter().enumerate() {
+            rows.push(offset_analysis(
+                id,
+                1350 + frame as i64 * 10,
+                project,
+                category,
+                0.9,
+            ));
+            id += 1;
+        }
+        for offset in [1800_i64, 2250, 2700, 3150] {
+            rows.push(offset_analysis(id, offset, "C1234", "Consulting", 0.9));
+            id += 1;
+        }
+        let planned = plan(&input_for(rows));
+        assert!(planned.questions.is_empty());
+        assert_eq!(
+            planned.activities.len(),
+            7,
+            "calm C1234 flank - 5 burst zones - calm C1234 flank"
+        );
+        let projects: Vec<&str> = planned
+            .activities
+            .iter()
+            .map(|a| a.project_guess.as_str())
+            .collect();
+        assert_eq!(
+            projects,
+            vec!["C1234", "C000P021", "C000P001", "C000P027", "C000P001", "C000P027", "C1234"]
+        );
+        let sub_minute = planned
+            .activities
+            .iter()
+            .filter(|a| span_seconds(a) < 60)
+            .count();
+        assert_eq!(sub_minute, 3, "only the burst's middle flip-flop slivers");
+    }
+
+    #[test]
+    fn sessions_beyond_classify_window_stay_grey() {
+        // One keyframe at 15:06:00. The default 600 s window classifies
+        // the surrounding +-10 min; sessions farther out stay unclassified
+        // and go to the question queue (no force-classification).
+        let build_rows = || {
+            let mut rows = Vec::new();
+            for k in 0..120 {
+                rows.push(poll_session(k + 1, k * 10)); // 15:00:00-15:20:00
+            }
+            rows.push(offset_analysis(1000, 360, "C1234", "Consulting", 0.9));
+            rows
+        };
+        let planned = plan(&input_for(build_rows()));
+        assert_eq!(planned.activities.len(), 1);
+        let activity = &planned.activities[0];
+        // The window reaches 600 s in both directions: the whole slice up
+        // to 15:16:00 (exactly 600 s after the frame) is classified; the
+        // next session (610 s) is not.
+        assert_eq!(activity.start, "2026-11-06T15:00:00+08:00");
+        assert_eq!(activity.end, "2026-11-06T15:16:10+08:00");
+        assert_eq!(planned.questions.len(), 23, "15:16:10-15:20:00 stays grey");
+
+        // A tight window only classifies the frame's immediate surround.
+        let mut tight = cfg();
+        tight.classify_window_s = 60;
+        let planned = plan_day(&input_for(build_rows()), &[], &tight, &HeuristicTitler);
+        assert_eq!(planned.activities.len(), 1);
+        assert_eq!(planned.activities[0].start, "2026-11-06T15:04:50+08:00");
+        assert_eq!(planned.activities[0].end, "2026-11-06T15:07:10+08:00");
+        assert_eq!(planned.questions.len(), 106);
+    }
+
+    #[test]
+    fn equidistant_frames_pick_the_earlier_analysis() {
+        // One frame 120 s before the span, one 120 s after it: the
+        // distance tie goes to the earlier analysis (issue #63 rule); the
+        // later frame's higher confidence does not override it.
+        let input = input_for(vec![
+            session(1, 10, 0, 600.0, "Code.exe"), // 10:00:00-10:10:00
+            analysis(10, 9, 58, "C1111", "Consulting", 0.8), // 120 s before
+            analysis(11, 10, 12, "C2222", "QA", 0.9), // 120 s after
+        ]);
+        let planned = plan(&input);
+        assert_eq!(planned.activities.len(), 1);
+        assert_eq!(planned.activities[0].project_guess, "C1111");
+        assert!((planned.activities[0].confidence - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn frames_inside_a_session_tie_on_distance_earliest_wins() {
+        // All frames inside a session sit at distance 0: the earliest
+        // wins even when a later frame is more confident - distance, not
+        // confidence, is the selector (issue #63).
+        let input = input_for(vec![
+            session(1, 10, 0, 1800.0, "Code.exe"), // 10:00-10:30
+            analysis(10, 10, 10, "C1111", "Consulting", 0.7),
+            analysis(11, 10, 20, "C2222", "QA", 0.95),
+        ]);
+        let planned = plan(&input);
+        assert_eq!(planned.activities.len(), 1);
+        assert_eq!(planned.activities[0].project_guess, "C1111");
+        assert!((planned.activities[0].confidence - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn nearest_frame_gates_resolution_even_when_a_farther_one_is_confident() {
+        // The nearest frame classifies the session and its own confidence
+        // walks the usual resolution gate: a farther high-confidence frame
+        // inside the window does not rescue the span.
+        let input = input_for(vec![
+            session(1, 10, 0, 1200.0, "Code.exe"),     // 10:00:00-10:20:00
+            analysis(10, 10, 19, "?", "?", 0.3),       // nearest, inside
+            analysis(11, 10, 22, "C2222", "QA", 0.95), // 120 s after end
+        ]);
+        let planned = plan(&input);
+        assert!(planned.activities.is_empty());
         assert_eq!(planned.questions.len(), 1);
     }
 
