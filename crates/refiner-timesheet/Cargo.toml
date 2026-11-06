@@ -1,6 +1,6 @@
 [package]
 name = "refiner-timesheet"
-description = "Hub-side Timesheet AI pipeline: frame analysis worker (Lemonade vision) and question queue for activity-daemon"
+description = "Hub-side Timesheet AI pipeline: frame analysis worker (Lemonade vision), question queue and month-end xlsx export for activity-daemon"
 version.workspace = true
 edition.workspace = true
 
@@ -14,8 +14,12 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 rusqlite = { version = "0.41", features = ["bundled"] }
+# Month-end xlsx export (issue #46): writes the Cubewise offline-template
+# upload workbook in memory.
+rust_xlsxwriter = "0.102.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Vocabulary + config parsing (embedded TOML asset and `[timesheet]` section).
 toml = "1"
 # Same small blocking client as the client-side forwarder (rustls, builds on
 # Windows + the hub container Linux): the worker runs Lemonade calls inside
@@ -30,3 +34,5 @@ tokio = { version = "1", features = ["rt", "sync", "time"] }
 # server's stack - no extra mock framework).
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+# Golden export test reads the produced workbook back (issue #46).
+calamine = "0.38"

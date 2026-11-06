@@ -32,7 +32,7 @@ use crate::config::TimesheetConfig;
 use crate::lemonade::{FrameAnalysis, LemonadeClient};
 use crate::sampler::{SampleDecision, SamplerState};
 use crate::storage::{EvidenceFrame, TsQuestionStore};
-use crate::vocab::Vocabulary;
+use crate::vocab::CubewiseVocab;
 
 /// Cursor name under the core `refiner_cursors` table.
 pub const CURSOR_NAME: &str = "timesheet-frame-analysis";
@@ -50,7 +50,7 @@ pub struct WorkerContext {
     /// Hub media root (`<data>/media`); frame event paths are relative to
     /// it (after their `media/` prefix).
     pub media_dir: PathBuf,
-    pub vocab: Vocabulary,
+    pub vocab: CubewiseVocab,
     /// Shared question queue (issue #44): low-confidence answers become
     /// questions with frame evidence, answered async by the owner.
     pub questions: Arc<Mutex<TsQuestionStore>>,
@@ -62,7 +62,7 @@ impl WorkerContext {
         questions: Arc<Mutex<TsQuestionStore>>,
         cfg: TimesheetConfig,
     ) -> Result<WorkerContext, String> {
-        let vocab = Vocabulary::load(cfg.vocab_path.as_deref())?;
+        let vocab = CubewiseVocab::load(cfg.vocab_path.as_deref()).map_err(|e| e.to_string())?;
         Ok(WorkerContext {
             cfg,
             media_dir,
@@ -622,7 +622,7 @@ mod tests {
         WorkerContext {
             cfg,
             media_dir,
-            vocab: Vocabulary::embedded().expect("embedded vocabulary"),
+            vocab: CubewiseVocab::embedded().clone(),
             questions: Arc::new(Mutex::new(
                 TsQuestionStore::open_in_memory().expect("question store"),
             )),
@@ -1008,7 +1008,7 @@ mod tests {
         });
         let client = LemonadeClient::new(&ctx.cfg);
         let outcome = tokio::task::spawn_blocking(move || {
-            let vocab = Vocabulary::embedded().expect("vocab");
+            let vocab = CubewiseVocab::embedded().clone();
             client.analyze_jpeg(b"jpeg-bytes", &vocab, &ctx.cfg.style)
         })
         .await

@@ -123,6 +123,7 @@ fn main() {
         auth,
         server_config.retention.clone(),
     )
+    .map(|state| state.with_timesheet_vocab_path(server_config.timesheet.vocab_path.clone()))
     .unwrap_or_else(|e| {
         eprintln!("failed to open central store at {}: {e}", db_path.display());
         std::process::exit(1);

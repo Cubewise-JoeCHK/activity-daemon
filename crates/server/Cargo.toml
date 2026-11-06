@@ -36,4 +36,5 @@ zstd = "0.13"
 # Sync contract v2 integration tests (#40): the real client forwarder
 # against the real hub router over loopback HTTP.
 activity-sync = { path = "../sync" }
+calamine = "0.38.0"
 tower = { version = "0.5", features = ["util"] }

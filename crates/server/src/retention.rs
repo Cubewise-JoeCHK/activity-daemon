@@ -111,6 +111,8 @@ impl Default for RetentionConfig {
 #[serde(default)]
 pub struct ServerConfig {
     pub retention: RetentionConfig,
+    /// `[timesheet]` section: month-end export settings (issue #46).
+    pub timesheet: crate::timesheet::TimesheetConfig,
 }
 
 /// Path of the server config file: `ACTIVITY_CONFIG` when set, otherwise

@@ -1,87 +1,119 @@
-//! Template vocabulary (issue #43, template contract in the ADR addendum
-//! on #16): the 7 categories and 189 project strings from the Cubewise
-//! offline timesheet template, seeded once into a committed config file -
-//! never hardcoded in Rust source.
+//! The Cubewise offline-template vocabulary (ADR addendum decision 4 on
+//! issue #16): the exact project strings (`<code> - <client> - <name>`) and
+//! the seven activity categories the template's upload sheet accepts.
+//!
+//! One canonical source serves both consumers of the vocabulary:
+//!
+//! - the frame-analysis worker (issue #43) builds its Lemonade prompt from
+//!   it and vocabulary-validates the model's reply (exact match first,
+//!   case-insensitive fallback to the canonical spelling), and
+//! - the month-end xlsx export (issue #46) accepts only approved rows whose
+//!   project string and category are exact template strings, and mirrors
+//!   the vocabulary into the workbook's `Sheet1`.
+//!
+//! The vocabulary lives in `assets/cubewise_vocabulary.toml` (extracted
+//! from `timsheet_offline_2026_08.xlsx`, Sheet1 A2:A8 / C2:C190) and is
+//! embedded into the binary at compile time - no vocabulary strings are
+//! hardcoded in .rs source. A deployment may point either consumer at a
+//! different TOML file of the same shape through the server's
+//! `[timesheet] vocab_path` config; a configured file that cannot be read
+//! or parsed is a hard error, matching the server-config philosophy (a
+//! typo must not silently change what the worker prompts for or what the
+//! export produces).
 
 use std::path::Path;
+use std::sync::OnceLock;
 
+use activity_core::CoreError;
 use serde::Deserialize;
 
-/// The committed seed, compiled in so the hub container needs no extra
-/// volume. Override with `[timesheet] vocab_path` for a custom vocabulary.
-pub const EMBEDDED_VOCAB_TOML: &str = include_str!("../assets/cubewise_vocabulary.toml");
+/// The embedded template vocabulary (compile-time asset; the default).
+const EMBEDDED_VOCAB_TOML: &str = include_str!("../assets/cubewise_vocabulary.toml");
 
-#[derive(Debug, Deserialize)]
-struct VocabFile {
-    categories: Vec<String>,
-    projects: Vec<String>,
+/// Project strings and categories the Cubewise upload sheet accepts.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CubewiseVocab {
+    /// The 7 activity categories (template Sheet1 A2:A8).
+    pub categories: Vec<String>,
+    /// The 189 exact project strings (template Sheet1 C2:C190).
+    pub projects: Vec<String>,
 }
 
-/// The closed vocabularies the model's answer must match: `category` is one
-/// of the template categories, `project_guess` one of the project strings.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Vocabulary {
-    categories: Vec<String>,
-    projects: Vec<String>,
-}
-
-impl Vocabulary {
-    /// Parse a vocabulary TOML (`categories = [...]`, `projects = [...]`).
-    /// Entries are trimmed; empty and duplicate entries are dropped. An
-    /// empty result is an error: a vocabulary the model cannot match makes
-    /// every analysis useless, so it must be loud.
-    pub fn parse(toml_str: &str) -> Result<Vocabulary, String> {
-        let file: VocabFile =
-            toml::from_str(toml_str).map_err(|e| format!("vocabulary TOML: {e}"))?;
-        let clean = |items: Vec<String>| -> Vec<String> {
-            let mut out: Vec<String> = Vec::new();
-            for item in items {
-                let item = item.trim().to_string();
-                if !item.is_empty() && !out.contains(&item) {
-                    out.push(item);
-                }
+impl CubewiseVocab {
+    /// Parse vocabulary TOML (shape: `categories = [...]`, `projects =
+    /// [...]`). Entries are trimmed; empty lists, blank entries or
+    /// duplicates are config errors - a vocabulary the owner cannot trust
+    /// must fail loudly, not silently narrow the prompt or shrink the
+    /// export.
+    pub fn parse_toml(text: &str) -> Result<CubewiseVocab, CoreError> {
+        let file: CubewiseVocab = toml::from_str(text)
+            .map_err(|e| CoreError::Config(format!("cannot parse vocabulary TOML: {e}")))?;
+        let clean = |label: &str, items: Vec<String>| -> Result<Vec<String>, CoreError> {
+            if items.is_empty() {
+                return Err(CoreError::Config(format!(
+                    "vocabulary {label} list is empty"
+                )));
             }
-            out
+            let mut out: Vec<String> = Vec::with_capacity(items.len());
+            for (n, item) in items.iter().enumerate() {
+                let item = item.trim();
+                if item.is_empty() {
+                    return Err(CoreError::Config(format!(
+                        "vocabulary {label} entry {n} is blank"
+                    )));
+                }
+                let item = item.to_string();
+                if out.contains(&item) {
+                    return Err(CoreError::Config(format!(
+                        "vocabulary {label} list contains duplicates ({item})"
+                    )));
+                }
+                out.push(item);
+            }
+            Ok(out)
         };
-        let categories = clean(file.categories);
-        let projects = clean(file.projects);
-        if categories.is_empty() {
-            return Err("vocabulary has no categories".to_string());
-        }
-        if projects.is_empty() {
-            return Err("vocabulary has no projects".to_string());
-        }
-        Ok(Vocabulary {
+        let categories = clean("categories", file.categories)?;
+        let projects = clean("projects", file.projects)?;
+        Ok(CubewiseVocab {
             categories,
             projects,
         })
     }
 
-    /// The embedded template seed.
-    pub fn embedded() -> Result<Vocabulary, String> {
-        Vocabulary::parse(EMBEDDED_VOCAB_TOML)
+    /// The embedded template vocabulary (parsed once per process).
+    pub fn embedded() -> &'static CubewiseVocab {
+        static EMBEDDED: OnceLock<CubewiseVocab> = OnceLock::new();
+        EMBEDDED.get_or_init(|| {
+            CubewiseVocab::parse_toml(EMBEDDED_VOCAB_TOML)
+                .expect("embedded cubewise_vocabulary.toml is valid")
+        })
     }
 
-    /// The embedded seed, unless `override_path` is configured.
-    pub fn load(override_path: Option<&Path>) -> Result<Vocabulary, String> {
-        match override_path {
-            None => Vocabulary::embedded(),
+    /// Load the vocabulary: an explicit path wins (read errors and parse
+    /// errors are hard errors carrying the path), otherwise the embedded
+    /// template asset is used.
+    pub fn load(path: Option<&Path>) -> Result<CubewiseVocab, CoreError> {
+        match path {
+            None => Ok(CubewiseVocab::embedded().clone()),
             Some(path) => {
-                let s = std::fs::read_to_string(path)
-                    .map_err(|e| format!("cannot read vocabulary file {}: {e}", path.display()))?;
-                Vocabulary::parse(&s)
+                let text = std::fs::read_to_string(path).map_err(|e| {
+                    CoreError::Config(format!("cannot read vocabulary {}: {e}", path.display()))
+                })?;
+                CubewiseVocab::parse_toml(&text).map_err(|e| {
+                    CoreError::Config(format!("invalid vocabulary {}: {e}", path.display()))
+                })
             }
         }
     }
 
-    /// Template categories, in template order.
-    pub fn categories(&self) -> &[String] {
-        &self.categories
+    /// Whether `project` is one of the exact template project strings.
+    pub fn has_project(&self, project: &str) -> bool {
+        self.projects.iter().any(|known| known == project)
     }
 
-    /// Template project strings, in template order.
-    pub fn projects(&self) -> &[String] {
-        &self.projects
+    /// Whether `category` is one of the 7 template categories.
+    pub fn has_category(&self, category: &str) -> bool {
+        self.categories.iter().any(|known| known == category)
     }
 
     /// Canonical spelling of a model-returned category: exact match first,
@@ -112,12 +144,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_seed_matches_the_template_extraction() {
+    fn embedded_vocab_matches_the_template_extraction() {
         // Locks the committed seed against silent truncation: 7 categories
         // and 189 projects straight from timsheet_offline_2026_08.xlsx.
-        let vocab = Vocabulary::embedded().expect("embedded seed parses");
+        let vocab = CubewiseVocab::embedded();
         assert_eq!(
-            vocab.categories(),
+            vocab.categories,
             [
                 "Consulting",
                 "Support",
@@ -128,21 +160,21 @@ mod tests {
                 "Customer Returned",
             ]
         );
-        assert_eq!(vocab.projects().len(), 189);
+        assert_eq!(vocab.projects.len(), 189);
         // first and last extracted rows, spot-checked against the xlsx
-        assert!(vocab.projects()[0].starts_with("A143P010 - Frasers"));
-        assert!(vocab.projects()[188].starts_with("C920P020 - AIA HK"));
-        // the seed file itself must not carry blanks or duplicates
-        let mut sorted = vocab.projects().to_vec();
-        sorted.sort();
-        let unique = sorted.len();
-        sorted.dedup();
-        assert_eq!(sorted.len(), unique);
+        assert!(vocab.projects[0].starts_with("A143P010 - Frasers"));
+        assert!(vocab.projects[188].starts_with("C920P020 - AIA HK"));
+        // export-style exact lookups (a case variant is NOT in vocabulary)
+        assert!(vocab.has_category("Consulting"));
+        assert!(vocab.has_category("Customer Returned"));
+        assert!(vocab.has_project("C000P000 - Cubewise - Internal"));
+        assert!(!vocab.has_category("consulting"));
+        assert!(!vocab.has_project("C000P000 - Internal"));
     }
 
     #[test]
     fn canonical_matching_is_exact_then_case_insensitive() {
-        let vocab = Vocabulary::embedded().expect("embedded seed parses");
+        let vocab = CubewiseVocab::embedded();
         assert_eq!(
             vocab.canonical_category("QA"),
             Some("QA"),
@@ -166,45 +198,59 @@ mod tests {
     }
 
     #[test]
-    fn parse_trims_drops_empty_and_duplicate_entries() {
-        let vocab = Vocabulary::parse(
-            "categories = [\"Alpha\", \"  \", \"alpha\", \"Alpha\"]\nprojects = [\"P1\"]\n",
-        )
-        .expect("parse noisy vocabulary");
-        assert_eq!(vocab.categories(), ["Alpha", "alpha"]);
-        assert_eq!(vocab.projects(), ["P1"]);
+    fn load_uses_embedded_without_path() {
+        let vocab = CubewiseVocab::load(None).expect("embedded load");
+        assert_eq!(vocab, *CubewiseVocab::embedded());
     }
 
     #[test]
-    fn parse_rejects_missing_or_empty_lists() {
-        assert!(Vocabulary::parse("projects = [\"P1\"]\n").is_err());
-        assert!(Vocabulary::parse("categories = [\"A\"]\n").is_err());
-        assert!(Vocabulary::parse("nope = 1\n").is_err());
-    }
-
-    #[test]
-    fn load_honours_override_path() {
-        let dir = std::env::temp_dir().join(format!(
-            "refiner-vocab-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+    fn load_reads_override_path_and_fails_loudly() {
+        let dir = std::env::temp_dir().join(format!("refiner-vocab-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("custom_vocab.toml");
+        let path = dir.join("vocab.toml");
         std::fs::write(
             &path,
-            "categories = [\"Internal\"]\nprojects = [\"P1\", \"P2\"]\n",
+            "categories = [\"Consulting\"]\nprojects = [\"A1 - X - Y\"]\n",
         )
         .expect("write vocab");
-        let vocab = Vocabulary::load(Some(&path)).expect("override loads");
-        assert_eq!(vocab.categories(), ["Internal"]);
-        assert_eq!(vocab.projects(), ["P1", "P2"]);
 
-        let missing = Vocabulary::load(Some(&dir.join("gone.toml")))
-            .expect_err("missing override must be an error");
-        assert!(missing.contains("cannot read vocabulary"));
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+        let vocab = CubewiseVocab::load(Some(&path)).expect("override load");
+        assert_eq!(vocab.projects, vec!["A1 - X - Y".to_string()]);
+
+        std::fs::write(
+            &path,
+            "categories = [\"Consulting\", \"Consulting\"]\nprojects = [\"A1 - X - Y\"]\n",
+        )
+        .expect("write dup vocab");
+        let err = CubewiseVocab::load(Some(&path)).expect_err("duplicate rejected");
+        assert!(matches!(err, CoreError::Config(_)), "{err:?}");
+
+        let missing = CubewiseVocab::load(Some(&dir.join("absent.toml")));
+        assert!(missing.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_rejects_empty_and_blank_entries() {
+        let empty = CubewiseVocab::parse_toml("categories = []\nprojects = [\"A1 - X\"]\n");
+        assert!(empty.is_err());
+        let blank = CubewiseVocab::parse_toml(
+            "categories = [\"Consulting\", \" \"]\nprojects = [\"A1 - X\"]\n",
+        );
+        assert!(blank.is_err());
+        let garbage = CubewiseVocab::parse_toml("categories = \"nope\"\n");
+        assert!(garbage.is_err());
+        // a missing list is a parse error too
+        assert!(CubewiseVocab::parse_toml("projects = [\"P1\"]\n").is_err());
+    }
+
+    #[test]
+    fn parse_trims_padded_entries() {
+        let vocab = CubewiseVocab::parse_toml(
+            "categories = [\" Alpha \", \"Beta\"]\nprojects = [\" P1 \", \"P2\"]\n",
+        )
+        .expect("parse padded vocabulary");
+        assert_eq!(vocab.categories, ["Alpha".to_string(), "Beta".to_string()]);
+        assert_eq!(vocab.projects, ["P1".to_string(), "P2".to_string()]);
     }
 }

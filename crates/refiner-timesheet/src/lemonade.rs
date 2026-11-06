@@ -16,7 +16,7 @@ use base64::Engine as _;
 use serde_json::json;
 
 use crate::config::{StyleConfig, TimesheetConfig, DEFAULT_STYLE_PROMPT};
-use crate::vocab::Vocabulary;
+use crate::vocab::CubewiseVocab;
 
 /// A validated model answer.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -89,7 +89,7 @@ impl LemonadeClient {
     pub fn analyze_jpeg(
         &self,
         jpeg: &[u8],
-        vocab: &Vocabulary,
+        vocab: &CubewiseVocab,
         style: &StyleConfig,
     ) -> Result<FrameAnalysis, LemonadeError> {
         let messages = build_messages(jpeg, vocab, style);
@@ -139,7 +139,7 @@ impl LemonadeClient {
 /// Assemble the chat messages for one frame: system + user(text, image).
 pub fn build_messages(
     jpeg: &[u8],
-    vocab: &Vocabulary,
+    vocab: &CubewiseVocab,
     style: &StyleConfig,
 ) -> Vec<serde_json::Value> {
     let data_url = format!(
@@ -163,10 +163,10 @@ pub fn build_messages(
 
 /// The user-message text: internal instructions first, then the owner style
 /// block appended after them (injection contract, issue #53).
-pub fn build_text_prompt(vocab: &Vocabulary, style: &StyleConfig) -> String {
-    let categories = vocab.categories().join(" | ");
+pub fn build_text_prompt(vocab: &CubewiseVocab, style: &StyleConfig) -> String {
+    let categories = vocab.categories.join(" | ");
     let mut projects = String::new();
-    for project in vocab.projects() {
+    for project in &vocab.projects {
         projects.push_str("  - ");
         projects.push_str(project);
         projects.push('\n');
@@ -250,7 +250,10 @@ fn as_string_field(body: &serde_json::Value, key: &str) -> String {
 /// `category`/`project_guess` are stored empty; an empty category also
 /// zeroes the confidence (the answer cannot be routed anywhere, so the
 /// low-confidence hand-off must catch it).
-pub fn parse_analysis(content: &str, vocab: &Vocabulary) -> Result<FrameAnalysis, LemonadeError> {
+pub fn parse_analysis(
+    content: &str,
+    vocab: &CubewiseVocab,
+) -> Result<FrameAnalysis, LemonadeError> {
     let json_object = extract_json_object(content).ok_or_else(|| {
         LemonadeError::Response(format!(
             "no JSON object in reply: {}",
@@ -305,8 +308,8 @@ mod tests {
     use super::*;
     use crate::config::StyleExample;
 
-    fn vocab() -> Vocabulary {
-        Vocabulary::parse(
+    fn vocab() -> CubewiseVocab {
+        CubewiseVocab::parse_toml(
             "categories = [\"Consulting\", \"Support\"]\nprojects = [\"A1P01 - Demo\", \"C2P02 - Internal\"]\n",
         )
         .expect("test vocabulary")
