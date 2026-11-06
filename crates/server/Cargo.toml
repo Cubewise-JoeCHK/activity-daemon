@@ -17,4 +17,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "fs", "io-util", "signal", "time"] }
 
 [dev-dependencies]
+# Sync contract v2 integration tests (#40): the real client forwarder
+# against the real hub router over loopback HTTP.
+activity-sync = { path = "../sync" }
 tower = { version = "0.5", features = ["util"] }

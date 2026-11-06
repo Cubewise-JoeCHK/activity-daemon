@@ -1060,6 +1060,7 @@ name = "server"
 version = "0.1.6"
 dependencies = [
  "activity-core",
+ "activity-sync",
  "axum",
  "chrono",
  "http-body-util",
