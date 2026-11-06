@@ -674,7 +674,7 @@ mod tests {
     /// workflow uploads (plus the Linux server pair, which must be ignored
     /// by the selection).
     const SAMPLE_RELEASE_JSON: &str = r#"{
-        "tag_name": "v0.2.0",
+        "tag_name": "v0.3.0",
         "assets": [
             {"name": "activity-daemon-windows-x86_64.exe",
              "browser_download_url": "https://example.test/dl/activity-daemon-windows-x86_64.exe"},
@@ -835,7 +835,7 @@ mod tests {
         let body_file = dir.join("new-body-reference.bin");
         std::fs::write(&body_file, new_body).expect("write reference body");
         let digest_hex = file_sha256_hex(&body_file).expect("hash reference");
-        let release = release_with_default_assets("v0.2.0", "fake://exe", "fake://sha");
+        let release = release_with_default_assets("v0.3.0", "fake://exe", "fake://sha");
         let fetcher = FakeFetcher {
             release: Some(release),
             error: None,
@@ -861,7 +861,7 @@ mod tests {
             .check_and_apply()
             .expect("apply succeeds")
             .expect("an update was applied");
-        assert_eq!(applied.tag, "v0.2.0");
+        assert_eq!(applied.tag, "v0.3.0");
         assert_eq!(std::fs::read(&exe).expect("read"), new_body.as_bytes());
         assert_eq!(
             std::fs::read(old_path(&exe)).expect("read"),
@@ -877,7 +877,7 @@ mod tests {
         // After the restart the new version re-checks the same release:
         // up to date, nothing changes.
         let updater_new = Updater::new(
-            Version::parse("0.2.0").expect("new version"),
+            Version::parse("0.3.0").expect("new version"),
             exe.clone(),
             dir.clone(),
             &fetcher,
@@ -894,7 +894,7 @@ mod tests {
         let dir = temp_dir("badsha");
         let exe = dir.join("activity-daemon.exe");
         std::fs::write(&exe, b"old-exe-bytes").expect("write old exe");
-        let release = release_with_default_assets("v0.2.0", "fake://exe", "fake://sha");
+        let release = release_with_default_assets("v0.3.0", "fake://exe", "fake://sha");
         let fetcher = FakeFetcher {
             release: Some(release),
             error: None,
@@ -916,7 +916,7 @@ mod tests {
         let err = updater.check_and_apply().expect_err("mismatch must abort");
         assert!(err.to_string().contains("sha256 mismatch"), "{err}");
         // The download was deleted, the old version is untouched.
-        assert!(!updater.update_dir().join("v0.2.0.exe.tmp").exists());
+        assert!(!updater.update_dir().join("v0.3.0.exe.tmp").exists());
         assert_eq!(std::fs::read(&exe).expect("read"), b"old-exe-bytes");
         assert!(!old_path(&exe).exists(), "no swap happened");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1006,7 +1006,7 @@ mod tests {
     fn check_and_apply_never_runs_two_updates_in_flight() {
         let _lock = apply_lock();
         let dir = temp_dir("guard");
-        let release = release_with_default_assets("v0.2.0", "u", "s");
+        let release = release_with_default_assets("v0.3.0", "u", "s");
         let fetcher = FakeFetcher {
             release: Some(release),
             error: None,
