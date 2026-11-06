@@ -172,7 +172,9 @@ grows the same value and the forwarder sends the header (wiring in #7).
 | `ACTIVITY_DB`     | `./data/activity.db`    | central SQLite store (WAL)                                     |
 | `ACTIVITY_DATA`   | `./data`                | media root; files land under `$ACTIVITY_DATA/media/<kind>/...` |
 | `ACTIVITY_TOKEN`  | unset                   | require matching `X-Activity-Token` header on `/ingest`        |
-| `ACTIVITY_CONFIG` | `$ACTIVITY_DATA/config.toml` | server config file (only `[retention]` today)             |
+| `ACTIVITY_CONFIG` | `$ACTIVITY_DATA/config.toml` | server config file (`[retention]`, `[retention.minio]`)   |
+| `ACTIVITY_MINIO_ACCESS_KEY` | unset            | MinIO permanent tier access key (issue #39; env only, never config) |
+| `ACTIVITY_MINIO_SECRET_KEY` | unset            | MinIO permanent tier secret key (issue #39; env only, never config) |
 
 The container image presets `ACTIVITY_PORT=8080`, `ACTIVITY_DB=/data/activity.db`,
 `ACTIVITY_DATA=/data` - keep the volume mounted at `/data` and everything
@@ -220,16 +222,66 @@ activity-server --dry-run   # prints months found, sizes, would-bundle/would-del
 
 `status --json` on a client surfaces the hub state (`GET /api/retention`,
 fetched best-effort): hot bytes by kind, bundle count/bytes, months
-pending, next scheduled action.
+pending, next scheduled action, per-bundle tier and the MinIO move state
+(issue #39).
+
+## Server config: `[retention.minio]` - the permanent tier (issue #39)
+
+Once a month is cold and its bundle is verified, the bundle moves to MinIO
+(`blob.joechowhk.internal`, path-style S3) as the **permanent tier**:
+
+```toml
+[retention.minio]
+enabled  = true
+endpoint = "blob.joechowhk.internal"
+bucket   = "activity-archive"
+prefix   = "bundles" # default; object key = <prefix>/<YYYY-MM>.tar.zst
+secure   = false     # TLS; the devbox *.joechowhk.internal vhosts are plain HTTP today
+```
+
+Credentials never live in the config file: set `ACTIVITY_MINIO_ACCESS_KEY`
+and `ACTIVITY_MINIO_SECRET_KEY` in the hub container's environment. Use a
+scoped key (read+write on the bucket only, no delete) so the IAM layer
+enforces the never-delete contract.
+
+Contract:
+
+- Layout: `s3://activity-archive/bundles/<YYYY-MM>.tar.zst` plus the
+  `.sha256` sidecar alongside. The app performs the move (no MinIO
+  lifecycle rule) so the audit trail stays in one place.
+- A bundle uploads only after the bundling stage verified it; after the
+  upload, the object is fetched back and verified (size + sha256), and
+  only then is the hub-local copy deleted (targeted per-file removal).
+- Nothing is ever deleted from MinIO by this feature. The only overwrite
+  is the idempotent re-upload of the same month's key on retry.
+- Upload/verify failures keep the hub-local bundle, record the reason in
+  `bundles/minio-state.json`, and retry on the next daily tick (the tick
+  cadence is the backoff).
+- The move state file is the proof a remote copy exists. If it is
+  unreadable, both stages pause and keep everything local (deleting the
+  file makes the next pass re-upload every local bundle - overwrites are
+  idempotent and verified).
+- Late-arriving raw files for an already-moved month stay on the hub and
+  are reported; rebundling from MinIO is future scope.
+
+Deployment one-time steps (values live in the infra, not this repo):
+
+```sh
+mc mb local/activity-archive          # bucket
+mc admin policy attach ...            # scoped key per /opt/minio/policies/ convention
+```
 
 ## HTTP API
 
 - `GET /health` -> `{"ok": true, "status": "ok", "version": "...", "events_count": n}`
   (`version` feeds the hub updater, issue #32)
-- `GET /api/retention` -> retention stats (issue #38, read-only, open per
-  the `/api` precedent): `{"enabled", "hot_days", "hot_bytes": {"frames",
-  "audio"}, "bundle_count", "bundle_bytes", "months_pending":
-  [{"month", "files", "bytes"}], "next_action"}`.
+- `GET /api/retention` -> retention stats (issues #38/#39, read-only, open
+  per the `/api` precedent): `{"enabled", "hot_days", "hot_bytes":
+  {"frames", "audio"}, "bundle_count", "bundle_bytes", "months_pending":
+  [{"month", "files", "bytes"}], "next_action", "bundles": [{"month",
+  "bytes", "tier" ("hot"|"minio")}], "minio": {"enabled", "endpoint",
+  "bucket", "prefix", "secure", "moved_months", "moved_bytes",
+  "last_move": {"month", "status", "error", "at", "attempts"}}}`.
 - `POST /ingest/events`
   - body: `{"device": "...", "events": [{"bucket", "timestamp" (RFC3339 with
     offset), "duration_s", "data"} ...]}`
