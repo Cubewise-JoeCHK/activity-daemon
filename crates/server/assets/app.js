@@ -96,17 +96,6 @@
     $("#error-banner").hidden = true;
   }
 
-  // Presentation-only app classification (grey shades). The authoritative
-  // classifier is the v0.2 config-driven rules engine on the hub.
-  function classify(app) {
-    const a = String(app || "").toLowerCase();
-    if (/code|visual studio|vscode|cursor|zed|neovim|vim|idea|rider|rustrover|pycharm|terminal|powershell|pwsh|conhost|wsl|cmd|sublime|emacs/.test(a)) return "deep";
-    if (/teams|zoom|slack|webex|meet|skype|facetime/.test(a)) return "meet";
-    if (/chrome|msedge|edge|firefox|safari|brave|arc|opera/.test(a)) return "res";
-    if (/outlook|mail|thunderbird|telegram|whatsapp|wechat|signal|discord/.test(a)) return "com";
-    return "other";
-  }
-
   function presenceClass(ageS) {
     if (ageS == null) return "offline";
     if (ageS < 120) return "";
@@ -416,8 +405,9 @@
       const day = byDate.get(iso);
       let blocks = '<div class="hlines"></div>';
       if (day) {
-        for (const s of day.sessions || []) blocks += sessionBlock(s, false);
-        for (const a of day.afk || []) blocks += sessionBlock(a, true);
+        for (const a of day.approved || []) blocks += approvedBlock(a);
+        for (const iv of uncoveredIntervals(day)) blocks += uncoveredBlock(iv);
+        for (const a of day.afk || []) blocks += afkBlock(a);
       }
       if (iso === todayIso) {
         const mins = now.getHours() * 60 + now.getMinutes();
@@ -434,35 +424,115 @@
     $("#cal-device").innerHTML = `device <b>${esc(state.weekCal?.device || "—")}</b>`;
   }
 
-  function sessionBlock(item, isAfk) {
-    const start = new Date(item.start);
-    if (isNaN(start)) return "";
-    const startMin = start.getHours() * 60 + start.getMinutes();
-    const durMin = Math.max(2, (item.duration_s || 0) / 60);
-    let top = startMin - DAY_START_MIN;
-    let height = durMin * PX_PER_MIN;
-    if (top < 0) { height += top; top = 0; } // started before the grid window
-    if (top >= DAY_MINUTES) return "";
-    height = Math.min(height, DAY_MINUTES - top);
-    if (height < 18) height = 18; // readable minimum, like the mockup
-    if (isAfk) {
-      return `<div class="ev afk" style="top:${top}px;height:${height}px"><b>AFK</b>${height >= 30 ? `<span class="t">${fmtClock(item.start)} · ${fmtDur(item.duration_s)}</span>` : ""}</div>`;
+  // ----- processed rendering (issue #48). Approved timesheet activities =
+  // coloured blocks (category colour, project label); active time not
+  // covered by an approval = grey; AFK unchanged. Drafts never arrive from
+  // the API, so they cannot render.
+
+  const GRID_END = DAY_START_MIN + DAY_MINUTES; // grid bottom, 21:00
+
+  function categoryClass(category) {
+    const slug = String(category || "").toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return slug ? "cat-" + slug : "cat-none";
+  }
+
+  function minuteOfDay(rfc3339) {
+    const t = new Date(rfc3339);
+    if (isNaN(t)) return null;
+    return t.getHours() * 60 + t.getMinutes() + t.getSeconds() / 60;
+  }
+
+  function approvedInterval(item) {
+    const a = minuteOfDay(item.start), b = minuteOfDay(item.end);
+    if (a == null || b == null || b <= a) return null;
+    return [Math.max(a, DAY_START_MIN), Math.min(b, GRID_END)];
+  }
+
+  function sessionInterval(item) {
+    const a = minuteOfDay(item.start);
+    if (a == null) return null;
+    return [Math.max(a, DAY_START_MIN),
+            Math.min(a + (item.duration_s || 0) / 60, GRID_END)];
+  }
+
+  function mergeIntervals(list) {
+    const sorted = list.filter(Boolean).sort((x, y) => x[0] - y[0]);
+    const out = [];
+    for (const iv of sorted) {
+      const last = out[out.length - 1];
+      if (last && iv[0] <= last[1]) last[1] = Math.max(last[1], iv[1]);
+      else out.push([iv[0], iv[1]]);
     }
-    const cls = classify(item.app);
-    const live = isLive(item) ? " live" : "";
-    return `<div class="ev ${cls}${live}" style="top:${top}px;height:${height}px"><b>${esc(item.app || "app")}</b>${height >= 30 ? `<span class="t">${fmtClock(item.start)} · ${esc(shortTitle(item.title))}</span>` : ""}</div>`;
+    return out;
   }
 
-  function shortTitle(title) {
-    return String(title || "").slice(0, 60);
+  function subtractIntervals(base, minus) {
+    const out = [];
+    for (const [a, b] of base) {
+      let cur = a;
+      for (const [m0, m1] of minus) {
+        if (m1 <= cur || m0 >= b) continue;
+        if (m0 > cur) out.push([cur, Math.min(m0, b)]);
+        cur = Math.max(cur, m1);
+        if (cur >= b) break;
+      }
+      if (cur < b) out.push([cur, b]);
+    }
+    return out;
   }
 
-  // A session is "live" when its span reaches now (open-ended last session
-  // is flushed only on change, so the newest window event may still run).
-  function isLive(session) {
-    const end = new Date(new Date(session.start).getTime() + (session.duration_s || 0) * 1000);
-    const last = state.weekCal?.days?.flatMap((d) => d.sessions || []).at(-1);
-    return last && last.start === session.start && end.getTime() > Date.now() - 120000;
+  // Active session time minus the approved coverage, merged into blocks.
+  // With no approved rows yet (empty bucket), every session is grey.
+  function uncoveredIntervals(day) {
+    const covered = mergeIntervals((day.approved || []).map(approvedInterval));
+    const active = mergeIntervals((day.sessions || []).map(sessionInterval));
+    return subtractIntervals(active, covered);
+  }
+
+  // Shared grid placement: clips to the 07:00-21:00 window, keeps a
+  // readable 18 px minimum (same convention the old session blocks used).
+  // Returns {top, height} in px, or null when fully outside the grid.
+  function placeBlock(startMin, endMin) {
+    let top = startMin - DAY_START_MIN;
+    let height = (endMin - startMin) * PX_PER_MIN;
+    if (top < 0) { height += top; top = 0; }
+    if (top >= DAY_MINUTES || height <= 0) return null;
+    height = Math.min(height, DAY_MINUTES - top);
+    if (height < 18) height = 18;
+    return { top, height };
+  }
+
+  function approvedBlock(item) {
+    const iv = approvedInterval(item);
+    if (!iv) return "";
+    const p = placeBlock(iv[0], iv[1]);
+    if (!p) return "";
+    const tip = `${item.project || "No project"} · ${item.category || "Unclassified"}` +
+      ` · ${fmtClock(item.start)}–${fmtClock(item.end)} · confidence ${Math.round((item.confidence || 0) * 100)}%`;
+    return `<div class="ev ${categoryClass(item.category)}" style="top:${p.top}px;height:${p.height}px" title="${esc(tip)}">` +
+      `<b>${esc(item.project || "—")}</b>` +
+      `${p.height >= 30 ? `<span class="t">${fmtClock(item.start)} · ${esc(shortText(item.task))}</span>` : ""}</div>`;
+  }
+
+  function uncoveredBlock(iv) {
+    const p = placeBlock(iv[0], iv[1]);
+    if (!p) return "";
+    return `<div class="ev uncovered" style="top:${p.top}px;height:${p.height}px" ` +
+      `title="Unclassified active time · ${fmtDur((iv[1] - iv[0]) * 60)}"></div>`;
+  }
+
+  function afkBlock(item) {
+    const a = minuteOfDay(item.start);
+    if (a == null) return "";
+    const p = placeBlock(a, a + Math.max(2, (item.duration_s || 0) / 60));
+    if (!p) return "";
+    return `<div class="ev afk" style="top:${p.top}px;height:${p.height}px"><b>AFK</b>` +
+      `${p.height >= 30 ? `<span class="t">${fmtClock(item.start)} · ${fmtDur(item.duration_s)}</span>` : ""}</div>`;
+  }
+
+  function shortText(text) {
+    return String(text || "").slice(0, 60);
   }
 
   // -------------------------------------------------------------- wiring

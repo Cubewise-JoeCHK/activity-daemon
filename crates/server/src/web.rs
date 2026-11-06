@@ -10,9 +10,20 @@
 //!   the 30 most recent events per device; plus hub-level facts (version,
 //!   uptime, stored media bytes per kind).
 //! - `GET /api/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&device=...]` -
-//!   window sessions and AFK spans grouped by day for the behaviour
-//!   calendar. Without `device` the device with the most window events in
-//!   the range wins (single-owner hub: usually every day has exactly one).
+//!   window sessions, AFK spans and approved timesheet activities grouped
+//!   by day for the behaviour calendar. Without `device` the device with
+//!   the most window events in the range wins (single-owner hub: usually
+//!   every day has exactly one).
+//!
+//!   Each day object carries an additive `approved` array (ADR addendum on
+//!   #16, issue #48): owner-approved activities from bucket
+//!   `timesheet-approved` as `{start, end, project, category, task,
+//!   confidence}`. The reader is defensive - a missing or empty bucket
+//!   yields empty arrays and every other field of the response stays
+//!   byte-identical, so the transition period (no approved rows yet)
+//!   renders as unclassified active time. Draft activities
+//!   (`timesheet-draft`) are never queried: drafts never appear on the
+//!   calendar.
 //! - `GET /api/retention` - hub-side media retention stats (issue #38):
 //!   hot raw bytes per kind, bundle count/bytes, cold months still pending,
 //!   and the next scheduled action. Surfaced through the client's
@@ -41,6 +52,7 @@ use chrono::{
     DateTime, Duration as ChronoDuration, FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone,
     Utc,
 };
+use refiner_timesheet::BUCKET_TIMESHEET_APPROVED;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -321,6 +333,21 @@ fn calendar_payload(
         None => Vec::new(),
     };
 
+    // Approved timesheet activities (issue #48): additive per-day data for
+    // the calendar rendering. Drafts are deliberately never read here.
+    // An empty or absent bucket yields empty arrays - the response is
+    // otherwise identical, so no approved rows yet means a fully backwards
+    // compatible payload.
+    let approved = match &device {
+        Some(device) => db.query_events_in(
+            Some(BUCKET_TIMESHEET_APPROVED),
+            Some(device),
+            Some(&range_start),
+            Some(&range_end),
+        )?,
+        None => Vec::new(),
+    };
+
     // Day skeletons for every date in the range (empty days included).
     let mut days: Vec<(NaiveDate, Value)> = Vec::new();
     let mut day = from;
@@ -332,6 +359,7 @@ fn calendar_payload(
                 "active_s": 0.0,
                 "sessions": Vec::<Value>::new(),
                 "afk": Vec::<Value>::new(),
+                "approved": Vec::<Value>::new(),
             }),
         ));
         day += ChronoDuration::days(1);
@@ -371,6 +399,47 @@ fn calendar_payload(
         }));
     }
 
+    // Approved activities bucketed by their local start day. Fields are
+    // read defensively: `start` falls back to the row timestamp and `end`
+    // to start + duration_s when the writer omitted them, and `project`
+    // accepts either the compiler's `project_guess` spelling or a plain
+    // `project` key, so a vocabulary rename on #47 cannot break rendering.
+    let mut approved_by_day: std::collections::HashMap<NaiveDate, Vec<Value>> =
+        std::collections::HashMap::new();
+    for event in approved {
+        let date = local_date_of(&event.timestamp)?;
+        let start = event
+            .data
+            .get("start")
+            .and_then(Value::as_str)
+            .unwrap_or(&event.timestamp)
+            .to_string();
+        let end = match event.data.get("end").and_then(Value::as_str) {
+            Some(end) => end.to_string(),
+            None => match parse_instant(&start) {
+                Ok(start) => {
+                    (start + ChronoDuration::seconds(event.duration_s as i64)).to_rfc3339()
+                }
+                Err(_) => start.clone(),
+            },
+        };
+        let project = event
+            .data
+            .get("project_guess")
+            .and_then(Value::as_str)
+            .or_else(|| event.data.get("project").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        approved_by_day.entry(date).or_default().push(json!({
+            "start": start,
+            "end": end,
+            "project": project,
+            "category": event.data.get("category").and_then(Value::as_str).unwrap_or(""),
+            "task": event.data.get("task").and_then(Value::as_str).unwrap_or(""),
+            "confidence": event.data.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
+        }));
+    }
+
     let days: Vec<Value> = days
         .into_iter()
         .map(|(date, mut day)| {
@@ -382,6 +451,9 @@ fn calendar_payload(
             }
             if let Some(afk) = afk_by_day.get(&date) {
                 day["afk"] = json!(afk);
+            }
+            if let Some(approved) = approved_by_day.get(&date) {
+                day["approved"] = json!(approved);
             }
             day
         })
