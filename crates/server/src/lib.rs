@@ -35,6 +35,11 @@
 //!   frame of a question as JPEG bytes, resolved against the media root.
 //! - `POST /api/timesheet/questions/{id}/answer` - body
 //!   `{"answer": "..."}`; marks the question answered (last write wins).
+//! - `POST /api/timesheet/questions/maintenance?date=YYYY-MM-DD` - the
+//!   question debris cleanup (issue #66): closes the day's open questions
+//!   whose span is zero-length or fully covered by the day's current
+//!   drafts (`superseded`; idempotent). Regeneration applies the same
+//!   rule automatically and reports `questions_closed`.
 //! - `GET /api/timesheet/export?month=YYYY-MM` - the month's approved
 //!   activities as a Cubewise offline-template xlsx download (issue #46),
 //!   `Content-Disposition: attachment; filename=timesheet_<month>.xlsx`;
@@ -48,7 +53,9 @@
 //!   merge window sessions + frame analyses + AFK + answered questions
 //!   into fresh drafts (old drafts marked `superseded_by`), optionally
 //!   consulting Lemonade once for titles/comments (`use_llm_titles`,
-//!   fail-soft to heuristics). Returns the same payload as GET.
+//!   fail-soft to heuristics). Open questions the recompile supersedes
+//!   close as `superseded` (issue #66, reported as `questions_closed`).
+//!   Returns the same payload as GET.
 //! - `GET /api/timesheet/style` - the owner writing style for every
 //!   AI-generated timesheet text (issue #53): `{style_prompt,
 //!   style_examples}` from `[timesheet.style]`. An empty prompt means the
