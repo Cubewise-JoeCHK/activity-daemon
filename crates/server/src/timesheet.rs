@@ -13,11 +13,14 @@
 //! - `POST /api/timesheet/questions/{id}/answer` - body `{"answer": "..."}`;
 //!   marks the question answered (last write wins on re-answer).
 //! - `POST /api/timesheet/questions/maintenance?date=YYYY-MM-DD` - the
-//!   question debris cleanup (issue #66): closes the day's open questions
-//!   whose span is zero-length or fully covered by the day's current
-//!   drafts (status `superseded`; `answer` stays NULL, evidence kept).
-//!   Idempotent - re-running closes nothing. Regeneration applies the
-//!   same rule automatically and reports `questions_closed`.
+//!   question debris cleanup (issues #66 + #68): closes the day's open
+//!   questions the recompile would supersede - zero-length spans, spans
+//!   fully covered by the day's current drafts, minute spans inside an
+//!   open stretch question's span, and asks whose session a classified
+//!   segment absorbed (status `superseded`; `answer` stays NULL,
+//!   evidence kept). Idempotent - re-running closes nothing.
+//!   Regeneration applies the same rule automatically and reports
+//!   `questions_closed`.
 //!
 //! Month-end export (issue #46):
 //! - `GET /api/timesheet/export?month=YYYY-MM` - the month's approved
@@ -119,7 +122,8 @@ use refiner_timesheet::{
     current_draft_from_row, export_month_bytes, parse_day, parse_month, plan_day, store_day,
     superseded_question_ids, BlockTitler, CubewiseVocab, DayInput, DraftActivity, HeuristicTitler,
     LemonadeTitler, StatusFilter, StyleConfig, StyleExample, TimesheetConfig, TsQuestion,
-    TsQuestionStore, BUCKET_FRAME_ANALYSIS, BUCKET_TIMESHEET_APPROVED, BUCKET_TIMESHEET_DRAFT,
+    TsQuestionStatus, TsQuestionStore, BUCKET_FRAME_ANALYSIS, BUCKET_TIMESHEET_APPROVED,
+    BUCKET_TIMESHEET_DRAFT,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -382,16 +386,19 @@ fn regenerate_payload(
         let stored = store_day(&db, &questions, &plan)?;
         (stored, plan, existing_questions)
     };
-    // Supersession guard (issue #66): the recompile closes the day's open
-    // questions whose span is zero-length or fully covered by the new
-    // drafts, so regeneration never leaves debris in the owner's queue
-    // (the maintenance endpoint applies the same rule to existing rows).
+    // Supersession guard (issues #66 + #68): the recompile closes the
+    // day's open questions it would supersede - zero-length spans, spans
+    // covered by the new drafts, minute spans inside an open stretch
+    // question's span, asks whose session a classified segment absorbed - so
+    // regeneration never leaves debris in the owner's queue (the
+    // maintenance endpoint applies the same rule to existing rows).
     let closed_ids = {
         let questions = state
             .ts_questions
             .lock()
             .map_err(|_| CoreError::Config("question store lock poisoned".to_string()))?;
-        let superseded = superseded_question_ids(&existing_questions, &plan.activities);
+        let superseded =
+            superseded_question_ids(&existing_questions, &plan.activities, &plan.supersession);
         questions.supersede_questions(&superseded)?
     };
     let mut payload = draft_payload(state, day)?;
@@ -488,7 +495,15 @@ async fn api_questions_maintenance(
         Ok(day) => day,
         Err(e) => return bad_request(e),
     };
-    let outcome = tokio::task::spawn_blocking(move || maintenance_payload(&state, day)).await;
+    // The replay uses the live config (segmentation windows shape the
+    // compile-side coverage); titling stays heuristic - the rule never
+    // reads titles, so no Lemonade call is made.
+    let timesheet = match state.timesheet_snapshot() {
+        Ok(timesheet) => timesheet,
+        Err(e) => return internal_error(e),
+    };
+    let outcome =
+        tokio::task::spawn_blocking(move || maintenance_payload(&state, day, &timesheet)).await;
     match outcome {
         Ok(Ok(payload)) => json_response(StatusCode::OK, payload),
         Ok(Err(e)) => internal_error(e),
@@ -496,42 +511,82 @@ async fn api_questions_maintenance(
     }
 }
 
-/// The one-off debris cleanup (issue #66): apply the regeneration's
-/// supersession rule to existing rows - close the day's open questions
-/// whose span is zero-length or fully covered by the day's CURRENT drafts
-/// (approved or new; superseded draft history never covers anything).
+/// The one-off debris cleanup (issues #66 + #68): apply the
+/// regeneration's supersession rule to existing rows - close the day's
+/// open questions a recompile would supersede: zero-length spans, spans
+/// fully covered by the day's CURRENT drafts (approved or new; superseded
+/// draft history never covers anything), minute spans inside an open
+/// stretch question's span, and asks whose session a classified segment
+/// absorbed. The compile side re-runs on the same raw material with
+/// heuristic titles (deterministic, and the rule never reads titles), so
+/// the endpoint's decision always matches the regeneration guard's.
 /// Idempotent: closed questions are no longer open, so re-running closes
 /// nothing.
-fn maintenance_payload(state: &AppState, day: NaiveDate) -> Result<Value, CoreError> {
-    let drafts: Vec<DraftActivity> = {
+fn maintenance_payload(
+    state: &AppState,
+    day: NaiveDate,
+    timesheet: &TimesheetConfig,
+) -> Result<Value, CoreError> {
+    let day_str = day.format("%Y-%m-%d").to_string();
+    let (drafts, plan, existing_questions) = {
         let db = state
             .db
             .lock()
             .map_err(|_| CoreError::Config("database lock poisoned".to_string()))?;
+        let questions = state
+            .ts_questions
+            .lock()
+            .map_err(|_| CoreError::Config("question store lock poisoned".to_string()))?;
         let (from, to) = local_day_bounds(day)?;
-        let rows =
+        let draft_rows =
             db.query_event_rows_in(Some(BUCKET_TIMESHEET_DRAFT), None, Some(&from), Some(&to))?;
-        rows.iter()
+        let drafts: Vec<DraftActivity> = draft_rows
+            .iter()
             .filter(|row| row_in_day(row, day))
             .filter_map(current_draft_from_row)
-            .collect()
+            .collect();
+        let existing_questions: Vec<TsQuestion> = questions
+            .list_questions(StatusFilter::All)?
+            .into_iter()
+            .filter(|q| q.day == day_str)
+            .collect();
+        let input = DayInput {
+            day,
+            sessions: db.query_event_rows_in(Some(BUCKET_WINDOW), None, Some(&from), Some(&to))?,
+            analyses: db.query_event_rows_in(
+                Some(BUCKET_FRAME_ANALYSIS),
+                None,
+                Some(&from),
+                Some(&to),
+            )?,
+            afk: db.query_event_rows_in(Some(BUCKET_AFK), None, Some(&from), Some(&to))?,
+            old_drafts: draft_rows,
+            approved: db.query_event_rows_in(
+                Some(BUCKET_TIMESHEET_APPROVED),
+                None,
+                Some(&from),
+                Some(&to),
+            )?,
+        };
+        // `plan_day` is pure: nothing here writes - the replay exists only
+        // to build the rule's compile-side coverage (issue #68).
+        let plan = plan_day(&input, &existing_questions, timesheet, &HeuristicTitler);
+        (drafts, plan, existing_questions)
     };
-    let day_str = day.format("%Y-%m-%d").to_string();
     let store = state
         .ts_questions
         .lock()
         .map_err(|_| CoreError::Config("question store lock poisoned".to_string()))?;
-    let open: Vec<TsQuestion> = store
-        .list_questions(StatusFilter::Open)?
-        .into_iter()
-        .filter(|q| q.day == day_str)
-        .collect();
-    let superseded = superseded_question_ids(&open, &drafts);
+    let superseded = superseded_question_ids(&existing_questions, &drafts, &plan.supersession);
     let closed = store.supersede_questions(&superseded)?;
+    let open_now = existing_questions
+        .iter()
+        .filter(|q| q.status == TsQuestionStatus::Open)
+        .count();
     Ok(json!({
         "date": day_str,
         "closed_ids": closed,
-        "open_remaining": open.len() - closed.len(),
+        "open_remaining": open_now - closed.len(),
     }))
 }
 

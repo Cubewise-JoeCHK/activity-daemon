@@ -1,10 +1,13 @@
-//! Integration tests for the question debris cleanup (issue #66): the
-//! regeneration guard (`POST /api/timesheet/draft` closes superseded
+//! Integration tests for the question debris cleanup (issues #66 + #68):
+//! the regeneration guard (`POST /api/timesheet/draft` closes superseded
 //! questions and reports `questions_closed`) and the one-off maintenance
 //! endpoint (`POST /api/timesheet/questions/maintenance`, idempotent).
-//! The fixture mirrors the pilot debris pattern: zero-length
-//! "HH:MM-HH:MM" compiler questions plus analysis-worker instant
-//! questions - one covered by the recompiled drafts, one still grey.
+//! The fixtures mirror the pilot debris patterns: zero-length
+//! "HH:MM-HH:MM" compiler questions, analysis-worker instant questions -
+//! one covered by the recompiled drafts, one still grey - and the issue
+//! #68 stale pre-segmentation asks (minute-truncated session asks inside
+//! an open stretch question's span, and session asks a voted segment
+//! absorbed).
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -344,6 +347,115 @@ async fn maintenance_cleans_existing_rows_and_is_idempotent() {
         .expect("oneshot");
     let open = body_json(res).await;
     assert_eq!(open["questions"].as_array().expect("questions").len(), 2);
+    drop(dir);
+}
+
+// ------------------------------------- stale pre-segmentation asks (#68)
+
+#[tokio::test]
+async fn maintenance_supersedes_stale_pre_segmentation_asks() {
+    // The pilot pattern (issue #68): a voted block absorbed a session a
+    // stale ask still asks about (its minute-truncated span is NOT draft
+    // covered - the seconds never line up), and a grey stretch raised the
+    // wide question that owns its span. The maintenance endpoint closes
+    // both stale asks and leaves the stretch question open, idempotently.
+    // The stretch spans two sessions, so its question text matches no
+    // single session's text and rule (c) never touches it.
+    let (dir, state) = test_state("maintenance-stale");
+    let app = build_router(state);
+    // The voted block: 09:00:01-09:29:59 (Code.exe) with a 0.9 analysis
+    // inside - the ask text is the session's deterministic text.
+    seed_events(
+        &app,
+        "laptop",
+        vec![
+            EventEnvelope {
+                bucket: "window-watcher".to_string(),
+                timestamp: "2026-11-06T09:00:01+08:00".to_string(),
+                duration_s: 1798.0,
+                data: json!({ "app": "Code.exe", "title": "window title" }),
+            },
+            // The grey stretch: 15:19:37-15:31:12 (Chrome.exe) across
+            // two adjacent sessions, no analyses - never drafted, asked
+            // as one wide question (like the pilot's stretches).
+            EventEnvelope {
+                bucket: "window-watcher".to_string(),
+                timestamp: "2026-11-06T15:19:37+08:00".to_string(),
+                duration_s: 300.0,
+                data: json!({ "app": "Chrome.exe", "title": "window title" }),
+            },
+            EventEnvelope {
+                bucket: "window-watcher".to_string(),
+                timestamp: "2026-11-06T15:24:37+08:00".to_string(),
+                duration_s: 395.0,
+                data: json!({ "app": "Chrome.exe", "title": "window title" }),
+            },
+            analysis(9, 15, "C1234", "Consulting", 0.9),
+        ],
+    )
+    .await;
+    // First compile: drafts + the stretch question; nothing to close yet.
+    let res = app
+        .clone()
+        .oneshot(post("/api/timesheet/draft?date=2026-11-06"))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let payload = body_json(res).await;
+    assert_eq!(payload["questions_created"].as_i64().expect("created"), 1);
+    assert_eq!(payload["questions_closed"].as_i64().expect("closed"), 0);
+
+    // The pre-segmentation debris: the block session's own ask (voted
+    // segment absorbed it) and a minute ask inside the stretch.
+    seed_question(
+        &dir,
+        "2026-11-06",
+        "What were you working on 09:00-09:29 (Code.exe)?",
+        &[],
+    );
+    seed_question(
+        &dir,
+        "2026-11-06",
+        "What were you working on 15:20-15:24 (Chrome.exe)?",
+        &[],
+    );
+
+    let res = app
+        .clone()
+        .oneshot(post("/api/timesheet/questions/maintenance?date=2026-11-06"))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let payload = body_json(res).await;
+    assert_eq!(payload["closed_ids"].as_array().expect("ids").len(), 2);
+    assert_eq!(payload["open_remaining"].as_i64().expect("remaining"), 1);
+
+    // Idempotent: the re-run closes nothing.
+    let res = app
+        .clone()
+        .oneshot(post("/api/timesheet/questions/maintenance?date=2026-11-06"))
+        .await
+        .expect("oneshot");
+    let rerun = body_json(res).await;
+    assert_eq!(
+        rerun["closed_ids"].as_array().expect("ids").len(),
+        0,
+        "second run is a no-op"
+    );
+    assert_eq!(rerun["open_remaining"].as_i64().expect("remaining"), 1);
+
+    // The stretch question stays: it owns the grey time.
+    let res = app
+        .oneshot(get("/api/timesheet/questions"))
+        .await
+        .expect("oneshot");
+    let open = body_json(res).await;
+    let open_items = open["questions"].as_array().expect("questions");
+    assert_eq!(open_items.len(), 1);
+    assert!(open_items[0]["question"]
+        .as_str()
+        .expect("text")
+        .contains("15:19-15:31"));
     drop(dir);
 }
 
