@@ -1,11 +1,13 @@
 //! The forwarder loop: fetch unsynced rows, upload media files first, post
 //! the event batch, mark accepted rows synced. Media pass-through (sync
-//! contract v2, issue #40): a media file is deleted from the client as soon
-//! as the hub's PUT ack proves a durable, checksum-verified write; no ack,
-//! a checksum mismatch, or any other error leaves the file untouched for
-//! the retry. Errors are retried with exponential backoff plus jitter; the
-//! shutdown flag is polled every 250 ms so the daemon (issue #7) can stop
-//! the thread promptly.
+//! contract v2, issue #40, ADR rev 12 amendment): a media file is deleted
+//! from the client only when BOTH its upload was checksum-verified by the
+//! hub AND the referencing index row was accepted by an event batch; the
+//! PUT ack alone is not deletion clearance. No verified upload, a checksum
+//! mismatch, or a rejected row keeps the file for the retry, so an unsynced
+//! row can never lose its file. Errors are retried with exponential
+//! backoff plus jitter; the shutdown flag is polled every 250 ms so the
+//! daemon (issue #7) can stop the thread promptly.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -138,8 +140,11 @@ pub fn sync_once(
 
     // (a) media files first; rows whose file cannot be delivered are
     // skipped this round (stay unsynced, retried later) and excluded from
-    // the batch below.
+    // the batch below. A checksum-verified upload makes the local file
+    // deletion-eligible; the deletion itself waits for batch acceptance in
+    // step (c) - the PUT ack alone is not deletion clearance.
     let mut uploaded_ids: Vec<i64> = Vec::new();
+    let mut verified_files: Vec<(i64, &Path)> = Vec::new();
     for p in &planned {
         if let PlannedRow::Media {
             row_id,
@@ -149,7 +154,11 @@ pub fn sync_once(
         } = p
         {
             match upload_media_file(client, settings, file, media) {
-                Ok(()) => uploaded_ids.push(*row_id),
+                Ok(true) => {
+                    uploaded_ids.push(*row_id);
+                    verified_files.push((*row_id, file.as_path()));
+                }
+                Ok(false) => uploaded_ids.push(*row_id),
                 Err(err) => {
                     log::warn!("media file for row {row_id} not uploaded, will retry later: {err}")
                 }
@@ -187,25 +196,47 @@ pub fn sync_once(
             rejected.reason
         );
     }
+
+    // (d) sync contract v2 (issue #40, ADR rev 12 amendment): delete a
+    // local media file only now - its PUT was checksum-verified AND this
+    // batch accepted the referencing index row. A rejected row keeps its
+    // file and retries (re-upload + re-post) next round, so no unsynced
+    // row can ever lose its file.
+    for (row_id, file) in &verified_files {
+        if accepted_ids.contains(row_id) {
+            if let Err(e) = std::fs::remove_file(file) {
+                log::warn!(
+                    "media row {row_id} accepted by hub, but {} could not be deleted: {e} - the rolling budget will evict it",
+                    file.display()
+                );
+            } else {
+                log::info!(
+                    "media row {row_id} synced, local copy deleted: {}",
+                    file.display()
+                );
+            }
+        }
+    }
     stats.posted_events = posted.len();
     stats.accepted = accepted_ids.len();
     stats.rejected = ack.rejected.len();
     Ok(stats)
 }
 
-/// Hash and stream one media file to the hub, then apply the sync v2
-/// pass-through (issue #40): on a verified ack - the hub fsynced exactly
-/// these bytes and echoes their checksum - the local file is deleted
-/// (targeted per-file removal). An ack whose checksum mismatches fails the
-/// upload (the row stays unsynced and retries); a pre-v2 ack without a
-/// checksum counts as uploaded but keeps the file (deletion requires a
-/// verified checksum).
+/// Hash and stream one media file to the hub. Returns `Ok(true)` when the
+/// ack is checksum-verified - the hub fsynced exactly these bytes - which
+/// makes the local file deletion-eligible once its index row is accepted by
+/// a batch (the caller deletes; the PUT ack alone is not deletion
+/// clearance, ADR rev 12 amendment). Returns `Ok(false)` for a pre-v2 ack
+/// without a checksum: the upload counts, the file stays (an old hub must
+/// not stall media sync). An ack whose checksum mismatches is `Err`: the
+/// row stays unsynced and retries.
 fn upload_media_file(
     client: &dyn HttpClient,
     settings: &SyncSettings,
     file: &Path,
     media: &crate::plan::MediaRef,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
     let (_, sha_hex) =
         sha256_file_hex(file).map_err(|e| format!("cannot hash {}: {e}", file.display()))?;
     let handle =
@@ -217,28 +248,14 @@ fn upload_media_file(
     let ack: MediaPutAck = serde_json::from_str(&body)
         .map_err(|e| format!("unparseable media ack from {url}: {e}"))?;
     if ack_verifies_upload(&ack, &sha_hex) {
-        // Verified: the hub durably holds exactly these bytes - the client
-        // stops being a media archive. A failed removal is logged, not
-        // fatal: the hub copy exists, so the index row must still flow; the
-        // rolling budget backstop will evict the leftover file later.
-        if let Err(e) = std::fs::remove_file(file) {
-            log::warn!(
-                "media uploaded and acked, but {} could not be deleted: {e} - the rolling budget will evict it",
-                file.display()
-            );
-        } else {
-            log::info!(
-                "media uploaded (ack verified), local copy deleted: {}",
-                file.display()
-            );
-        }
+        Ok(true)
     } else if ack.sha256.is_some() {
-        // A checksum that does NOT match is never deletion clearance: fail
+        // A checksum that does NOT match is never verified delivery: fail
         // the upload so the row stays unsynced and retries.
-        return Err(format!(
+        Err(format!(
             "hub ack for {url} is not checksum-verified (ack sha {:?} vs local {sha_hex}) - file retained",
             ack.sha256
-        ));
+        ))
     } else {
         // Pre-v2 hub (ack without a checksum): the upload counts, the file
         // stays - an old hub must not stall media sync.
@@ -246,8 +263,8 @@ fn upload_media_file(
             "media uploaded; hub ack carries no checksum (pre-v2 hub) - file retained: {}",
             file.display()
         );
+        Ok(false)
     }
-    Ok(())
 }
 
 /// Sleep in small slices so the shutdown flag takes effect promptly.
@@ -446,20 +463,82 @@ mod tests {
         assert_eq!(db.unsynced_count().expect("count"), 0);
         assert_eq!(stats.accepted, 2);
         assert_eq!(stats.uploaded_files, 1);
-        // sync contract v2 (#40): the verified ack deletes the local file
+        // sync contract v2 (#40, rev 12 amendment): verified upload AND
+        // batch acceptance together delete the local file
         assert!(
             !file_path.exists(),
-            "checksum-verified ack must delete the local media file"
+            "batch acceptance of a verified upload must delete the local media file"
         );
         let _ = (plain, media);
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
+    fn verified_put_without_batch_acceptance_keeps_the_file() {
+        // The hub verified the PUT, but dies before the batch POST: the
+        // PUT ack alone is NOT deletion clearance - the file must stay so
+        // the row can retry (re-upload + re-post) next round.
+        let dir = temp_dir("putnoack");
+        let db = Db::open_in_memory().expect("db");
+        insert_plain(&db, "a");
+        let rel = "media/screen/2026/11/03/frame-11.jpg";
+        insert_media(&db, rel);
+        let file_path = dir.join(rel);
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file_path, b"jpeg-bytes").expect("write file");
+
+        let client = FakeClient::with_post_result(Result::Err(HttpError::transport(
+            "hub died before the batch",
+        )));
+        let settings = SyncSettings::new("http://hub:8080", "laptop");
+        let err = sync_once(&client, &settings, &db, &dir).expect_err("batch must fail");
+        assert_eq!(err.class(), RetryClass::Backoff);
+
+        assert!(
+            file_path.exists(),
+            "a PUT ack without batch acceptance must keep the file"
+        );
+        assert_eq!(
+            db.unsynced_count().expect("count"),
+            2,
+            "nothing marked synced on a failed batch"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn rejected_media_row_keeps_its_file() {
+        // Batch goes out, but the hub rejects the media index row: the row
+        // stays unsynced, so its (verified-uploaded) file must be retained
+        // for the retry next round.
+        let dir = temp_dir("rejectedmedia");
+        let db = Db::open_in_memory().expect("db");
+        insert_plain(&db, "a");
+        let rel = "media/screen/2026/11/03/frame-12.jpg";
+        insert_media(&db, rel);
+        let file_path = dir.join(rel);
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file_path, b"jpeg-bytes").expect("write file");
+
+        let client = FakeClient::with_post_result(Ok(
+            "{\"accepted\":1,\"rejected\":[{\"index\":1,\"reason\":\"bad timestamp\"}]}"
+                .to_string(),
+        ));
+        let settings = SyncSettings::new("http://hub:8080", "laptop");
+        let stats = sync_once(&client, &settings, &db, &dir).expect("round completes");
+
+        assert_eq!(stats.accepted, 1, "plain event accepted");
+        assert!(file_path.exists(), "a rejected row keeps its file");
+        assert_eq!(db.unsynced_count().expect("count"), 1);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
     fn mismatched_checksum_ack_keeps_the_file_and_the_row_unsynced() {
         // A 200 ack carrying the WRONG checksum (broken middlebox / skew):
-        // the client must not delete, and the row must stay unsynced for
-        // retry - only a matching checksum is deletion clearance.
+        // the client must not treat the upload as verified, and the row
+        // must stay unsynced for retry - only a matching checksum makes
+        // the file deletion-eligible.
         let dir = temp_dir("mismatch");
         let db = Db::open_in_memory().expect("db");
         insert_plain(&db, "a");

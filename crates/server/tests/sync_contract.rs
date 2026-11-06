@@ -1,7 +1,8 @@
 //! Sync contract v2 integration tests (issue #40): the real client
 //! forwarder (`activity_sync::sync_once` with the real `UreqClient`) driven
 //! over loopback HTTP against the real hub router. Covers the
-//! delete-on-ack media pass-through end to end: a verified ack deletes the
+//! delete-after-batch-acceptance media pass-through end to end (ADR rev 12
+//! amendment): a verified upload whose index batch is accepted deletes the
 //! client file (hub holds the exact bytes, counters stay correct); an
 //! unreachable hub - the same client path as a hub killed before the
 //! durable write - keeps the file and the counters untouched.
@@ -84,7 +85,7 @@ fn seed_media(db: &Db, data_dir: &Path, bytes: &[u8]) -> PathBuf {
 /// hub's serve task needs its own worker (a current-thread runtime would
 /// starve it until the 300 s request timeout).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn verified_ack_deletes_client_file_and_counters_stay_correct() {
+async fn accepted_batch_deletes_client_file_and_counters_stay_correct() {
     let hub_dir = TempDir::new("hub");
     let client_dir = TempDir::new("client");
     let db = Db::open_in_memory().expect("client db");
@@ -104,10 +105,11 @@ async fn verified_ack_deletes_client_file_and_counters_stay_correct() {
     assert_eq!(stats.uploaded_files, 1);
     assert_eq!(stats.accepted, 2);
     assert_eq!(db.unsynced_count().expect("count"), 0);
-    // pass-through: the client file is gone ...
+    // pass-through: the client file is gone once the verified upload's
+    // index row was batch-accepted ...
     assert!(
         !client_file.exists(),
-        "a checksum-verified ack must delete the local media file"
+        "batch acceptance of a verified upload must delete the local media file"
     );
     // ... and the hub durably holds the exact bytes plus the index row.
     let hub_copy = hub_dir.0.join("media/screen/2026/11/03/frame-1.jpg");
