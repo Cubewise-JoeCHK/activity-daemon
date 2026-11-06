@@ -22,7 +22,11 @@
 //!   bundle at the final path; a crash mid-prune is completed by the next
 //!   pass (bundle re-verified against the manifest, remaining raws removed).
 //! - A `.sha256` sidecar records the verified bundle digest (same format as
-//!   the release artifacts; the future MinIO tier can re-check it cheaply).
+//!   the release artifacts; the MinIO tier re-checks it cheaply).
+//! - Stage 2 (issue #39, [`crate::minio`]): once a month is cold AND its
+//!   bundle is verified, the bundle moves to the MinIO permanent tier and
+//!   the hub-local copy is removed only after a verified round trip.
+//!   Bundling never touches a month whose archive already lives in MinIO.
 //!
 //! The sweeper runs inside the server on a daily tick ([`run_pass`]) and is
 //! idempotent; `--dry-run` prints the plan without writing or deleting
@@ -39,6 +43,8 @@ use sha2::Digest;
 
 use activity_core::CoreError;
 
+use crate::minio;
+
 /// Media kinds in retention scope (issue #38: frames + audio only). Other
 /// kinds under `media/` are never bundled and never deleted.
 const MEDIA_KINDS: [&str; 2] = ["frames", "audio"];
@@ -47,8 +53,10 @@ const MEDIA_KINDS: [&str; 2] = ["frames", "audio"];
 const MANIFEST_NAME: &str = "_manifest.json";
 /// Suffix of the in-progress bundle (renamed to the final name on success).
 const PART_SUFFIX: &str = ".part";
-/// Suffix of the verified-digest sidecar (`sha256sum` text format).
-const SHA256_SUFFIX: &str = ".sha256";
+/// Suffix of the verified-digest sidecar (`sha256sum` text format); the
+/// MinIO move stage (issue #39) uploads it alongside the bundle. Part of
+/// the documented store layout, hence public.
+pub const SHA256_SUFFIX: &str = ".sha256";
 /// zstd compression level (3 = the library default; the media is already
 /// JPEG/OGG compressed, so higher levels buy almost nothing).
 const ZSTD_LEVEL: i32 = 3;
@@ -73,8 +81,7 @@ pub enum BundleCadence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetentionConfig {
-    /// Master switch. Stays `false` until the MinIO move tier (follow-up
-    /// issue) lands and the owner opts in.
+    /// Master switch. Stays `false` until the owner opts in.
     pub enabled: bool,
     /// Hot window in days: raw files stay browsable under `media/` for this
     /// long; months that ended strictly more than `hot_days` ago are
@@ -82,6 +89,9 @@ pub struct RetentionConfig {
     pub hot_days: u64,
     /// Archive granularity (only `monthly` exists).
     pub bundle: BundleCadence,
+    /// `[retention.minio]` permanent tier (issue #39): verified bundles
+    /// move to MinIO once cold; disabled by default.
+    pub minio: crate::minio::MinioConfig,
 }
 
 impl Default for RetentionConfig {
@@ -90,6 +100,7 @@ impl Default for RetentionConfig {
             enabled: false,
             hot_days: 365,
             bundle: BundleCadence::Monthly,
+            minio: crate::minio::MinioConfig::default(),
         }
     }
 }
@@ -129,6 +140,12 @@ pub fn load_server_config(path: &Path) -> Result<ServerConfig, CoreError> {
     };
     let cfg: ServerConfig = toml::from_str(&text)
         .map_err(|e| CoreError::Config(format!("cannot parse {}: {e}", path.display())))?;
+    // Semantic validation beyond serde (issue #39): an enabled minio
+    // section must name an endpoint and a bucket - a typo must not silently
+    // run the move stage with empty settings.
+    if let Err(reason) = cfg.retention.minio.validate() {
+        return Err(CoreError::Config(reason));
+    }
     Ok(cfg)
 }
 
@@ -157,7 +174,10 @@ impl RetentionStore {
         }
     }
 
-    fn bundle_path(&self, month: &str) -> PathBuf {
+    /// Path of a month's bundle file (`<YYYY-MM>.tar.zst`); part of the
+    /// documented store layout, shared with the MinIO move stage
+    /// (issue #39).
+    pub fn bundle_path(&self, month: &str) -> PathBuf {
         self.bundles_dir.join(format!("{month}.tar.zst"))
     }
 
@@ -296,7 +316,7 @@ fn last_day_of(first: NaiveDate) -> NaiveDate {
 /// A month is *cold* (bundle-eligible) when it is fully elapsed AND its
 /// last day lies strictly beyond the hot window. The current month never
 /// satisfies this: its last day is always >= today >= the cutoff.
-fn is_cold(month: &str, today: NaiveDate, hot_days: u64) -> bool {
+pub(crate) fn is_cold(month: &str, today: NaiveDate, hot_days: u64) -> bool {
     let Some(first) = parse_month(month) else {
         return false;
     };
@@ -305,7 +325,7 @@ fn is_cold(month: &str, today: NaiveDate, hot_days: u64) -> bool {
 }
 
 /// `YYYY-MM` -> first day of that month.
-fn parse_month(month: &str) -> Option<NaiveDate> {
+pub(crate) fn parse_month(month: &str) -> Option<NaiveDate> {
     let (year, month) = month.split_once('-')?;
     if year.len() != 4 || month.len() != 2 {
         return None;
@@ -391,7 +411,7 @@ fn append_bytes_member(
 }
 
 /// sha256 of a file, streamed (media files can be large).
-fn sha256_file(path: &Path) -> Result<String, String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let mut hasher = sha2::Sha256::new();
     std::io::copy(&mut file, &mut hasher)
@@ -400,7 +420,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 }
 
 /// sha256 of an in-memory slice.
-fn sha256_bytes(data: &[u8]) -> String {
+pub(crate) fn sha256_bytes(data: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(data))
 }
 
@@ -411,8 +431,9 @@ fn sha256_bytes(data: &[u8]) -> String {
 /// members must match the manifest exactly (same set, same sizes, same
 /// order). Up to [`SAMPLE_COUNT`] member contents are checksummed against
 /// the manifest - hashed inline during the same decode pass, so one pass
-/// verifies everything, even with the raws already pruned.
-fn verify_bundle(store: &RetentionStore, month: &str) -> Result<BundleManifest, String> {
+/// verifies everything, even with the raws already pruned. Also the gate
+/// the MinIO move stage passes before uploading (issue #39).
+pub(crate) fn verify_bundle(store: &RetentionStore, month: &str) -> Result<BundleManifest, String> {
     let bundle = store.bundle_path(month);
     let file = File::open(&bundle).map_err(|e| format!("cannot open {}: {e}", bundle.display()))?;
     let decoder = zstd::stream::Decoder::new(file).map_err(|e| format!("zstd decoder: {e}"))?;
@@ -644,20 +665,53 @@ pub fn run_pass(store: &RetentionStore, cfg: &RetentionConfig, today: NaiveDate)
     if !cfg.enabled {
         return report;
     }
+    // Issue #39: months whose verified archive already lives in the
+    // permanent tier are never re-bundled - a partial rebuild could later
+    // overwrite the full remote copy. An unreadable move state pauses
+    // bundling entirely: the state is what proves the remote copy exists.
+    let moved = moved_month_guard(store, cfg);
     for month in pending_months(store, cfg, today) {
-        match pass_month(store, &month, today) {
-            Ok((bundled, files, bytes)) => {
-                if bundled {
-                    report.bundled.push(month.clone());
-                }
-                if files > 0 {
-                    report.pruned.push((month.clone(), files, bytes));
-                }
+        match &moved {
+            Err(reason) => {
+                report.skipped.push((
+                    month,
+                    format!("minio move state unreadable ({reason}) - bundling paused"),
+                ));
             }
-            Err(reason) => report.skipped.push((month, reason)),
+            Ok(moved) if moved.contains(&month) => {
+                report.skipped.push((
+                    month,
+                    "archive already moved to minio - raw files kept (rebundling is v2 scope)"
+                        .to_string(),
+                ));
+            }
+            Ok(_) => match pass_month(store, &month, today) {
+                Ok((bundled, files, bytes)) => {
+                    if bundled {
+                        report.bundled.push(month.clone());
+                    }
+                    if files > 0 {
+                        report.pruned.push((month.clone(), files, bytes));
+                    }
+                }
+                Err(reason) => report.skipped.push((month, reason)),
+            },
         }
     }
     report
+}
+
+/// The months already moved to the permanent tier (issue #39), or the
+/// reason the move state could not be read. When minio is disabled there
+/// is no guard: an empty set.
+fn moved_month_guard(
+    store: &RetentionStore,
+    cfg: &RetentionConfig,
+) -> Result<BTreeSet<String>, String> {
+    if !cfg.minio.enabled {
+        return Ok(BTreeSet::new());
+    }
+    minio::moved_months_guard(&store.bundles_dir)
 }
 
 /// Bundle-and-prune one month. Idempotent: every step is re-derived from
@@ -740,13 +794,21 @@ pub fn plan_months(
     today: NaiveDate,
 ) -> Vec<MonthPlan> {
     let by_month = walk_all(store);
+    let moved = moved_month_guard(store, cfg).unwrap_or_default();
     let mut plans = Vec::new();
     for (month, raws) in by_month {
         if raws.is_empty() || !is_cold(&month, today, cfg.hot_days) {
             continue;
         }
         let bytes = raws.iter().map(|file| file.bytes).sum();
-        let action = if store.bundle_path(&month).exists() {
+        let action = if moved.contains(&month) {
+            format!(
+                "would keep {} raw {} ({}) - archive already moved to minio, rebundling is v2 scope",
+                raws.len(),
+                files_word(raws.len()),
+                human_bytes(bytes)
+            )
+        } else if store.bundle_path(&month).exists() {
             match verify_bundle(store, &month)
                 .and_then(|manifest| raws_match_manifest(&manifest, &raws))
             {
@@ -835,6 +897,12 @@ pub struct RetentionStats {
     pub months_pending: Vec<PendingMonth>,
     /// Human description of what the next daily tick would do.
     pub next_action: String,
+    /// Every bundle with its tier (`hot` hub-local / `minio` permanent
+    /// tier), oldest first (issue #39).
+    pub bundles: Vec<minio::BundleInfo>,
+    /// MinIO permanent tier block: moved months, last move result (issue
+    /// #39).
+    pub minio: minio::MinioStats,
 }
 
 /// One pending month in [`RetentionStats`].
@@ -890,8 +958,9 @@ pub fn collect_stats(
         });
     }
 
+    let moved = moved_month_guard(store, cfg).unwrap_or_default();
     let next_action = match months_pending.first() {
-        Some(first) => {
+        Some(first) if !moved.contains(&first.month) => {
             if store.bundle_path(&first.month).exists() {
                 format!(
                     "delete {} raw {} of {} ({}) - bundle already archived",
@@ -901,8 +970,13 @@ pub fn collect_stats(
                     human_bytes(first.bytes)
                 )
             } else {
+                let move_step = if cfg.minio.enabled {
+                    " then move the bundle to minio"
+                } else {
+                    ""
+                };
                 format!(
-                    "bundle {} into bundles/{}.tar.zst ({} {}, {}) then delete raws",
+                    "bundle {} into bundles/{}.tar.zst ({} {}, {}) then delete raws{move_step}",
                     first.month,
                     first.month,
                     first.files,
@@ -911,8 +985,14 @@ pub fn collect_stats(
                 )
             }
         }
+        Some(first) => format!(
+            "late raws of {} stay on the hub - the archive lives in minio",
+            first.month
+        ),
         None => "none".to_string(),
     };
+
+    let (bundles, minio) = minio::bundle_tiers(store, cfg);
 
     RetentionStats {
         enabled: cfg.enabled,
@@ -922,6 +1002,8 @@ pub fn collect_stats(
         bundle_bytes,
         months_pending,
         next_action,
+        bundles,
+        minio,
     }
 }
 
@@ -936,7 +1018,7 @@ fn files_word(count: usize) -> &'static str {
 
 /// Human binary size: "0 B", "512 B", "1.5 MB", "3.2 GB" (mirrors the
 /// client's status formatter; strings here are log/plan/UI text).
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
     let mut value = bytes as f64;
     let mut unit = 0;
