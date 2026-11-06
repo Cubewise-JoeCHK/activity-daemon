@@ -108,6 +108,11 @@ async fn retention_endpoint_reports_disabled_default_state() {
     assert_eq!(payload["hot_days"], 365);
     assert!(payload["hot_bytes"]["frames"].as_u64().expect("frames") > 0);
     assert_eq!(payload["bundle_count"], 0);
+    // Issue #39: per-bundle tiers and the minio block are always present;
+    // with the stage disabled nothing is moved.
+    assert_eq!(payload["bundles"], serde_json::json!([]));
+    assert_eq!(payload["minio"]["enabled"], false);
+    assert_eq!(payload["minio"]["moved_months"], serde_json::json!([]));
     // Months are still reported as pending even while disabled: the stats
     // describe the store, the flag describes the sweeper. The current month
     // is never pending.
