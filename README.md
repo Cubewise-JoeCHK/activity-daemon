@@ -6,7 +6,8 @@ frames, meeting audio) into a local-first SQLite store on Windows, then batch
 forward everything to a central hub on the owner's WSL box over Tailscale -
 no byte ever leaves the owner's tailnet and no third-party service is
 involved. Raw data is collected first; classification, summaries, export and
-AI analysis are later refinements on the central store (see
+AI analysis are later refinements - orchestrated on the central hub, with
+model inference on the owner's Windows GPU box via Lemonade (see
 docs/data-pipeline.md). Design contracts live in the ADR (issue #16) and the
 owner need profile (docs/needs.md) - every feature must trace to a stated
 need.
@@ -109,8 +110,10 @@ tailnet, and the container image stays self-contained.
 - **Calendar view** (`#calendar`): Teams-style work-week grid of window
   sessions + AFK spans (07:00-21:00, now-line, mini month with activity
   dots). Shading classifies apps presentation-only (code/terminals dark,
-  meetings, browsers, comms); the authoritative classifier is the planned
-  v0.2 config-driven rules engine, which will replace the heuristics.
+  meetings, browsers, comms); the shading retires once the timesheet AI
+  layer lands - the calendar will then show processed data: approved
+  activities (category colour, project label), unclassified active time
+  grey, AFK unchanged.
 - **JSON APIs** (read-only, same open precedent as `GET /health`; writes
   stay token-guarded):
   - `GET /api/machines` - per-device summary + the 30 newest events each.
@@ -359,6 +362,6 @@ and never fails the command you actually ran.
 
 - docs/needs.md - owner need profile, source of truth for design decisions
 - docs/process.md - dev loop, release flow, post-milestone retro
-- docs/data-pipeline.md - v0.2 processing plan (classifier, summaries, export, STT, MCP)
+- docs/data-pipeline.md - v0.2 processing plan (timesheet AI stage chain, export, STT, MCP)
 - docs/lessons.md - dev gotchas log
 - AGENTS.md - rules for AI collaborators
