@@ -200,11 +200,22 @@ async fn compile_merge_roundtrip_get_and_post() {
     let res = app.clone().oneshot(post(DAY_URI)).await.expect("oneshot");
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
-    assert_eq!(v["status"]["count"], 1, "superseded drafts stay hidden");
+    assert_eq!(v["status"]["count"], 1, "status.count covers current rows");
     assert_eq!(v["superseded"], 1);
+    // The payload exposes the replaced row as `superseded` (issue #60)
+    // alongside the fresh current one. (Batch stamps are
+    // millisecond-resolution and can collide on quick regenerations -
+    // the row id is the collision-free proof of a new draft.)
+    let all = v["drafts"].as_array().expect("drafts");
+    assert_eq!(all.len(), 2, "current + superseded listed");
+    assert!(all.iter().any(|d| d["state"] == "superseded"));
+    let current = all
+        .iter()
+        .find(|d| d["state"] != "superseded")
+        .expect("current draft");
     assert_ne!(
-        v["drafts"][0]["batch"].as_str().expect("new batch"),
-        drafts[0]["batch"].as_str().expect("old batch")
+        current["id"].as_i64().expect("new draft id"),
+        drafts[0]["id"].as_i64().expect("old draft id")
     );
 }
 

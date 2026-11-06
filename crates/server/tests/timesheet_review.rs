@@ -372,8 +372,17 @@ async fn edit_rejects_empty_fields_unknown_ids_superseded_and_approved() {
     assert_eq!(res.status(), StatusCode::CONFLICT);
 
     // approved: the current draft cannot be edited after approval
+    // (the payload lists superseded rows first - issue #60 state field -
+    // so pick the current one explicitly)
     let current = body_json(run(&app, get("/api/timesheet/draft?date=2026-11-06")).await).await;
-    let current_id = current["drafts"][0]["id"].as_i64().expect("current id");
+    let current_id = current["drafts"]
+        .as_array()
+        .expect("drafts")
+        .iter()
+        .find(|d| d["state"] != "superseded")
+        .expect("current draft")["id"]
+        .as_i64()
+        .expect("current id");
     let res = run(
         &app,
         post_json(
