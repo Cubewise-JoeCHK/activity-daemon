@@ -19,6 +19,11 @@ need; the owner queries when filling a timesheet or reflecting.
 - 24/7, always running, local-first: the device writes to its own SQLite
   before anything else; collection never depends on the network or the hub
   being up.
+- Collection is self-healing: one command takes a machine from bare install
+  to fully supervised capture - autostart, a watchdog that notices a dead
+  or wedged daemon and restarts it, no accidental sleep - without the owner
+  hand-wiring schedulers or babysitting services. A silent daemon must
+  never cost a day of data again (issue #36).
 - Every byte flows to the WSL central hub over Tailscale. Nothing ever
   leaves the owner's tailnet. No third-party services, ever.
 - The WSL box is the central data hub: the central store, all AI activity

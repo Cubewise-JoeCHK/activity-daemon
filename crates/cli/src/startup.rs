@@ -671,8 +671,9 @@ fn startup_artifact_present(file: &str) -> bool {
 }
 
 /// Run `schtasks` with the given arguments and print its output.
+/// `pub(crate)`: the #36 watchdog fallback task reuses the same runner.
 #[cfg(windows)]
-fn schtasks(args: &[&str]) -> Result<String> {
+pub(crate) fn schtasks(args: &[&str]) -> Result<String> {
     let output = std::process::Command::new("schtasks")
         .args(args)
         .output()
@@ -694,7 +695,7 @@ fn schtasks(args: &[&str]) -> Result<String> {
 }
 
 #[cfg(not(windows))]
-fn schtasks(args: &[&str]) -> Result<String> {
+pub(crate) fn schtasks(args: &[&str]) -> Result<String> {
     anyhow::bail!(
         "schtasks is only available on Windows (use --dry-run to preview the task XML): {}",
         args.join(" ")

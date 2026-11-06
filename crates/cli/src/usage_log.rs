@@ -33,6 +33,8 @@ pub const BUCKET_USAGE: &str = "usage";
 pub const FEATURE_DAEMON: &str = "daemon";
 pub const FEATURE_STATUS: &str = "status";
 pub const FEATURE_MEETING_RECORDING: &str = "meeting-recording";
+/// Issue #36 one-command install (supervisor setup).
+pub const FEATURE_INSTALL: &str = "install";
 pub const FEATURE_STARTUP: &str = "startup";
 pub const FEATURE_UPDATE: &str = "update";
 /// Issue #30 tray menu events (Windows-only; see the actions below).
@@ -333,6 +335,7 @@ mod tests {
         assert_eq!(FEATURE_DAEMON, "daemon");
         assert_eq!(FEATURE_STATUS, "status");
         assert_eq!(FEATURE_MEETING_RECORDING, "meeting-recording");
+        assert_eq!(FEATURE_INSTALL, "install");
         assert_eq!(FEATURE_STARTUP, "startup");
         assert_eq!(FEATURE_UPDATE, "update");
         assert_eq!(FEATURE_TRAY, "tray");

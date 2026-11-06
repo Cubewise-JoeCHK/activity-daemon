@@ -32,12 +32,18 @@ serde_json = "1"
 # Graphics_Gdi (message-only window, popup menu, ShowWindow, embedded icon).
 # Issue #35 adds: Registry (SystemUsesLightTheme picks the tray's dark- or
 # light-bg icon set).
+# Issue #36 adds: Services (the watchdog service protocol),
+# RemoteDesktop (WTS session id + user token, user env block for the
+# session-aware daemon restart).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
     "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

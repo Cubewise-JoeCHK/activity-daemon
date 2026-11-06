@@ -63,8 +63,9 @@ impl DaemonLock {
         }
     }
 
-    /// The pid recorded in the lock file, if it parses (tests).
-    #[cfg(test)]
+    /// The pid recorded in the lock file, if it parses. Read-only peek for
+    /// the watchdog supervision decision (issue #36): "is the holder alive
+    /// and does it match the last heartbeat beater?" - never acquires.
     pub fn holder_pid(data_dir: &Path) -> Option<u32> {
         let content = std::fs::read_to_string(DaemonLock::lock_path(data_dir)).ok()?;
         parse_pid(&content)

@@ -95,6 +95,62 @@ pub fn resolve(config_override: Option<&Path>) -> Result<Resolved> {
     })
 }
 
+/// Outcome of a config line patch (issue #36 `install` flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchOutcome {
+    /// The line was replaced (a `config.toml.bak-install` backup was
+    /// written before the first change).
+    Changed,
+    /// The file already carried exactly the new line - untouched.
+    Already,
+    /// No `key = ...` line exists (deleted from a partial config) - the
+    /// caller reports it instead of guessing where to append.
+    LineMissing,
+}
+
+/// Replace the `key = ...` line in the config file with `new_line`
+/// (issue #36 `install --device/--server-url/--disable-auto-update`).
+///
+/// Line-targeted and idempotent: the key is matched as the text before the
+/// first `=` (trimmed), so section placement and comments are preserved
+/// verbatim. A `.bak-install` backup is written once, before the first
+/// change. Only the exact-new-line case counts as [`PatchOutcome::Already`].
+pub fn patch_config_line(path: &Path, key: &str, new_line: &str) -> Result<PatchOutcome> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read config file {}", path.display()))?;
+    let mut replaced = false;
+    let mut already = false;
+    let mut out: Vec<&str> = Vec::new();
+    for line in content.lines() {
+        let key_of_line = line.split('=').next().map(|k| k.trim());
+        if key_of_line == Some(key) {
+            if line.trim() == new_line {
+                already = true;
+            }
+            replaced = true;
+            out.push(new_line);
+        } else {
+            out.push(line);
+        }
+    }
+    if !replaced {
+        return Ok(PatchOutcome::LineMissing);
+    }
+    if already {
+        return Ok(PatchOutcome::Already);
+    }
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".bak-install");
+    let backup = PathBuf::from(backup);
+    if !backup.exists() {
+        std::fs::copy(path, &backup)
+            .with_context(|| format!("cannot write backup {}", backup.display()))?;
+    }
+    std::fs::write(path, format!("{}\n", out.join("\n")))
+        .with_context(|| format!("cannot write config file {}", path.display()))?;
+    Ok(PatchOutcome::Changed)
+}
+
 /// The commented config template with every field at its default; `data_dir`
 /// is the one active line because the CLI picks it per machine.
 ///
@@ -299,6 +355,60 @@ mod tests {
         // Broken config is a hard error, not silent defaults.
         std::fs::write(&other, "[screen\nbroken = ").expect("write broken");
         assert!(resolve(Some(&other)).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Config line patches (issue #36): targeted line replace, idempotent,
+    /// `.bak-install` backup before the first change, `LineMissing` when a
+    /// partial config deleted the key, other lines untouched.
+    #[test]
+    fn patch_config_line_replaces_targets_and_backs_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "activity-cli-patch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "data_dir = 'D:\\ad\\data'\n\
+             [sync]\n\
+             server_url = \"http://hub:8080\"\n\
+             device_name = \"windows-client\"\n\
+             auto_update = true\n",
+        )
+        .expect("write config");
+
+        // Replace a key inside a section; the rest stays verbatim.
+        assert_eq!(
+            patch_config_line(&path, "device_name", "device_name = \"cubejoe\"").expect("patch"),
+            PatchOutcome::Changed
+        );
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(".bak-install");
+        assert!(PathBuf::from(backup).exists(), "backup written");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("device_name = \"cubejoe\""), "{text}");
+        assert!(text.contains("server_url = \"http://hub:8080\""), "{text}");
+        assert!(text.contains("auto_update = true"), "{text}");
+        assert!(text.contains("data_dir = 'D:\\ad\\data'"), "{text}");
+
+        // Replacing with the same line is Already (and no new backup churn).
+        assert_eq!(
+            patch_config_line(&path, "device_name", "device_name = \"cubejoe\"").expect("patch2"),
+            PatchOutcome::Already
+        );
+        // A deleted key is reported, never guessed.
+        std::fs::write(&path, "data_dir = 'x'\n[sync]\n").expect("write minimal");
+        assert_eq!(
+            patch_config_line(&path, "auto_update", "auto_update = false").expect("patch3"),
+            PatchOutcome::LineMissing
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

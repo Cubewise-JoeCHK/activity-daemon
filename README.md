@@ -20,7 +20,7 @@ need.
 | `watcher-screen` (crates/watcher-screen) | lib | per-monitor JPEG frame capture (content deduped) + rolling retention planner (#5) |
 | `watcher-audio` (crates/watcher-audio) | lib | meeting audio contract skeleton (#6) |
 | `server` (crates/server) | bin | WSL central ingestion endpoint + read-only web UI (axum), deploy via Containerfile |
-| `activity-cli` (crates/cli) | bin | `activity-daemon` CLI: run / status / startup / record / update / usage |
+| `activity-cli` (crates/cli) | bin | `activity-daemon` CLI: run / status / startup / install / ensure-run / record / update / usage |
 | `activity-update` (crates/update) | lib | shared release check + sha256 verification for both updaters (#17, #32) |
 | `activity-server-update` (crates/server-update) | bin | `activity-server-update`: hub auto-updater on the WSL host (check / apply / watch / install / status / rollback, #32) |
 
@@ -228,6 +228,51 @@ folder) and reports the effective mechanism. `startup uninstall` removes
 the task and both fallback files (including a legacy
 `activity-daemon.cmd` from older installs).
 
+## One-command install (watchdog supervisor, issue #36)
+
+`activity-daemon install` takes a machine from bare install to fully
+supervised capture. This exists because a real machine silently lost a
+full afternoon on 2026-11-06: the daemon died during an auto-update
+relaunch and nothing noticed. The layers, in order:
+
+1. **Config** - `resolve` writes the template on first use; `--device
+   <name>`, `--server-url <url>` and `--disable-auto-update` patch single
+   lines with a `config.toml.bak-install` backup. The config is otherwise
+   never touched (the auto-update choice stays with the owner; the flags
+   exist because the update swap is the prime suspect for the incident).
+2. **Autostart** - the `startup install` fallback chain above, unchanged.
+3. **Power** - `powercfg /change standby-timeout-ac 0` (AC never sleeps; a
+   sleeping machine is the one failure a supervisor cannot heal).
+   `--keep-power-plan` skips it.
+4. **Supervisor** (the watchdog), best host first:
+   - **Windows service `ActivityDaemonWatchdog`** (LocalSystem, needs admin
+     once - the non-elevated install hands off via UAC): every 15 s it
+     reads the heartbeat. Fresh = leave. Stale with a dead or absent lock
+     holder = start. Stale with a live holder whose pid matches the last
+     beater = kill and start (wedged run loop). The restart crosses into
+     the active console session (`WTSQueryUserToken` +
+     `CreateEnvironmentBlock` + `CreateProcessAsUserW`) - the daemon always
+     runs in the user session (session 0 cannot capture anything); the
+     service only checks and decides. SCM failure recovery
+     (`sc failure actions= restart/5000`) restarts the watchdog itself,
+     and the binPath carries `service --data-dir <dir>` because LocalSystem
+     resolves a different `%APPDATA%`. A failed auto-update relaunch is
+     healed by this layer within ~30 s.
+   - **Fallback task `ActivityDaemonKeepAlive`**: logon trigger + a PT1M
+     repetition running `ensure-run` - the same decision as a one shot, in
+     the user session, no admin. Installed automatically when service
+     creation is denied (no admin / corporate GPO), degrading full ->
+     minimal XML exactly like the autostart chain.
+
+`install status` reports every layer (heartbeat + lock holder, the service
+state, the fallback task, the effective autostart mechanism, the patched
+config). `install uninstall` removes the service, the task and the
+autostart entries; the power change is left in place with the undo command
+printed. `install --dry-run` previews the sc commands and both task XMLs
+without touching anything. `ensure-run` itself never logs usage
+(automatic); `install` / `install uninstall` log one `{install,
+install|uninstall}` row each.
+
 ## Tray icon and windowless run (issue #30)
 
 The daemon must never show a console window. On Windows, `run` hides its
@@ -280,6 +325,8 @@ today / 7d / 30d / all-time from the local store (`--json` for machines);
 | `meeting-recording` | `manual-stop` | `record stop` |
 | `startup` | `install` | `startup install` (non-dry-run) |
 | `startup` | `uninstall` | `startup uninstall` (non-dry-run; the `startup status` query does NOT log) |
+| `install` | `install` | `install` (non-dry-run apply; also logged by the elevated retry) |
+| `install` | `uninstall` | `install uninstall` (non-dry-run; `install status` does NOT log) |
 | `update` | `apply` | manual `update` only - the automatic scheduled check NEVER logs |
 | `update` | `check` | manual `update check` only - never the scheduled check |
 | `tray` | `open-dashboard` | the tray menu's `Open dashboard` / tray left-click (opens the hub web UI) |
