@@ -30,6 +30,9 @@ object_store = { version = "0.14", features = ["aws"] }
 # Same TOML crate (major) as core's config parser; the server config file
 # carries the `[retention]` and `[timesheet]` sections.
 toml = "1"
+# Issue #53: the style PUT edits `[timesheet.style]` in place while keeping
+# every other section, key order and comment of the owner's config file.
+toml_edit = "0.25"
 zstd = "0.13"
 
 [dev-dependencies]

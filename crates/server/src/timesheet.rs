@@ -34,6 +34,22 @@
 //!   `superseded_by`); optionally one Lemonade call titles/comments the
 //!   blocks (`use_llm_titles`, fail-soft to heuristics).
 //!
+//! Owner writing style (issue #53):
+//! - `GET /api/timesheet/style` - the owner's `[timesheet.style]` section
+//!   as `{style_prompt, style_examples}`. The prompt is returned as
+//!   configured; empty means the built-in default
+//!   (`refiner_timesheet::DEFAULT_STYLE_PROMPT`, resolved by
+//!   `StyleConfig::effective_prompt`, tested in refiner-timesheet).
+//! - `PUT /api/timesheet/style` - body `{style_prompt, style_examples}`;
+//!   validates the shape (total content cap 8 KiB, at most 10 example
+//!   pairs), writes `[timesheet.style]` into the server config file
+//!   (`toml_edit` in-place edit: other sections, key order and comments
+//!   are preserved; a one-time `config.toml.bak-style` backup is written
+//!   before the first style write), reloads the in-memory config from the
+//!   written file and returns it. The frame-analysis worker (#43) reads
+//!   its config copy at startup, so a style PUT reaches it on the next
+//!   hub restart.
+//!
 //! Token policy (issues #44/#45): the answer POST and the draft POST
 //! follow the same open precedent as the other `/api` reads (crate docs,
 //! `/health` precedent) - the hub is single-owner and never proxied
@@ -55,9 +71,9 @@ use axum::Router;
 use chrono::{Local, NaiveDate, TimeZone};
 use refiner_timesheet::{
     current_draft_from_row, export_month_bytes, parse_day, parse_month, plan_day, store_day,
-    BlockTitler, DayInput, HeuristicTitler, LemonadeTitler, StatusFilter, TimesheetConfig,
-    TsQuestion, TsQuestionStore, BUCKET_FRAME_ANALYSIS, BUCKET_TIMESHEET_APPROVED,
-    BUCKET_TIMESHEET_DRAFT,
+    BlockTitler, DayInput, HeuristicTitler, LemonadeTitler, StatusFilter, StyleConfig,
+    StyleExample, TimesheetConfig, TsQuestion, TsQuestionStore, BUCKET_FRAME_ANALYSIS,
+    BUCKET_TIMESHEET_APPROVED, BUCKET_TIMESHEET_DRAFT,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -82,6 +98,10 @@ pub fn timesheet_router() -> Router<AppState> {
         .route(
             "/api/timesheet/draft",
             get(api_get_draft).post(api_post_draft),
+        )
+        .route(
+            "/api/timesheet/style",
+            get(api_get_style).put(api_put_style),
         )
 }
 
@@ -171,9 +191,16 @@ async fn api_post_draft(
         Ok(day) => day,
         Err(e) => return bad_request(e),
     };
-    let titler = select_titler(&state.timesheet);
+    // One consistent config copy for titler selection and the compile run
+    // (a concurrent style PUT must not change settings mid-request).
+    let timesheet = match state.timesheet_snapshot() {
+        Ok(timesheet) => timesheet,
+        Err(e) => return internal_error(e),
+    };
+    let titler = select_titler(&timesheet);
     let outcome =
-        tokio::task::spawn_blocking(move || regenerate_payload(&state, day, &titler)).await;
+        tokio::task::spawn_blocking(move || regenerate_payload(&state, day, &titler, &timesheet))
+            .await;
     match outcome {
         Ok(Ok(payload)) => json_response(StatusCode::OK, payload),
         Ok(Err(e)) => internal_error(e),
@@ -235,6 +262,7 @@ fn regenerate_payload(
     state: &AppState,
     day: NaiveDate,
     titler: &dyn BlockTitler,
+    timesheet: &TimesheetConfig,
 ) -> Result<Value, CoreError> {
     let (from, to) = local_day_bounds(day)?;
     let day_str = day.format("%Y-%m-%d").to_string();
@@ -265,7 +293,7 @@ fn regenerate_payload(
             afk,
             old_drafts,
         };
-        let plan = plan_day(&input, &existing_questions, &state.timesheet, titler);
+        let plan = plan_day(&input, &existing_questions, timesheet, titler);
         store_day(&db, &questions, &plan)?
     };
     let mut payload = draft_payload(state, day)?;
@@ -489,7 +517,10 @@ async fn api_export_month(
         ));
     };
     let db = state.db.clone();
-    let vocab_path = state.timesheet.vocab_path.clone();
+    let vocab_path = match state.timesheet_snapshot() {
+        Ok(timesheet) => timesheet.vocab_path.clone(),
+        Err(e) => return internal_error(e),
+    };
     let month_label = query.month;
     // Blocking SQLite + xlsx assembly stays off the async runtime.
     let outcome =
@@ -534,6 +565,219 @@ fn export_payload(
         db.query_events(BUCKET_TIMESHEET_APPROVED, None, None)?
     };
     export_month_bytes(&events, year, month, vocab_path.as_deref())
+}
+
+// -------------------------------------------------- GET/PUT /api/timesheet/style
+
+/// Total content cap from issue #53: prompt bytes plus example text bytes.
+const STYLE_TOTAL_CAP_BYTES: usize = 8 * 1024;
+/// Few-shot pair cap from issue #53.
+const STYLE_MAX_EXAMPLES: usize = 10;
+
+async fn api_get_style(State(state): State<AppState>) -> Response {
+    match state.timesheet_snapshot() {
+        Ok(timesheet) => json_response(StatusCode::OK, style_payload(&timesheet.style)),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn api_put_style(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<StyleBody>,
+) -> Response {
+    let style = match validate_style(&body.style_prompt, &body.style_examples) {
+        Ok(style) => style,
+        Err(reason) => return bad_request(reason),
+    };
+    let Some(config_path) = state.config_path.clone() else {
+        return internal_error(
+            "no server config file known to this state; the style cannot be persisted",
+        );
+    };
+    let outcome =
+        tokio::task::spawn_blocking(move || persist_style_section(&config_path, &style)).await;
+    match outcome {
+        Ok(Ok(timesheet)) => {
+            // Reload: the written file is the source of truth now; swap the
+            // shared config so every clone of AppState sees the new style.
+            {
+                let mut guard = match state.timesheet.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return internal_error("timesheet config lock poisoned");
+                    }
+                };
+                *guard = timesheet.clone();
+            }
+            json_response(StatusCode::OK, style_payload(&timesheet.style))
+        }
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(format!("style persist task failed: {e}")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StyleBody {
+    style_prompt: String,
+    style_examples: Vec<StyleExample>,
+}
+
+/// The `{style_prompt, style_examples}` payload every style endpoint
+/// returns. The prompt is the configured text - empty means the built-in
+/// default, which the prompt builders resolve via
+/// `StyleConfig::effective_prompt`.
+fn style_payload(style: &StyleConfig) -> Value {
+    json!({
+        "style_prompt": style.style_prompt,
+        "style_examples": style.style_examples,
+    })
+}
+
+/// Validate and normalize a style PUT body (issue #53): trim the prompt and
+/// every example field, enforce the 10-pair cap and the 8 KiB total content
+/// cap (prompt + example text, bytes). Returns the normalized style that is
+/// persisted and echoed.
+fn validate_style(
+    style_prompt: &str,
+    style_examples: &[StyleExample],
+) -> Result<StyleConfig, String> {
+    if style_examples.len() > STYLE_MAX_EXAMPLES {
+        return Err(format!(
+            "at most {STYLE_MAX_EXAMPLES} style_examples are allowed, got {}",
+            style_examples.len()
+        ));
+    }
+    let style_prompt = style_prompt.trim();
+    let examples: Vec<StyleExample> = style_examples
+        .iter()
+        .map(|example| StyleExample {
+            task: example.task.trim().to_string(),
+            comment: example.comment.trim().to_string(),
+        })
+        .collect();
+    let total_bytes = style_prompt.len()
+        + examples
+            .iter()
+            .map(|example| example.task.len() + example.comment.len())
+            .sum::<usize>();
+    if total_bytes > STYLE_TOTAL_CAP_BYTES {
+        return Err(format!(
+            "style content is {total_bytes} bytes; the cap is {STYLE_TOTAL_CAP_BYTES} \
+             (style_prompt + example text)"
+        ));
+    }
+    Ok(StyleConfig {
+        style_prompt: style_prompt.to_string(),
+        style_examples: examples,
+    })
+}
+
+/// Suffix of the one-time backup written before the first style write
+/// (`config.toml.bak-style` next to the config file).
+const STYLE_BACKUP_SUFFIX: &str = "bak-style";
+
+/// Write `[timesheet.style]` into the server config file (issue #53):
+/// `toml_edit` replaces only that section, so every other section, key
+/// order and comment of the owner's file is preserved. A one-time backup
+/// (`<config>.bak-style`) is written before the first style write and is
+/// never overwritten afterwards. The file is replaced atomically
+/// (tmp + rename) so a crash cannot leave a torn config behind, and the
+/// returned config is re-parsed from the written file: what the caller
+/// stores is exactly what the disk now says.
+fn persist_style_section(
+    config_path: &Path,
+    style: &StyleConfig,
+) -> Result<TimesheetConfig, CoreError> {
+    let original = match std::fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(CoreError::Config(format!(
+                "cannot read {}: {e}",
+                config_path.display()
+            )))
+        }
+    };
+    let mut doc = original.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        CoreError::Config(format!(
+            "cannot parse {}: {e} (the style was NOT written; fix the file by hand \
+             or restore it from the .bak-style backup)",
+            config_path.display()
+        ))
+    })?;
+
+    let mut style_tbl = toml_edit::Table::new();
+    style_tbl.insert(
+        "style_prompt",
+        toml_edit::value(style.style_prompt.as_str()),
+    );
+    if style.style_examples.is_empty() {
+        style_tbl.insert("style_examples", toml_edit::value(toml_edit::Array::new()));
+    } else {
+        let mut examples = toml_edit::ArrayOfTables::new();
+        for example in &style.style_examples {
+            let mut table = toml_edit::Table::new();
+            table.insert("task", toml_edit::value(example.task.as_str()));
+            table.insert("comment", toml_edit::value(example.comment.as_str()));
+            examples.push(table);
+        }
+        style_tbl.insert("style_examples", toml_edit::Item::ArrayOfTables(examples));
+    }
+
+    if !doc.contains_key("timesheet") {
+        // Implicit: only `[timesheet.style]` should appear in a fresh file,
+        // matching the spelling the refiner config parser documents.
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(true);
+        doc.insert("timesheet", toml_edit::Item::Table(table));
+    }
+    let Some(timesheet) = doc
+        .get_mut("timesheet")
+        .and_then(|item| item.as_table_mut())
+    else {
+        return Err(CoreError::Config(format!(
+            "{}: [timesheet] is not a table; the style was NOT written",
+            config_path.display()
+        )));
+    };
+    timesheet["style"] = toml_edit::Item::Table(style_tbl);
+
+    // One-time backup before the first write; never overwritten afterwards.
+    let backup_path = config_path.with_file_name(format!(
+        "{}.{STYLE_BACKUP_SUFFIX}",
+        config_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ));
+    if !backup_path.exists() {
+        std::fs::write(&backup_path, &original).map_err(|e| {
+            CoreError::Config(format!(
+                "cannot write backup {}: {e}",
+                backup_path.display()
+            ))
+        })?;
+    }
+
+    let tmp_path = config_path.with_file_name(format!(
+        "{}.tmp",
+        config_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ));
+    std::fs::write(&tmp_path, doc.to_string())
+        .map_err(|e| CoreError::Config(format!("cannot write {}: {e}", tmp_path.display())))?;
+    std::fs::rename(&tmp_path, config_path).map_err(|e| {
+        CoreError::Config(format!(
+            "cannot replace {} with the written config: {e}",
+            config_path.display()
+        ))
+    })?;
+
+    // Reload from disk: the return value is exactly what the file says now.
+    TimesheetConfig::load_file(config_path)
+        .map_err(|e| CoreError::Config(format!("style write-back reload failed: {e}")))
 }
 
 #[cfg(test)]
@@ -931,5 +1175,274 @@ mod tests {
         assert_eq!(from.date_naive(), day);
         assert_eq!(to.date_naive().pred_opt(), Some(day));
         assert!(from < to);
+    }
+
+    // -------------------------------------------------- style endpoints
+
+    use refiner_timesheet::StyleExample;
+
+    /// App state with a config file seeded at `dir/config.toml` (or none
+    /// seeded when `config_text` is None) and the style PUT wired to it.
+    fn style_app(dir: &Path, config_text: Option<&str>) -> (AppState, PathBuf) {
+        let config_path = dir.join("config.toml");
+        if let Some(text) = config_text {
+            std::fs::write(&config_path, text).expect("seed config file");
+        }
+        let state = AppState::open_with_retention(
+            &dir.join("activity.db"),
+            dir.join("media"),
+            crate::AuthConfig::disabled(),
+            crate::retention::RetentionConfig::default(),
+            TimesheetConfig::default(),
+        )
+        .expect("state")
+        .with_config_path(config_path.clone());
+        (state, config_path)
+    }
+
+    async fn put_style(app: Router, body: &Value) -> axum::http::Response<Body> {
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/timesheet/style")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+    }
+
+    async fn get_style(app: Router) -> axum::http::Response<Body> {
+        app.oneshot(
+            axum::http::Request::builder()
+                .uri("/api/timesheet/style")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+    }
+
+    async fn response_json(response: axum::http::Response<Body>) -> Value {
+        let bytes = response_bytes(response).await;
+        serde_json::from_slice(&bytes).expect("response is JSON")
+    }
+
+    fn style_body(prompt: &str, examples: &[(&str, &str)]) -> Value {
+        json!({
+            "style_prompt": prompt,
+            "style_examples": examples
+                .iter()
+                .map(|(task, comment)| json!({ "task": task, "comment": comment }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn validate_style_caps_are_inclusive_and_normalizes() {
+        // Exactly at the cap passes, one byte over fails.
+        let at_cap = "x".repeat(STYLE_TOTAL_CAP_BYTES);
+        assert!(validate_style(&at_cap, &[]).is_ok());
+        let over_cap = "x".repeat(STYLE_TOTAL_CAP_BYTES + 1);
+        assert!(validate_style(&over_cap, &[]).is_err());
+        // Prompt and example text count toward the same cap.
+        let half_prompt = "x".repeat(STYLE_TOTAL_CAP_BYTES / 2 + 1);
+        let half_task = "y".repeat(STYLE_TOTAL_CAP_BYTES / 2 + 1);
+        let half_examples = [StyleExample {
+            task: half_task,
+            comment: String::new(),
+        }];
+        assert!(validate_style(&half_prompt, &half_examples).is_err());
+        // Ten pairs pass, eleven fail.
+        let ten: Vec<StyleExample> = (0..10)
+            .map(|n| StyleExample {
+                task: format!("task {n}"),
+                comment: String::new(),
+            })
+            .collect();
+        assert!(validate_style("ok", &ten).is_ok());
+        let eleven: Vec<StyleExample> = ten
+            .into_iter()
+            .chain(std::iter::once(StyleExample {
+                task: "one more".to_string(),
+                comment: String::new(),
+            }))
+            .collect();
+        assert!(validate_style("ok", &eleven).is_err());
+        // The persisted value is the trimmed/normalized one.
+        let untrimmed = [StyleExample {
+            task: "  task  ".to_string(),
+            comment: "  comment  ".to_string(),
+        }];
+        let style = validate_style("  spaced prompt  ", &untrimmed).expect("valid style");
+        assert_eq!(style.style_prompt, "spaced prompt");
+        assert_eq!(style.style_examples[0].task, "task");
+        assert_eq!(style.style_examples[0].comment, "comment");
+    }
+
+    #[tokio::test]
+    async fn style_put_get_round_trip_preserves_other_sections() {
+        let dir = ExportTempDir::new("style-rt");
+        let seed =
+            "# hub config\n\n[retention]\nenabled = false # keep raw media\nhot_days = 365\n\n\
+                    [timesheet]\nuse_llm_titles = false\nmax_block_min = 90\n\n\
+                    [timesheet.style]\nstyle_prompt = \"\"\n";
+        let (state, config_path) = style_app(&dir.0, Some(seed));
+        let state_for_assert = state.clone();
+        let app = crate::build_router(state);
+
+        let response = put_style(
+            app.clone(),
+            &style_body(
+                "German, telegraphic.",
+                &[
+                    ("Debugged TM1 rule", "Fixed 3 rules"),
+                    ("Prepared demo", ""),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stored = response_json(response).await;
+        assert_eq!(stored["style_prompt"], "German, telegraphic.");
+        assert_eq!(stored["style_examples"][0]["task"], "Debugged TM1 rule");
+        assert_eq!(stored["style_examples"][0]["comment"], "Fixed 3 rules");
+        assert_eq!(stored["style_examples"][1]["comment"], "");
+
+        // GET returns the persisted value.
+        let fetched = response_json(get_style(app).await).await;
+        assert_eq!(fetched, stored);
+
+        // The config file keeps every other section and comment.
+        let file = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(file.contains("# hub config"), "file:\n{file}");
+        assert!(file.contains("# keep raw media"), "file:\n{file}");
+        assert!(file.contains("hot_days = 365"), "file:\n{file}");
+        assert!(file.contains("use_llm_titles = false"), "file:\n{file}");
+        assert!(file.contains("max_block_min = 90"), "file:\n{file}");
+        // ...and the style round-trips through the refiner parse side.
+        let cfg = TimesheetConfig::from_toml_str(&file).expect("written config parses");
+        assert_eq!(cfg.style.style_prompt, "German, telegraphic.");
+        assert_eq!(cfg.style.style_examples.len(), 2);
+        assert_eq!(cfg.style.style_examples[0].comment, "Fixed 3 rules");
+
+        // The in-memory config was reloaded with the written value.
+        let snapshot = state_for_assert.timesheet_snapshot().expect("snapshot");
+        assert_eq!(snapshot.style, cfg.style);
+    }
+
+    #[tokio::test]
+    async fn style_put_rejects_oversize_and_too_many_examples() {
+        let dir = ExportTempDir::new("style-validate");
+        let (state, config_path) = style_app(&dir.0, Some("[timesheet]\n"));
+        let before = std::fs::read_to_string(&config_path).expect("read config");
+        let app = crate::build_router(state);
+
+        // 11 pairs exceed the 10-pair cap.
+        let many: Vec<Value> = (0..11)
+            .map(|n| json!({ "task": format!("task {n}"), "comment": "" }))
+            .collect();
+        let response = put_style(
+            app.clone(),
+            &json!({ "style_prompt": "ok", "style_examples": many }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Total content above 8 KiB is rejected.
+        let big_prompt = "x".repeat(STYLE_TOTAL_CAP_BYTES + 1);
+        let response = put_style(app.clone(), &style_body(&big_prompt, &[])).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Rejections leave the config file and the served style untouched.
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            before
+        );
+        let fetched = response_json(get_style(app).await).await;
+        assert_eq!(fetched["style_prompt"], "");
+        assert_eq!(fetched["style_examples"].as_array().expect("list").len(), 0);
+        // No backup file appeared either (nothing was ever written).
+        assert!(!config_path.with_file_name("config.toml.bak-style").exists());
+    }
+
+    #[tokio::test]
+    async fn style_write_survives_a_restart() {
+        let dir = ExportTempDir::new("style-restart");
+        let (state, config_path) = style_app(&dir.0, Some("# cfg\n[timesheet]\n"));
+        let app = crate::build_router(state);
+        let response = put_style(
+            app,
+            &style_body("Bullet style, no prose.", &[("Demo task", "Demo comment")]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A fresh process re-reads the config from disk (the main.rs
+        // startup path) and serves the persisted style.
+        let restarted = TimesheetConfig::load_file(&config_path).expect("config on disk");
+        let state = AppState::open_with_retention(
+            &dir.0.join("activity.db"),
+            dir.0.join("media"),
+            crate::AuthConfig::disabled(),
+            crate::retention::RetentionConfig::default(),
+            restarted,
+        )
+        .expect("state");
+        let app = crate::build_router(state);
+        let fetched = response_json(get_style(app).await).await;
+        assert_eq!(fetched["style_prompt"], "Bullet style, no prose.");
+        assert_eq!(fetched["style_examples"][0]["task"], "Demo task");
+        assert_eq!(fetched["style_examples"][0]["comment"], "Demo comment");
+    }
+
+    #[tokio::test]
+    async fn style_backup_is_written_once_and_never_overwritten() {
+        let dir = ExportTempDir::new("style-backup");
+        let seed = "# original\n[retention]\nenabled = false\n";
+        let (state, config_path) = style_app(&dir.0, Some(seed));
+        let backup = config_path.with_file_name("config.toml.bak-style");
+        assert!(!backup.exists());
+        let app = crate::build_router(state);
+
+        let response = put_style(app.clone(), &style_body("first", &[])).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), seed);
+
+        let response = put_style(app, &style_body("second", &[])).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Still the original content after the second write.
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), seed);
+    }
+
+    #[tokio::test]
+    async fn style_get_defaults_without_a_configured_section() {
+        let dir = ExportTempDir::new("style-default");
+        let (state, _config_path) = style_app(&dir.0, Some("[retention]\nenabled = false\n"));
+        let app = crate::build_router(state);
+        let fetched = response_json(get_style(app).await).await;
+        assert_eq!(fetched["style_prompt"], "");
+        assert_eq!(fetched["style_examples"].as_array().expect("list").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn style_put_creates_a_missing_config_file() {
+        let dir = ExportTempDir::new("style-create");
+        let (state, config_path) = style_app(&dir.0, None);
+        assert!(!config_path.exists());
+        let app = crate::build_router(state);
+
+        let response = put_style(app.clone(), &style_body("fresh file", &[])).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let file = std::fs::read_to_string(&config_path).expect("config created");
+        let cfg = TimesheetConfig::from_toml_str(&file).expect("created config parses");
+        assert_eq!(cfg.style.style_prompt, "fresh file");
+        // The backup records that the file did not exist before this write.
+        let backup = config_path.with_file_name("config.toml.bak-style");
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), "");
+        // And it round-trips.
+        let fetched = response_json(get_style(app).await).await;
+        assert_eq!(fetched["style_prompt"], "fresh file");
     }
 }

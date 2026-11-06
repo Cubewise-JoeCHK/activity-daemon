@@ -116,7 +116,10 @@ fn main() {
     .unwrap_or_else(|e| {
         eprintln!("failed to open central store at {}: {e}", db_path.display());
         std::process::exit(1);
-    });
+    })
+    // Issue #53: the style PUT needs the file path to persist
+    // `[timesheet.style]` back into the config the hub started from.
+    .with_config_path(config_path);
 
     // Timesheet frame-analysis worker (issue #43): same store, own tokio
     // task, stopped by the same shutdown signal as the HTTP server. A

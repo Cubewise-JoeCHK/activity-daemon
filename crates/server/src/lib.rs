@@ -49,6 +49,16 @@
 //!   into fresh drafts (old drafts marked `superseded_by`), optionally
 //!   consulting Lemonade once for titles/comments (`use_llm_titles`,
 //!   fail-soft to heuristics). Returns the same payload as GET.
+//! - `GET /api/timesheet/style` - the owner writing style for every
+//!   AI-generated timesheet text (issue #53): `{style_prompt,
+//!   style_examples}` from `[timesheet.style]`. An empty prompt means the
+//!   built-in default (`refiner_timesheet::DEFAULT_STYLE_PROMPT`, resolved
+//!   by `StyleConfig::effective_prompt`).
+//! - `PUT /api/timesheet/style` - body `{style_prompt, style_examples}`;
+//!   validates (total cap 8 KB, at most 10 example pairs), persists the
+//!   `[timesheet.style]` section into the server config file (one-time
+//!   `.bak-style` backup before the first write), reloads the in-memory
+//!   config and returns the stored value.
 //!
 //! All `/api/timesheet` endpoints follow the open `/api` precedent
 //! (issue #44): the hub is single-owner and tailnet-only, so owner-facing
@@ -142,7 +152,16 @@ pub struct AppState {
     /// `[timesheet]` config (issues #43/#45/#53): worker settings, LLM
     /// titling flag, merge cap, Lemonade connection, export vocabulary
     /// path, owner style. Parsed from the server config file at startup.
-    timesheet: TimesheetConfig,
+    /// Shared behind an Arc so `PUT /api/timesheet/style` can swap the
+    /// whole struct after a successful config write-back and every clone
+    /// of AppState (and handler) sees the new style.
+    timesheet: Arc<Mutex<TimesheetConfig>>,
+    /// Path of the server config file backing `timesheet` (issue #53):
+    /// main resolves it (`ACTIVITY_CONFIG` / the data volume) and passes
+    /// it here so the style PUT can write `[timesheet.style]` back. None
+    /// when the state was built without a config file (tests, embedding) -
+    /// the style PUT then cannot persist and says so.
+    config_path: Option<PathBuf>,
     media_dir: PathBuf,
     /// Retention paths (`media/` root + `bundles/` output) and settings;
     /// issue #38.
@@ -265,13 +284,33 @@ impl AppState {
             // Same file, dedicated `ts_questions` table (WAL keeps the two
             // connections out of each other's way).
             ts_questions: Arc::new(Mutex::new(TsQuestionStore::open(db_path)?)),
-            timesheet,
+            timesheet: Arc::new(Mutex::new(timesheet)),
+            config_path: None,
             media_dir: media_dir.clone(),
             retention_store: retention::RetentionStore::from_media_dir(&media_dir),
             retention,
             auth,
             started_at: Instant::now(),
         })
+    }
+
+    /// Attach the server config file path (issue #53): production main
+    /// passes the file it parsed at startup so the style PUT can write
+    /// `[timesheet.style]` back into it and reload. Returns the state for
+    /// chaining.
+    pub fn with_config_path(mut self, config_path: PathBuf) -> AppState {
+        self.config_path = Some(config_path);
+        self
+    }
+
+    /// Snapshot of the current `[timesheet]` config: cloned under the lock
+    /// so handlers always work on a consistent copy while a style PUT may
+    /// swap the shared struct mid-request.
+    pub(crate) fn timesheet_snapshot(&self) -> Result<TimesheetConfig, CoreError> {
+        self.timesheet
+            .lock()
+            .map(|cfg| cfg.clone())
+            .map_err(|_| CoreError::Config("timesheet config lock poisoned".to_string()))
     }
 }
 
