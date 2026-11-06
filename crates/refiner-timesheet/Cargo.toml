@@ -10,5 +10,10 @@ activity-core = { path = "../core" }
 # RFC3339 UTC stamps in the same convention as media index rows.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
+rust_xlsxwriter = "0.102.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1.2.1"
+
+[dev-dependencies]
+calamine = "0.38.0"

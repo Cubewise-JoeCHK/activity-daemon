@@ -35,9 +35,14 @@
 //!   frame of a question as JPEG bytes, resolved against the media root.
 //! - `POST /api/timesheet/questions/{id}/answer` - body
 //!   `{"answer": "..."}`; marks the question answered (last write wins).
-//!   Follows the open `/api` precedent (issue #44): the hub is
-//!   single-owner and tailnet-only, so owner-facing `/api` stays open
-//!   while device-facing `/ingest` writes keep their token guard.
+//! - `GET /api/timesheet/export?month=YYYY-MM` - the month's approved
+//!   activities as a Cubewise offline-template xlsx download (issue #46),
+//!   `Content-Disposition: attachment; filename=timesheet_<month>.xlsx`;
+//!   refused rows are reported on the workbook's Warnings sheet and as
+//!   `X-Export-Warnings`. Follows the open `/api` precedent (issue #44):
+//!   the hub is single-owner and tailnet-only, so owner-facing `/api`
+//!   stays open while device-facing `/ingest` writes keep their token
+//!   guard.
 //!
 //! Auth modes (issue #18; no passwords anywhere):
 //! 1. **tailscale-whois** - when the tailscaled socket
@@ -111,6 +116,9 @@ pub struct AppState {
     /// handle; the wiring point for that worker lives in this crate, which
     /// can see the field.
     ts_questions: Arc<Mutex<TsQuestionStore>>,
+    /// Month-end export vocabulary override (`[timesheet] vocab_path`,
+    /// issue #46); `None` = the embedded Cubewise template vocabulary.
+    timesheet_vocab_path: Option<PathBuf>,
     media_dir: PathBuf,
     /// Retention paths (`media/` root + `bundles/` output) and settings;
     /// issue #38.
@@ -209,12 +217,21 @@ impl AppState {
             // Same file, dedicated `ts_questions` table (WAL keeps the two
             // connections out of each other's way).
             ts_questions: Arc::new(Mutex::new(TsQuestionStore::open(db_path)?)),
+            timesheet_vocab_path: None,
             media_dir: media_dir.clone(),
             retention_store: retention::RetentionStore::from_media_dir(&media_dir),
             retention,
             auth,
             started_at: Instant::now(),
         })
+    }
+
+    /// Attach the month-end export vocabulary override path (issue #46;
+    /// production passes the parsed `[timesheet]` config section). `None`
+    /// keeps the embedded Cubewise template vocabulary.
+    pub fn with_timesheet_vocab_path(mut self, vocab_path: Option<PathBuf>) -> AppState {
+        self.timesheet_vocab_path = vocab_path;
+        self
     }
 }
 

@@ -8,7 +8,7 @@
 //! | `ACTIVITY_DB`     | `./data/activity.db`    | central SQLite store          |
 //! | `ACTIVITY_DATA`   | `./data`                | media root (`$DATA/media`)    |
 //! | `ACTIVITY_TOKEN`  | unset                   | require `X-Activity-Token`    |
-//! | `ACTIVITY_CONFIG` | `$ACTIVITY_DATA/config.toml` | server config (`[retention]`) |
+//! | `ACTIVITY_CONFIG` | `$ACTIVITY_DATA/config.toml` | server config (`[retention]`, `[timesheet]`) |
 //!
 //! Flags: `--version` (print and exit), `--dry-run` (print the retention
 //! action plan for the store and exit - nothing is written or deleted,
@@ -100,6 +100,7 @@ fn main() {
         auth,
         server_config.retention.clone(),
     )
+    .map(|state| state.with_timesheet_vocab_path(server_config.timesheet.vocab_path.clone()))
     .unwrap_or_else(|e| {
         eprintln!("failed to open central store at {}: {e}", db_path.display());
         std::process::exit(1);
