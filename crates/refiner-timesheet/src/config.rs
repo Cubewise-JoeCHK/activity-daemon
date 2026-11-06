@@ -18,8 +18,9 @@
 //!   connection keys, the sampling policy and the vocabulary path;
 //! - the daily itinerary compiler (issue #45): `use_llm_titles` (consult
 //!   Lemonade once per day to title/comment draft blocks, fail-soft to
-//!   heuristic titles) and `max_block_min` (adjacent same-project sessions
-//!   merge up to this cap);
+//!   heuristic titles), `max_block_min` (adjacent same-project sessions
+//!   merge up to this cap) and `classify_window_s` (issue #63: how far the
+//!   nearest frame analysis may sit from a session and still classify it);
 //! - the month-end export (issue #46): `vocab_path` overrides the embedded
 //!   Cubewise template vocabulary;
 //! - `[timesheet.style]` (issue #53): the owner decides HOW generated
@@ -90,6 +91,14 @@ pub struct TimesheetConfig {
     /// Adjacent sessions with the same project + category merge up to this
     /// many minutes (issue #45: "configurable max block", default 2 h).
     pub max_block_min: u64,
+    /// How far in seconds the nearest frame analysis may sit from a
+    /// session's span and still classify it (issue #63, default 600 s):
+    /// one keyframe classifies the surrounding minutes instead of only the
+    /// single short session containing its instant, so flip-flopping
+    /// adjacent classifications stop fragmenting the day into sub-minute
+    /// drafts. Sessions with no analysis inside this window stay
+    /// unclassified (grey question hand-off).
+    pub classify_window_s: u64,
     /// Owner writing style (issue #53).
     pub style: StyleConfig,
 }
@@ -155,6 +164,7 @@ impl Default for TimesheetConfig {
             vocab_path: None,
             use_llm_titles: true,
             max_block_min: 120,
+            classify_window_s: 600,
             style: StyleConfig::default(),
         }
     }
@@ -205,6 +215,8 @@ mod tests {
         // issue #45
         assert!(cfg.use_llm_titles);
         assert_eq!(cfg.max_block_min, 120);
+        // issue #63
+        assert_eq!(cfg.classify_window_s, 600);
         assert_eq!(cfg.style, StyleConfig::default());
     }
 
@@ -285,6 +297,21 @@ mod tests {
         // worker keys keep their defaults
         assert!(cfg.enabled);
         assert_eq!(cfg.lemonade_model, DEFAULT_LEMONADE_MODEL);
+    }
+
+    #[test]
+    fn classify_window_s_parses_and_keeps_neighbours_at_defaults() {
+        // Issue #63's classification window sits next to the compiler keys
+        // and parses like them; untouched keys keep their defaults.
+        let cfg = TimesheetConfig::from_toml_str(
+            "[timesheet]\nclassify_window_s = 45\nmax_block_min = 90\n",
+        )
+        .expect("parse classify_window_s");
+        assert_eq!(cfg.classify_window_s, 45);
+        assert_eq!(cfg.max_block_min, 90);
+        let untouched = TimesheetConfig::from_toml_str("[timesheet]\nmax_block_min = 90\n")
+            .expect("parse without classify_window_s");
+        assert_eq!(untouched.classify_window_s, 600);
     }
 
     #[test]
