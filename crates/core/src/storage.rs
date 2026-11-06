@@ -12,6 +12,11 @@
 //! Indexes (created idempotently by [`Db::open_db`]): `(bucket, ts_start)`,
 //! `(device, ts_start)` and `(synced)`.
 //!
+//! Hub-side refiners (e.g. refiner-timesheet, issue #43) additionally get a
+//! tiny `refiner_cursors` table (`name TEXT PRIMARY KEY, last_id INTEGER`)
+//! for durable read cursors: each refiner remembers the last event id it
+//! processed so a hub restart resumes instead of re-processing history.
+//!
 //! Media convention (ADR): media files live on disk under
 //! `media/<kind>/<YYYY>/<MM>/<DD>/` and are indexed as ordinary events in the
 //! `media` bucket via [`Db::insert_media_index`]. A media index row is just an
@@ -23,11 +28,13 @@ use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use rusqlite::{params, params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 
-/// Well-known buckets (ADR v0.1). Buckets are open-ended; plugins may invent
-/// their own names without any core change.
+/// Well-known buckets (ADR v0.1 + ADR addendum on #16). Buckets are
+/// open-ended; plugins may invent their own names without any core change.
 pub const BUCKET_WINDOW: &str = "window-watcher";
 pub const BUCKET_AFK: &str = "afk-watcher";
 pub const BUCKET_MEDIA: &str = "media";
+/// AI frame analyses (ADR addendum on #16, written by refiner-timesheet).
+pub const BUCKET_FRAME_ANALYSIS: &str = "frame-analysis";
 
 #[derive(Debug)]
 pub enum CoreError {
@@ -231,7 +238,11 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_events_bucket_ts ON events (bucket, ts_start);
             CREATE INDEX IF NOT EXISTS idx_events_device_ts ON events (device, ts_start);
-            CREATE INDEX IF NOT EXISTS idx_events_synced ON events (synced);",
+            CREATE INDEX IF NOT EXISTS idx_events_synced ON events (synced);
+            CREATE TABLE IF NOT EXISTS refiner_cursors (
+                name TEXT PRIMARY KEY,
+                last_id INTEGER NOT NULL
+            );",
         )?;
         Ok(Db { conn })
     }
@@ -480,6 +491,57 @@ impl Db {
             rows.push(row?);
         }
         Ok(rows)
+    }
+
+    /// Fetch up to `limit` rows in `bucket` with `id > after_id`, ordered by
+    /// id (arrival order). This is the read path for hub-side refiners that
+    /// consume new arrivals and remember their position: pass the last
+    /// processed id (see [`Db::set_refiner_cursor`]) to get only newer rows.
+    /// `after_id = 0` returns everything from the first row (SQLite ids
+    /// start at 1).
+    pub fn fetch_bucket_events_after(
+        &self,
+        bucket: &str,
+        after_id: i64,
+        limit: u32,
+    ) -> Result<Vec<EventRow>> {
+        validate_bucket(bucket)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, bucket, ts_start, duration_s, data, device, synced
+             FROM events WHERE bucket = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+        )?;
+        let mut rows = Vec::new();
+        for row in stmt.query_map(params![bucket, after_id, limit], map_row)? {
+            rows.push(row?);
+        }
+        Ok(rows)
+    }
+
+    /// Durable read cursor for a hub-side refiner: the last event id the
+    /// named refiner fully processed, if it ever recorded one. Names are
+    /// refiner-chosen (e.g. `timesheet-frame-analysis`); cursors are
+    /// advisory state, not events - deleting a row just makes the refiner
+    /// re-process its bucket from the start.
+    pub fn refiner_cursor(&self, name: &str) -> Result<Option<i64>> {
+        validate_bucket(name)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT last_id FROM refiner_cursors WHERE name = ?1")?;
+        let mut rows = stmt.query_map(params![name], |r| r.get::<_, i64>(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Record a refiner's read cursor (upsert). Call only after the work
+    /// for `last_id` is durably done, so a crash before the write makes the
+    /// refiner redo that row (at-least-once processing).
+    pub fn set_refiner_cursor(&self, name: &str, last_id: i64) -> Result<()> {
+        validate_bucket(name)?;
+        self.conn.execute(
+            "INSERT INTO refiner_cursors (name, last_id) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET last_id = excluded.last_id",
+            params![name, last_id],
+        )?;
+        Ok(())
     }
 
     /// Total number of events.
@@ -1145,6 +1207,85 @@ mod tests {
         assert!(db.fetch_unsynced_events(10).expect("fetch").is_empty());
         assert_eq!(db.unsynced_count().expect("unsynced"), 0);
         assert_eq!(db.event_count().expect("total"), 3);
+    }
+
+    #[test]
+    fn fetch_bucket_events_after_returns_bucket_rows_in_id_order() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // arrival ids 1..4, buckets interleaved
+        let first = insert_for(&db, BUCKET_MEDIA, "dev-a", "2026-11-04T09:00:00+08:00", 0.0);
+        insert_for(
+            &db,
+            BUCKET_WINDOW,
+            "dev-a",
+            "2026-11-04T09:00:05+08:00",
+            1.0,
+        );
+        let third = insert_for(&db, BUCKET_MEDIA, "dev-a", "2026-11-04T09:00:10+08:00", 0.0);
+        insert_for(&db, BUCKET_MEDIA, "dev-a", "2026-11-04T09:00:15+08:00", 0.0);
+        assert_eq!(first, 1);
+        assert_eq!(third, 3);
+
+        // after_id = 0 covers every row of the bucket, never other buckets
+        let rows = db
+            .fetch_bucket_events_after(BUCKET_MEDIA, 0, 10)
+            .expect("fetch all");
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 3, 4]);
+        // limit truncates, still earliest-first
+        let head = db
+            .fetch_bucket_events_after(BUCKET_MEDIA, 0, 2)
+            .expect("fetch head");
+        assert_eq!(head.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 3]);
+        // resuming after a processed id yields only newer rows
+        let rest = db
+            .fetch_bucket_events_after(BUCKET_MEDIA, 1, 10)
+            .expect("fetch rest");
+        assert_eq!(rest.iter().map(|r| r.id).collect::<Vec<_>>(), vec![3, 4]);
+        // nothing after the last id
+        assert!(db
+            .fetch_bucket_events_after(BUCKET_MEDIA, 4, 10)
+            .expect("fetch past end")
+            .is_empty());
+        // empty bucket name stays rejected
+        assert!(matches!(
+            db.fetch_bucket_events_after("", 0, 10),
+            Err(CoreError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn refiner_cursor_roundtrip_and_upsert() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        assert_eq!(
+            db.refiner_cursor("timesheet-frame-analysis")
+                .expect("unset cursor"),
+            None
+        );
+        db.set_refiner_cursor("timesheet-frame-analysis", 7)
+            .expect("set");
+        assert_eq!(
+            db.refiner_cursor("timesheet-frame-analysis")
+                .expect("read back"),
+            Some(7)
+        );
+        // upsert: the same name moves forward
+        db.set_refiner_cursor("timesheet-frame-analysis", 9)
+            .expect("upsert");
+        assert_eq!(
+            db.refiner_cursor("timesheet-frame-analysis")
+                .expect("read upserted"),
+            Some(9)
+        );
+        // cursors are independent per refiner
+        assert_eq!(
+            db.refiner_cursor("other-refiner").expect("other cursor"),
+            None
+        );
+        // empty refiner name rejected
+        assert!(matches!(
+            db.set_refiner_cursor("", 1),
+            Err(CoreError::Validation(_))
+        ));
     }
 
     #[test]

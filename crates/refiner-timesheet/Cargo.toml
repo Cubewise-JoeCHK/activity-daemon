@@ -1,14 +1,32 @@
 [package]
 name = "refiner-timesheet"
-description = "Hub-side Timesheet AI pipeline (question queue storage) for activity-daemon"
+description = "Hub-side Timesheet AI pipeline: frame analysis worker (Lemonade vision) and question queue for activity-daemon"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 activity-core = { path = "../core" }
-# Same time crate (and feature set) as core: created_at/answered_at are
-# RFC3339 UTC stamps in the same convention as media index rows.
+base64 = "0.22"
+# Same time crate (and feature set) as core: frame instants are parsed from
+# the stored RFC3339 timestamps and bucketed by their own wall-clock hour;
+# created_at/answered_at are RFC3339 UTC stamps in the same convention as
+# media index rows.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+log = "0.4"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1"
+# Same small blocking client as the client-side forwarder (rustls, builds on
+# Windows + the hub container Linux): the worker runs Lemonade calls inside
+# tokio::task::spawn_blocking so the async runtime stays free for ingestion.
+ureq = { version = "2", features = ["json"] }
+# The worker loop itself: watch channel for shutdown, sleep/select pacing,
+# spawn_blocking offload (rt is implied by the server's rt-multi-thread).
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+# Hand-rolled OpenAI-compatible mock endpoint (axum is already the hub
+# server's stack - no extra mock framework).
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
