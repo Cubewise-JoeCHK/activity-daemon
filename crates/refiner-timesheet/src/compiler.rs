@@ -23,8 +23,9 @@
 //! - Low-confidence spans that cannot be resolved (no analysis, or best
 //!   confidence below [`RESOLVE_MIN_CONFIDENCE`]) become question items
 //!   through the issue #44 store instead of activities. An already-open
-//!   question covering the span is never duplicated; an answered one
-//!   resolves the span with the owner's answer (confidence 1.0).
+//!   question whose evidence frame falls inside the span (containment,
+//!   issue #65) or whose text matches is never duplicated; an answered
+//!   one resolves the span with the owner's answer (confidence 1.0).
 //! - [`store_day`] writes drafts via the normal core insert: bucket
 //!   `timesheet-draft`, `ts_start` = activity start, `duration_s` = length,
 //!   `device` = the day's majority session device, `data` = the activity
@@ -439,6 +440,21 @@ fn span_distance_ms(session: &SessionRec, ts: DateTime<FixedOffset>) -> i64 {
     }
 }
 
+/// Does a question's evidence frame fall inside the session's span
+/// (`[start, end)`, the containment [`span_distance_ms`] uses)? The
+/// existing-question dedup's frame-hash arm matches only frames inside
+/// the candidate span (issue #65): since #63 a session cites every
+/// analysis within `classify_window_s`, so a bare hash overlap would let
+/// a far-away open question suppress a real session. A frame whose
+/// timestamp does not parse never matches; the question-text arm still
+/// covers the question.
+fn frame_in_span(session: &SessionRec, frame: &EvidenceFrame) -> bool {
+    match DateTime::parse_from_rfc3339(&frame.ts) {
+        Ok(ts) => ts >= session.start && ts < session.end,
+        Err(_) => false,
+    }
+}
+
 /// The classification window in whole milliseconds (`classify_window_s`,
 /// issue #63). An analysis at span distance 0 (inside the session) is
 /// always within it.
@@ -731,13 +747,20 @@ pub fn plan_day(
         }
         let question_text = heuristic_question(session);
 
-        // Existing questions covering this span: frame-hash overlap, or the
-        // deterministic question text (covers frame-less questions).
+        // Existing questions covering this span: an evidence frame inside
+        // the span (containment, issue #65 - after #63 a session cites
+        // every analysis within `classify_window_s`, so a bare hash
+        // overlap would let a question ten minutes away suppress the
+        // session), or the deterministic question text (covers frame-less
+        // questions).
         let matches: Vec<&TsQuestion> = existing_questions
             .iter()
             .filter(|q| {
                 q.day == day_str
-                    && (q.evidence.iter().any(|f| shas.contains(&f.frame_sha16))
+                    && (q
+                        .evidence
+                        .iter()
+                        .any(|f| shas.contains(&f.frame_sha16) && frame_in_span(session, f))
                         || q.question == question_text)
             })
             .collect();
@@ -1725,6 +1748,89 @@ mod tests {
         // no new question (already open), no activity (unresolved)
         assert!(planned.questions.is_empty());
         assert!(planned.activities.is_empty());
+    }
+
+    #[test]
+    fn far_open_question_does_not_suppress_real_sessions() {
+        // Issue #65 regression, the #49 pilot's vanished sessions: one
+        // open question (confidence 0.30, evidence frame 6a17e7484e59b1b9
+        // at 21:34:03) sits within the 600 s classify window of four
+        // real, high-confidence sessions (6497 ~39 min, 6516, 6598,
+        // 6668), so the frame-overlap dedup arm silently skipped all
+        // four. With the arm restricted to evidence frames inside the
+        // session span, all four draft and nothing new is asked.
+        let questions = TsQuestionStore::open_in_memory().expect("store");
+        questions
+            .create_question(
+                DAY,
+                "What were you working on at 2026-11-06T21:34:03+08:00? \
+                 (auto-detected: Creating a new project in the IDE; confidence 0.30)",
+                &[EvidenceFrame {
+                    frame_path: "media/frames/2026/11/06/213403_DISPLAY7_6a17e7484e59b1b9.jpg"
+                        .to_string(),
+                    frame_sha16: "6a17e7484e59b1b9".to_string(),
+                    ts: "2026-11-06T21:34:03+08:00".to_string(),
+                }],
+            )
+            .expect("create");
+        // The question's own low-confidence analysis (post-#63 every
+        // session within 600 s cites it as evidence - the widening that
+        // armed the bug).
+        let question_frame = row(
+            2000,
+            BUCKET_FRAME_ANALYSIS,
+            "2026-11-06T21:34:03+08:00",
+            0.0,
+            serde_json::json!({
+                "frame_sha16": "6a17e7484e59b1b9",
+                "frame_path": "media/frames/2026/11/06/213403_DISPLAY7_6a17e7484e59b1b9.jpg",
+                "activity": "Creating a new project in the IDE",
+                "project_guess": "C000P001",
+                "category": "Pre-Sales",
+                "confidence": 0.3,
+                "evidence": [],
+                "model": "qwen",
+                "sampled": true,
+            }),
+        );
+        // The four vanished sessions (real ids from the #49 record), all
+        // within 600 s of the 21:34:03 frame and none containing it.
+        let vanished = |id: i64, ts: &str, dur_s: f64| {
+            row(
+                id,
+                "window-watcher",
+                ts,
+                dur_s,
+                serde_json::json!({"app": "Code.exe", "title": "window title"}),
+            )
+        };
+        let input = input_for(vec![
+            vanished(6497, "2026-11-06T20:50:00+08:00", 2340.0), // 20:50-21:29
+            vanished(6668, "2026-11-06T21:36:00+08:00", 60.0),
+            vanished(6516, "2026-11-06T21:38:30+08:00", 60.0),
+            vanished(6598, "2026-11-06T21:42:00+08:00", 60.0),
+            // High-confidence frames (offsets after 15:00:00) so every
+            // session resolves; spaced and labelled so none merge.
+            offset_analysis(2002, 21300, "C1234", "Consulting", 0.9), // 20:55:00
+            offset_analysis(2003, 23790, "C1234", "Consulting", 0.9), // 21:36:30
+            offset_analysis(2004, 23940, "C9999", "QA", 0.9),         // 21:39:00
+            offset_analysis(2005, 24150, "C1234", "Consulting", 0.9), // 21:42:30
+            question_frame,
+        ]);
+        let existing = questions.list_questions(StatusFilter::All).expect("list");
+        let planned = plan_day(&input, &existing, &cfg(), &HeuristicTitler);
+        assert!(
+            planned.questions.is_empty(),
+            "no new questions for resolved sessions"
+        );
+        assert_eq!(planned.activities.len(), 4, "all four sessions draft");
+        let mut drafted_ids: Vec<i64> = planned
+            .activities
+            .iter()
+            .flat_map(|a| a.sources.session_ids.iter().copied())
+            .collect();
+        drafted_ids.sort();
+        assert_eq!(drafted_ids, vec![6497, 6516, 6598, 6668]);
     }
 
     // --------------------------- fixture: regeneration superseding
