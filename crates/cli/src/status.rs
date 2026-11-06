@@ -13,13 +13,19 @@
 //! - database size on disk (main file + WAL + SHM)
 //! - frames and audio media bytes vs their rolling budgets
 //!   (`screen.max_total_mb` / `audio.max_total_mb`)
+//! - hub media retention stats (issue #38, best effort): `GET
+//!   /api/retention` on the configured hub - hot bytes by kind, bundle
+//!   count/bytes, months pending, next scheduled action. Absent when the
+//!   hub is unreachable; the local report never depends on the network.
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use activity_core::{Config, Db, BUCKET_WINDOW};
 use anyhow::Result;
 use chrono::{DateTime, Local, SecondsFormat, TimeZone};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::heartbeat::{self, HeartbeatState};
 use crate::usage_log;
@@ -30,7 +36,10 @@ const FOREGROUND_LOOKBACK_DAYS: i64 = 30;
 /// `status` subcommand entry point.
 pub fn cmd_status(json: bool, config_override: Option<&Path>) -> Result<()> {
     let resolved = crate::config::resolve(config_override)?;
-    let report = collect(&resolved.config, Local::now());
+    let mut report = collect(&resolved.config, Local::now());
+    // Best effort: retention stats live on the hub; offline or older hubs
+    // simply leave the field absent.
+    report.retention = fetch_retention(&resolved.config.sync.server_url);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -94,6 +103,47 @@ pub struct StatusReport {
     pub db_bytes: u64,
     pub frames: MediaUsage,
     pub audio: MediaUsage,
+    /// Hub media retention stats (issue #38); absent when the hub is
+    /// unreachable or predates #38.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionStats>,
+}
+
+/// Hub-side media retention snapshot (issue #38), fetched from
+/// `GET /api/retention` on the configured hub. Mirror of the server
+/// payload; deserializes loosely so additive server fields stay harmless.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetentionStats {
+    pub enabled: bool,
+    pub hot_days: u64,
+    /// Raw bytes per media kind still hot on the hub.
+    pub hot_bytes: BTreeMap<String, u64>,
+    pub bundle_count: u64,
+    pub bundle_bytes: u64,
+    /// Cold months still holding raw files, oldest first.
+    pub months_pending: Vec<HubPendingMonth>,
+    /// What the hub's next daily sweeper pass would do.
+    pub next_action: String,
+}
+
+/// One pending month on the hub ([`RetentionStats`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HubPendingMonth {
+    pub month: String,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// Best-effort fetch of the hub's retention stats. `None` on any failure
+/// (hub down, old hub without the endpoint, timeout) - status is a local
+/// command and must never fail because the network is away.
+fn fetch_retention(server_url: &str) -> Option<RetentionStats> {
+    let url = format!("{}/api/retention", server_url.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(3))
+        .build();
+    let response = agent.get(&url).call().ok()?;
+    response.into_json::<RetentionStats>().ok()
 }
 
 /// Collect the status snapshot. `now` anchors the "today" window (injected
@@ -148,6 +198,7 @@ pub fn collect(cfg: &Config, now: DateTime<Local>) -> StatusReport {
             bytes: dir_size(&data_dir.join("media").join("audio")),
             budget_mb: cfg.audio.max_total_mb,
         },
+        retention: None,
     };
 
     if db_present {
@@ -306,6 +357,27 @@ pub(crate) fn render_human(report: &StatusReport) -> String {
         human_bytes(report.audio.bytes),
         report.audio.budget_mb
     ));
+    if let Some(retention) = &report.retention {
+        let state = if retention.enabled {
+            format!("on (hot {}d)", retention.hot_days)
+        } else {
+            "off".to_string()
+        };
+        let pending = if retention.months_pending.is_empty() {
+            "nothing pending".to_string()
+        } else {
+            format!(
+                "{} month(s) pending, next: {}",
+                retention.months_pending.len(),
+                retention.next_action
+            )
+        };
+        out.push_str(&format!(
+            "  hub:      {} bundle(s) ({}), {pending}, retention {state}\n",
+            retention.bundle_count,
+            human_bytes(retention.bundle_bytes)
+        ));
+    }
     out
 }
 
@@ -474,5 +546,59 @@ mod tests {
         assert!(json.contains("\"today_active_s\":0.0"), "{json}");
         assert!(!json.contains("-0.0"), "{json}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #38: the retention block is absent while the hub is
+    /// unreachable (field skipped in JSON, still parseable), and a fetched
+    /// hub payload round-trips through the report.
+    #[test]
+    fn retention_field_is_optional_and_roundtrips() {
+        let cfg = Config {
+            data_dir: temp_dir("retention-absent"),
+            ..Config::default()
+        };
+        let now = Local
+            .with_ymd_and_hms(2026, 11, 4, 11, 0, 0)
+            .single()
+            .expect("now");
+        let report = collect(&cfg, now);
+        assert_eq!(report.retention, None);
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            !json.contains("\"retention\""),
+            "absent field must be skipped: {json}"
+        );
+        let back: StatusReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, report);
+
+        // A hub payload (as GET /api/retention returns) round-trips.
+        let mut with_hub = report.clone();
+        with_hub.retention = Some(RetentionStats {
+            enabled: true,
+            hot_days: 365,
+            hot_bytes: BTreeMap::from([("frames".to_string(), 1024), ("audio".to_string(), 512)]),
+            bundle_count: 2,
+            bundle_bytes: 4096,
+            months_pending: vec![HubPendingMonth {
+                month: "2025-10".to_string(),
+                files: 12,
+                bytes: 2048,
+            }],
+            next_action:
+                "bundle 2025-10 into bundles/2025-10.tar.zst (12 files, 2.0 KB) then delete raws"
+                    .to_string(),
+        });
+        let json = serde_json::to_string(&with_hub).expect("serialize");
+        assert!(json.contains("\"retention\""), "{json}");
+        let back: StatusReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, with_hub);
+
+        // Human rendering carries the essentials.
+        let text = render_human(&with_hub);
+        assert!(text.contains("hub:"), "{text}");
+        assert!(text.contains("2 bundle(s)"), "{text}");
+        assert!(text.contains("1 month(s) pending"), "{text}");
+        assert!(text.contains("on (hot 365d)"), "{text}");
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
     }
 }

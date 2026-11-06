@@ -51,7 +51,14 @@
 //! UI (machine status + behaviour calendar), backed by `GET /api/machines`
 //! and `GET /api/calendar`. `/api` reads follow the `/health` precedent:
 //! open, tailnet-only, no token (writes stay guarded).
+//!
+//! Retention (issue #38, `retention` module): finished months of raw media
+//! are bundled into `bundles/<YYYY-MM>.tar.zst` once they age beyond the
+//! hot window (`[retention]` in the server config file, disabled by
+//! default); `GET /api/retention` reports the stats the client's
+//! `status --json` surfaces.
 
+pub mod retention;
 pub mod web;
 pub mod whois;
 
@@ -85,6 +92,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct AppState {
     db: Arc<Mutex<Db>>,
     media_dir: PathBuf,
+    /// Retention paths (`media/` root + `bundles/` output) and settings;
+    /// issue #38.
+    retention_store: retention::RetentionStore,
+    retention: retention::RetentionConfig,
     auth: AuthConfig,
     /// When this state was constructed (= hub process start in production);
     /// surfaces as `hub.uptime_s` in the web UI's machine view.
@@ -157,9 +168,27 @@ impl AppState {
         media_dir: PathBuf,
         auth: AuthConfig,
     ) -> Result<AppState, CoreError> {
+        AppState::open_with_retention(
+            db_path,
+            media_dir,
+            auth,
+            retention::RetentionConfig::default(),
+        )
+    }
+
+    /// [`AppState::open_with_auth`] with explicit retention settings
+    /// (issue #38); production passes the parsed server config.
+    pub fn open_with_retention(
+        db_path: &Path,
+        media_dir: PathBuf,
+        auth: AuthConfig,
+        retention: retention::RetentionConfig,
+    ) -> Result<AppState, CoreError> {
         Ok(AppState {
             db: Arc::new(Mutex::new(Db::open_db(db_path)?)),
-            media_dir,
+            media_dir: media_dir.clone(),
+            retention_store: retention::RetentionStore::from_media_dir(&media_dir),
+            retention,
             auth,
             started_at: Instant::now(),
         })

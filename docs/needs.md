@@ -39,9 +39,17 @@ need; the owner queries when filling a timesheet or reflecting.
   volume.
 - The owner works across multiple monitors; screen frames must cover every
   screen actually in use, not just the primary one. Monitors share the
-  client-side retention budget.
-- Client-side rolling retention bounds device disk use; the central hub is
-  the keep-forever archive (cap configurable).
+  client-side retention budget (backstop; primary retention is hub-side).
+- Media lifecycle (owner decision v1.2, 2026-11-06): captured media uploads
+  to the hub promptly and the client deletes its local copy on ack
+  (delete-on-ack pass-through). Client rolling budgets survive only as an
+  upload-failure backstop, not primary retention.
+- The hub holds raw media hot for 365 days as monthly `tar.zst` bundles;
+  after that the bundles move to MinIO (`blob.joechowhk.internal`, inside
+  the tailnet) as the permanent tier - the no-third-party rule holds. Events
+  and derived artifacts are exempt and stay on the hub permanently.
+- Accepted trade-off: after ack the client keeps zero media redundancy; the
+  hub/MinIO copy is the single live copy.
 - Meeting audio triggering: manual trigger (hotkey / CLI) for in-person
   meetings (mic only); auto-trigger on conferencing apps (mic + loopback)
   when the app holds an active audio session.
