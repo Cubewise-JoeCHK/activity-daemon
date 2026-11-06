@@ -63,7 +63,7 @@
 use std::collections::BTreeMap;
 
 use activity_core::{CoreError, Db, EventEnvelope, EventRow};
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveTime, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{StyleConfig, TimesheetConfig};
@@ -243,12 +243,36 @@ pub fn parse_day(day: &str) -> Result<NaiveDate, CoreError> {
     }
 }
 
+/// The compile-side coverage context of the amended supersession rule
+/// (issue #68): what only the current compile knows about the day.
+///
+/// - `stretch_cover_spans`: the wall-clock spans of the day's grey
+///   stretches an open question represents - matched to an existing open
+///   question (suppressed duplicate) or planned by this compile. A stale
+///   ask whose minute-granular span sits inside one is debris: the
+///   stretch question owns that time now.
+/// - `segmented_session_texts`: the deterministic question text of every
+///   session inside a segment the compile classified - resolved by the
+///   vote, grey below the gate, or grey with no evidence at all: the
+///   segmentation absorbed the session's time either way (a resolved
+///   segment drafts it, a grey one hands it to a stretch question). The
+///   matching ask describes that absorbed time, robust to the `%H:%M`
+///   truncation the ask text carries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SupersessionContext {
+    pub stretch_cover_spans: Vec<(NaiveTime, NaiveTime)>,
+    pub segmented_session_texts: Vec<String>,
+}
+
 /// The compiler's full decisions for one day. Pure output of [`plan_day`].
 #[derive(Debug, Clone)]
 pub struct DayPlan {
     pub day: NaiveDate,
     pub activities: Vec<DraftActivity>,
     pub questions: Vec<PlannedQuestion>,
+    /// The supersession rule's compile-side coverage (issue #68); consumed
+    /// by [`superseded_question_ids`] through both call sites.
+    pub supersession: SupersessionContext,
     /// Device stamped on inserted drafts: the day's majority session
     /// device (single-owner hub; ties break to the smallest name).
     pub device: String,
@@ -1068,21 +1092,56 @@ fn covered_by_drafts(
     false
 }
 
-/// The open questions the recompiled drafts supersede (issue #66). A
-/// question closes when
+/// Is the minute-granular ask span `[start, end)` inside one of the
+/// stretch cover spans (issue #68b)? Times compare as minutes of the
+/// shared local day - both sides are `%H:%M` question texts, so the
+/// minute truncation cancels out; a span whose end is not after its
+/// start crosses midnight (the end shifts a day forward). An ask wider
+/// than every cover, straddling one, or COINCIDING with one stays open -
+/// the coinciding question is the stretch's own open question (the dedup
+/// keeps exactly one question per stretch span), never debris.
+fn covered_by_stretch_span(ask: (NaiveTime, NaiveTime), covers: &[(NaiveTime, NaiveTime)]) -> bool {
+    let minutes = |time: NaiveTime| i64::from(time.num_seconds_from_midnight() / 60);
+    let normalize = |(start, end): (NaiveTime, NaiveTime)| {
+        let (start, end) = (minutes(start), minutes(end));
+        (start, if end < start { end + 24 * 60 } else { end })
+    };
+    let (ask_start, ask_end) = normalize(ask);
+    covers.iter().any(|&cover| {
+        let (cover_start, cover_end) = normalize(cover);
+        ask_start >= cover_start
+            && ask_end <= cover_end
+            && (ask_start, ask_end) != (cover_start, cover_end)
+    })
+}
+
+/// The open questions the recompile supersedes (issues #66 + #68). A
+/// question closes when any of
 /// - its text span is zero-length (the superseded pre-#63 compile's
-///   sub-minute debris - dead by construction, drafts or not), or
+///   sub-minute debris - dead by construction, drafts or not),
 /// - its span is fully covered by the union of the current drafts: the
 ///   owner reviews the drafts, not a queue of questions about drafted
-///   time. An evidence-backed instant question closes only through
+///   time (an evidence-backed instant question closes only through
 ///   coverage - a still-grey instant stays askable even though a single
-///   instant is zero-length.
+///   instant is zero-length),
+/// - its minute-granular text span sits inside the wall-clock span of a
+///   grey stretch an open question represents (issue #68b - the stretch
+///   question owns that time),
+/// - its question text is the deterministic text of a session inside a
+///   segment the compile classified (issue #68c - the segmentation
+///   absorbed that time, even if the block was later split; the vote's
+///   outcome - drafted, grey below the gate, grey without evidence - does
+///   not matter, the ask's span is owned either way).
 ///
 /// Non-open questions and unknown spans are never returned. Pure; the
 /// caller writes the closures through
 /// `TsQuestionStore::supersede_questions` (the regeneration guard and
 /// the maintenance endpoint share this exact rule).
-pub fn superseded_question_ids(questions: &[TsQuestion], drafts: &[DraftActivity]) -> Vec<i64> {
+pub fn superseded_question_ids(
+    questions: &[TsQuestion],
+    drafts: &[DraftActivity],
+    supersession: &SupersessionContext,
+) -> Vec<i64> {
     let mut draft_spans: Vec<(DateTime<FixedOffset>, DateTime<FixedOffset>)> = drafts
         .iter()
         .filter_map(|activity| {
@@ -1097,14 +1156,34 @@ pub fn superseded_question_ids(questions: &[TsQuestion], drafts: &[DraftActivity
     questions
         .iter()
         .filter(|question| question.status == TsQuestionStatus::Open)
-        .filter(|question| match question_span(question) {
+        .filter(|question| {
             // Zero-length compile debris closes regardless of drafts.
-            Some(QuestionSpan::Text(start, end)) if start == end => true,
-            Some(span) => match materialize_question_span(span, question, offset) {
-                Some((start, end)) => covered_by_drafts(start, end, &draft_spans),
+            if let Some(QuestionSpan::Text(start, end)) = question_span(question) {
+                if start == end {
+                    return true;
+                }
+            }
+            // An open stretch question's span covers the ask (issue #68b).
+            if let Some(QuestionSpan::Text(start, end)) = question_text_span(question) {
+                if covered_by_stretch_span((start, end), &supersession.stretch_cover_spans) {
+                    return true;
+                }
+            }
+            // A classified segment absorbed the ask's session (issue #68c).
+            if supersession
+                .segmented_session_texts
+                .contains(&question.question)
+            {
+                return true;
+            }
+            // Drafts cover the span (issue #66).
+            match question_span(question) {
+                Some(span) => match materialize_question_span(span, question, offset) {
+                    Some((start, end)) => covered_by_drafts(start, end, &draft_spans),
+                    None => false,
+                },
                 None => false,
-            },
-            None => false,
+            }
         })
         .map(|question| question.id)
         .collect()
@@ -1244,6 +1323,7 @@ pub fn plan_day(
     // flushes the stretch under construction.
     let mut groups: Vec<Group> = Vec::new();
     let mut stretches: Vec<Stretch> = Vec::new();
+    let mut segmented_session_texts: Vec<String> = Vec::new();
     for run in runs_of(
         &segmentable,
         &sessions,
@@ -1256,6 +1336,14 @@ pub fn plan_day(
         for chunk in split_at_max_block(&run, max_block) {
             let segment = build_segment(chunk);
             let classification = classify_segment(&segment, &analyses, window_ms);
+            // Rule (c) coverage (issue #68): the segmentation absorbs the
+            // segment's sessions' asks whether the vote resolved them
+            // (drafted), left them grey below the gate, or found no
+            // evidence at all (a grey stretch question owns that time) -
+            // the per-session ask is debris either way.
+            for segment_session in &segment.sessions {
+                segmented_session_texts.push(heuristic_question(segment_session));
+            }
             let resolvable = classification
                 .selected
                 .is_some_and(|s| s.confidence >= RESOLVE_MIN_CONFIDENCE);
@@ -1292,6 +1380,7 @@ pub fn plan_day(
     // one summary question.
     let mut planned_questions: Vec<PlannedQuestion> = Vec::new();
     let mut pending: Vec<&Stretch> = Vec::new();
+    let mut stretch_cover_spans: Vec<(NaiveTime, NaiveTime)> = Vec::new();
     for stretch in &stretches {
         let question_text = stretch_question(stretch);
         let shas = pool_shas(&stretch.pool);
@@ -1337,9 +1426,13 @@ pub fn plan_day(
                     .collect(),
             });
         } else if matches.iter().any(|q| q.answer.is_none()) {
-            // Unresolved and already asked: no duplicate question.
+            // Unresolved and already asked: no duplicate question; the
+            // existing open question covers the stretch (issue #68b).
+            stretch_cover_spans.push((stretch.start.time(), stretch.end.time()));
         } else {
             pending.push(stretch);
+            // The planned question will be open (issue #68b cover).
+            stretch_cover_spans.push((stretch.start.time(), stretch.end.time()));
         }
     }
     let cap = usize::try_from(cfg.daily_question_cap).unwrap_or(usize::MAX);
@@ -1455,6 +1548,9 @@ pub fn plan_day(
         .map(|(name, _)| name.to_string())
         .unwrap_or_else(|| FALLBACK_DEVICE.to_string());
 
+    segmented_session_texts.sort();
+    segmented_session_texts.dedup();
+
     DayPlan {
         day,
         activities,
@@ -1462,6 +1558,10 @@ pub fn plan_day(
         device,
         skipped_rows: skipped,
         supersede_rows,
+        supersession: SupersessionContext {
+            stretch_cover_spans,
+            segmented_session_texts,
+        },
     }
 }
 
@@ -2572,7 +2672,10 @@ mod tests {
             &[],
         );
         let wide = open_question(2, "What were you working on 09:00-10:00 (Code.exe)?", &[]);
-        assert_eq!(superseded_question_ids(&[debris, wide], &[]), vec![1]);
+        assert_eq!(
+            superseded_question_ids(&[debris, wide], &[], &SupersessionContext::default()),
+            vec![1]
+        );
     }
 
     #[test]
@@ -2583,25 +2686,37 @@ mod tests {
             activity("2026-11-06T09:00:00+08:00", "2026-11-06T09:30:00+08:00"),
             activity("2026-11-06T09:30:00+08:00", "2026-11-06T10:00:00+08:00"),
         ];
-        assert_eq!(superseded_question_ids(&[wide(1)], &drafts), vec![1]);
+        assert_eq!(
+            superseded_question_ids(&[wide(1)], &drafts, &SupersessionContext::default()),
+            vec![1]
+        );
         // ...partial coverage does not...
         let drafts = [activity(
             "2026-11-06T09:00:00+08:00",
             "2026-11-06T09:30:00+08:00",
         )];
-        assert!(superseded_question_ids(&[wide(1)], &drafts).is_empty());
+        assert!(
+            superseded_question_ids(&[wide(1)], &drafts, &SupersessionContext::default())
+                .is_empty()
+        );
         // ...and neither does a hole between two drafts.
         let drafts = [
             activity("2026-11-06T09:00:00+08:00", "2026-11-06T09:30:00+08:00"),
             activity("2026-11-06T09:45:00+08:00", "2026-11-06T10:00:00+08:00"),
         ];
-        assert!(superseded_question_ids(&[wide(1)], &drafts).is_empty());
+        assert!(
+            superseded_question_ids(&[wide(1)], &drafts, &SupersessionContext::default())
+                .is_empty()
+        );
         // Fully disjoint drafts leave it open.
         let drafts = [
             activity("2026-11-06T08:00:00+08:00", "2026-11-06T08:30:00+08:00"),
             activity("2026-11-06T11:00:00+08:00", "2026-11-06T12:00:00+08:00"),
         ];
-        assert!(superseded_question_ids(&[wide(1)], &drafts).is_empty());
+        assert!(
+            superseded_question_ids(&[wide(1)], &drafts, &SupersessionContext::default())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2630,10 +2745,16 @@ mod tests {
             activity("2026-11-06T09:00:00+08:00", "2026-11-06T09:30:00+08:00"),
             activity("2026-11-06T10:00:00+08:00", "2026-11-06T11:00:00+08:00"),
         ];
-        assert_eq!(superseded_question_ids(&[covered, grey], &drafts), vec![1]);
+        assert_eq!(
+            superseded_question_ids(&[covered, grey], &drafts, &SupersessionContext::default()),
+            vec![1]
+        );
         // Text-only instant (no evidence rows) follows the same rule.
         let text_only = open_question(3, &worker_text("2026-11-06T09:15:00+08:00"), &[]);
-        assert_eq!(superseded_question_ids(&[text_only], &drafts), vec![3]);
+        assert_eq!(
+            superseded_question_ids(&[text_only], &drafts, &SupersessionContext::default()),
+            vec![3]
+        );
     }
 
     #[test]
@@ -2656,7 +2777,151 @@ mod tests {
             &[],
         );
         closed.status = TsQuestionStatus::Superseded;
-        assert!(superseded_question_ids(&[mystery, answered, closed], &drafts).is_empty());
+        assert!(superseded_question_ids(
+            &[mystery, answered, closed],
+            &drafts,
+            &SupersessionContext::default()
+        )
+        .is_empty());
+    }
+
+    // ----------------- fixture: amended supersession (issue #68)
+
+    fn context(stretch_spans: &[(NaiveTime, NaiveTime)], voted: &[&str]) -> SupersessionContext {
+        SupersessionContext {
+            stretch_cover_spans: stretch_spans.to_vec(),
+            segmented_session_texts: voted.iter().map(|text| (*text).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn stretch_text_span_covers_minute_truncated_asks() {
+        // The pilot pattern (issue #68): a pre-segmentation ask whose
+        // minute-truncated span sits inside an open stretch question's
+        // span closes even though the drafts never cover it (grey time is
+        // never drafted, and the exact-second edges never line up).
+        let stretch = context(
+            &[(
+                NaiveTime::from_hms_opt(15, 19, 0).expect("cover start"),
+                NaiveTime::from_hms_opt(15, 31, 0).expect("cover end"),
+            )],
+            &[],
+        );
+        let stale = open_question(1, "What were you working on 15:19-15:20 (ZCode.exe)?", &[]);
+        assert_eq!(superseded_question_ids(&[stale], &[], &stretch), vec![1]);
+        // A partial overlap (the ask reaches past the stretch) stays open.
+        let overhang = open_question(2, "What were you working on 15:30-15:32 (ZCode.exe)?", &[]);
+        assert!(superseded_question_ids(&[overhang], &[], &stretch).is_empty());
+        // A question coinciding with the cover span IS the stretch's own
+        // open question - the owner's only ask about that grey time.
+        let owner = open_question(3, "What were you working on 15:19-15:31 (ZCode.exe)?", &[]);
+        assert!(superseded_question_ids(&[owner], &[], &stretch).is_empty());
+        // Midnight wrap: an ask past midnight inside a wrapping stretch.
+        let wrap = context(
+            &[(
+                NaiveTime::from_hms_opt(23, 52, 0).expect("wrap start"),
+                NaiveTime::from_hms_opt(0, 2, 0).expect("wrap end"),
+            )],
+            &[],
+        );
+        let late = open_question(4, "What were you working on 23:55-00:01 (ZCode.exe)?", &[]);
+        assert_eq!(superseded_question_ids(&[late], &[], &wrap), vec![4]);
+    }
+
+    #[test]
+    fn voted_segment_text_closes_the_matching_session_ask() {
+        // Rule (c): the ask text IS a voted segment session's text - the
+        // vote absorbed that time (the match is the exact deterministic
+        // text, robust to the %H:%M truncation; span coverage would fail
+        // on the truncated edges).
+        let voted = context(
+            &[],
+            &["What were you working on 12:02-12:03 (WindowsTerminal.exe)?"],
+        );
+        let stale = open_question(
+            1,
+            "What were you working on 12:02-12:03 (WindowsTerminal.exe)?",
+            &[],
+        );
+        assert_eq!(superseded_question_ids(&[stale], &[], &voted), vec![1]);
+        // A near miss (different app, minute span or shape) stays open.
+        let other_app = open_question(2, "What were you working on 12:02-12:03 (Code.exe)?", &[]);
+        let drifted = open_question(
+            3,
+            "What were you working on 12:02-12:04 (WindowsTerminal.exe)?",
+            &[],
+        );
+        let mystery = open_question(4, "Why is the sky blue?", &[]);
+        assert!(superseded_question_ids(&[other_app, drifted, mystery], &[], &voted).is_empty());
+        // An unvoted segment (empty pool - nothing classified the time)
+        // leaves the session ask open.
+        let unvoted = SupersessionContext::default();
+        let ask_again = open_question(
+            5,
+            "What were you working on 12:02-12:03 (WindowsTerminal.exe)?",
+            &[],
+        );
+        assert!(superseded_question_ids(&[ask_again], &[], &unvoted).is_empty());
+    }
+
+    #[test]
+    fn plan_day_builds_the_supersession_context_for_the_pilot_pattern() {
+        // The pilot situation (issue #68): a voted block absorbed a
+        // session a stale ask still asks about; a grey stretch (two
+        // adjacent sessions, no analyses) raised the wide question owning
+        // its span - the two grey sessions' own texts are absorbed too.
+        let voted_text = "What were you working on 12:02-12:03 (WindowsTerminal.exe)?";
+        let grey_a_text = "What were you working on 15:19-15:20 (Chrome.exe)?";
+        let grey_b_text = "What were you working on 15:20-15:21 (ZCode.exe)?";
+        let input = input_for(vec![
+            session(1, 12, 2, 61.0, "WindowsTerminal.exe"),
+            analysis(10, 12, 2, "C1234", "Consulting", 0.9),
+            session(2, 15, 19, 60.0, "Chrome.exe"),
+            session(3, 15, 20, 60.0, "ZCode.exe"),
+        ]);
+        let planned = plan(&input);
+        assert_eq!(planned.activities.len(), 1, "one voted block");
+        assert_eq!(planned.questions.len(), 1, "the grey stretch asks");
+        assert_eq!(
+            planned.supersession.stretch_cover_spans,
+            vec![(
+                NaiveTime::from_hms_opt(15, 19, 0).expect("cover start"),
+                NaiveTime::from_hms_opt(15, 21, 0).expect("cover end"),
+            )]
+        );
+        assert_eq!(
+            planned.supersession.segmented_session_texts,
+            vec![
+                voted_text.to_string(),
+                grey_a_text.to_string(),
+                grey_b_text.to_string(),
+            ]
+        );
+
+        // The amended rule closes the stale asks (a voted session's own
+        // ask via the text arm, a minute ask inside the stretch via the
+        // stretch arm, a grey session's own ask via the text arm); the
+        // wide stretch question itself and an unrelated ask stay open.
+        let stale_voted = open_question(1, voted_text, &[]);
+        let stale_stretch =
+            open_question(2, "What were you working on 15:20-15:21 (Chrome.exe)?", &[]);
+        let stale_grey = open_question(3, grey_a_text, &[]);
+        let stretch_question = open_question(4, &planned.questions[0].question, &[]);
+        let unrelated = open_question(5, "What were you working on 21:00-21:30 (Code.exe)?", &[]);
+        assert_eq!(
+            superseded_question_ids(
+                &[
+                    stale_voted,
+                    stale_stretch,
+                    stale_grey,
+                    stretch_question,
+                    unrelated,
+                ],
+                &planned.activities,
+                &planned.supersession,
+            ),
+            vec![1, 2, 3]
+        );
     }
 
     // --------------------------- fixture: regeneration superseding
