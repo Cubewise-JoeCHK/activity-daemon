@@ -12,6 +12,12 @@
 //!   root.
 //! - `POST /api/timesheet/questions/{id}/answer` - body `{"answer": "..."}`;
 //!   marks the question answered (last write wins on re-answer).
+//! - `POST /api/timesheet/questions/maintenance?date=YYYY-MM-DD` - the
+//!   question debris cleanup (issue #66): closes the day's open questions
+//!   whose span is zero-length or fully covered by the day's current
+//!   drafts (status `superseded`; `answer` stays NULL, evidence kept).
+//!   Idempotent - re-running closes nothing. Regeneration applies the
+//!   same rule automatically and reports `questions_closed`.
 //!
 //! Month-end export (issue #46):
 //! - `GET /api/timesheet/export?month=YYYY-MM` - the month's approved
@@ -110,10 +116,10 @@ use axum::routing::{get, post, put};
 use axum::Router;
 use chrono::{Local, NaiveDate, SecondsFormat, TimeZone, Utc};
 use refiner_timesheet::{
-    export_month_bytes, parse_day, parse_month, plan_day, store_day, BlockTitler, CubewiseVocab,
-    DayInput, DraftActivity, HeuristicTitler, LemonadeTitler, StatusFilter, StyleConfig,
-    StyleExample, TimesheetConfig, TsQuestion, TsQuestionStore, BUCKET_FRAME_ANALYSIS,
-    BUCKET_TIMESHEET_APPROVED, BUCKET_TIMESHEET_DRAFT,
+    current_draft_from_row, export_month_bytes, parse_day, parse_month, plan_day, store_day,
+    superseded_question_ids, BlockTitler, CubewiseVocab, DayInput, DraftActivity, HeuristicTitler,
+    LemonadeTitler, StatusFilter, StyleConfig, StyleExample, TimesheetConfig, TsQuestion,
+    TsQuestionStore, BUCKET_FRAME_ANALYSIS, BUCKET_TIMESHEET_APPROVED, BUCKET_TIMESHEET_DRAFT,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -133,6 +139,10 @@ pub fn timesheet_router() -> Router<AppState> {
         .route(
             "/api/timesheet/questions/{id}/answer",
             post(api_answer_question),
+        )
+        .route(
+            "/api/timesheet/questions/maintenance",
+            post(api_questions_maintenance),
         )
         .route("/api/timesheet/export", get(api_export_month))
         .route(
@@ -332,7 +342,7 @@ fn regenerate_payload(
 ) -> Result<Value, CoreError> {
     let (from, to) = local_day_bounds(day)?;
     let day_str = day.format("%Y-%m-%d").to_string();
-    let stored = {
+    let (stored, plan, existing_questions) = {
         let db = state
             .db
             .lock()
@@ -369,10 +379,24 @@ fn regenerate_payload(
             approved,
         };
         let plan = plan_day(&input, &existing_questions, timesheet, titler);
-        store_day(&db, &questions, &plan)?
+        let stored = store_day(&db, &questions, &plan)?;
+        (stored, plan, existing_questions)
+    };
+    // Supersession guard (issue #66): the recompile closes the day's open
+    // questions whose span is zero-length or fully covered by the new
+    // drafts, so regeneration never leaves debris in the owner's queue
+    // (the maintenance endpoint applies the same rule to existing rows).
+    let closed_ids = {
+        let questions = state
+            .ts_questions
+            .lock()
+            .map_err(|_| CoreError::Config("question store lock poisoned".to_string()))?;
+        let superseded = superseded_question_ids(&existing_questions, &plan.activities);
+        questions.supersede_questions(&superseded)?
     };
     let mut payload = draft_payload(state, day)?;
     payload["questions_created"] = json!(stored.question_ids.len());
+    payload["questions_closed"] = json!(closed_ids.len());
     payload["superseded"] = json!(stored.superseded_ids.len());
     Ok(payload)
 }
@@ -446,6 +470,69 @@ fn question_payload(question: &TsQuestion) -> Value {
         "answered_at": question.answered_at,
         "evidence": evidence,
     })
+}
+
+// -------------------------------- POST /api/timesheet/questions/maintenance
+
+#[derive(Debug, Deserialize)]
+pub struct MaintenanceQuery {
+    /// The owner's local day, `YYYY-MM-DD`.
+    date: String,
+}
+
+async fn api_questions_maintenance(
+    State(state): State<AppState>,
+    Query(query): Query<MaintenanceQuery>,
+) -> Response {
+    let day = match parse_day(&query.date) {
+        Ok(day) => day,
+        Err(e) => return bad_request(e),
+    };
+    let outcome = tokio::task::spawn_blocking(move || maintenance_payload(&state, day)).await;
+    match outcome {
+        Ok(Ok(payload)) => json_response(StatusCode::OK, payload),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(format!("maintenance task failed: {e}")),
+    }
+}
+
+/// The one-off debris cleanup (issue #66): apply the regeneration's
+/// supersession rule to existing rows - close the day's open questions
+/// whose span is zero-length or fully covered by the day's CURRENT drafts
+/// (approved or new; superseded draft history never covers anything).
+/// Idempotent: closed questions are no longer open, so re-running closes
+/// nothing.
+fn maintenance_payload(state: &AppState, day: NaiveDate) -> Result<Value, CoreError> {
+    let drafts: Vec<DraftActivity> = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| CoreError::Config("database lock poisoned".to_string()))?;
+        let (from, to) = local_day_bounds(day)?;
+        let rows =
+            db.query_event_rows_in(Some(BUCKET_TIMESHEET_DRAFT), None, Some(&from), Some(&to))?;
+        rows.iter()
+            .filter(|row| row_in_day(row, day))
+            .filter_map(current_draft_from_row)
+            .collect()
+    };
+    let day_str = day.format("%Y-%m-%d").to_string();
+    let store = state
+        .ts_questions
+        .lock()
+        .map_err(|_| CoreError::Config("question store lock poisoned".to_string()))?;
+    let open: Vec<TsQuestion> = store
+        .list_questions(StatusFilter::Open)?
+        .into_iter()
+        .filter(|q| q.day == day_str)
+        .collect();
+    let superseded = superseded_question_ids(&open, &drafts);
+    let closed = store.supersede_questions(&superseded)?;
+    Ok(json!({
+        "date": day_str,
+        "closed_ids": closed,
+        "open_remaining": open.len() - closed.len(),
+    }))
 }
 
 // --------------------------------- GET /api/timesheet/questions/{id}/evidence/{n}

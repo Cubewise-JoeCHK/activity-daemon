@@ -2,7 +2,8 @@
 //!
 //! Schema (`ts_questions` table, ADR addendum on issue #16):
 //! `id INTEGER PRIMARY KEY, day TEXT NOT NULL, question TEXT NOT NULL,
-//! evidence_json TEXT NOT NULL, status TEXT NOT NULL ('open'|'answered'),
+//! evidence_json TEXT NOT NULL, status TEXT NOT NULL
+//! ('open'|'answered'|'superseded'),
 //! answer TEXT, created_at TEXT NOT NULL, answered_at TEXT`.
 //!
 //! `evidence_json` holds a JSON list of `{frame_path, frame_sha16, ts}`
@@ -15,7 +16,12 @@
 //! WAL, so the hub server can hold both connections without read-write
 //! contention; a busy timeout covers the short write overlaps. Answered
 //! questions keep their evidence (nothing is deleted on answer - the row
-//! only flips `status` and fills `answer`/`answered_at`).
+//! only flips `status` and fills `answer`/`answered_at`). Superseded
+//! questions (issue #66) keep their evidence too: regeneration or the
+//! maintenance endpoint closes them when their span is zero-length
+//! debris or fully covered by the recompiled drafts - `status` flips to
+//! `superseded`, `answered_at` doubles as the closure stamp and
+//! `answer` stays NULL (nobody answered).
 
 use std::path::Path;
 use std::time::Duration;
@@ -36,12 +42,16 @@ pub struct EvidenceFrame {
     pub ts: String,
 }
 
-/// Lifecycle of a question: created `open` by the analysis worker,
-/// flipped to `answered` (with the answer text) by the owner.
+/// Lifecycle of a question: created `open` by the analysis worker or
+/// the compiler, flipped to `answered` (with the answer text) by the
+/// owner, or closed `superseded` (issue #66: zero-length or fully
+/// covered span; `answered_at` is the closure stamp, `answer` stays
+/// NULL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TsQuestionStatus {
     Open,
     Answered,
+    Superseded,
 }
 
 impl TsQuestionStatus {
@@ -49,6 +59,7 @@ impl TsQuestionStatus {
         match self {
             TsQuestionStatus::Open => "open",
             TsQuestionStatus::Answered => "answered",
+            TsQuestionStatus::Superseded => "superseded",
         }
     }
 
@@ -56,6 +67,7 @@ impl TsQuestionStatus {
         match status {
             "open" => Ok(TsQuestionStatus::Open),
             "answered" => Ok(TsQuestionStatus::Answered),
+            "superseded" => Ok(TsQuestionStatus::Superseded),
             other => Err(CoreError::Validation(format!(
                 "unknown question status '{other}' in store"
             ))),
@@ -228,6 +240,28 @@ impl TsQuestionStore {
             return Ok(None);
         }
         self.get_question(id)
+    }
+
+    /// Close open questions as superseded (issue #66): the only write
+    /// regeneration's supersession guard and the maintenance endpoint
+    /// make. Only currently-`open` rows flip - an owner answer wins over
+    /// supersession (never overwritten) - so re-running with the same
+    /// ids is a no-op. `answered_at` carries the closure stamp; `answer`
+    /// stays NULL. Returns the ids actually closed (input order).
+    pub fn supersede_questions(&self, ids: &[i64]) -> Result<Vec<i64>, CoreError> {
+        let mut closed = Vec::with_capacity(ids.len());
+        for id in ids {
+            let updated = self.conn.execute(
+                "UPDATE ts_questions
+                 SET status = 'superseded', answered_at = ?2
+                 WHERE id = ?1 AND status = 'open'",
+                params![id, now_rfc3339()],
+            )?;
+            if updated == 1 {
+                closed.push(*id);
+            }
+        }
+        Ok(closed)
     }
 }
 
@@ -473,5 +507,51 @@ mod tests {
             );
         }
         cleanup(&path);
+    }
+
+    #[test]
+    fn supersede_questions_closes_open_rows_idempotently() {
+        let store = TsQuestionStore::open_in_memory().expect("open");
+        let debris = create_at(&store, "2026-11-06", "debris");
+        let grey = create_at(&store, "2026-11-06", "grey");
+        let answered = create_at(&store, "2026-11-06", "answered");
+        store
+            .answer_question(answered, "owner answered")
+            .expect("answer")
+            .expect("answered");
+
+        // Unknown ids are skipped, answered rows are never touched.
+        let closed = store
+            .supersede_questions(&[debris, 999, answered])
+            .expect("supersede");
+        assert_eq!(closed, vec![debris]);
+
+        let status = |id: i64| store.get_question(id).expect("get").expect("exists").status;
+        assert_eq!(status(debris), TsQuestionStatus::Superseded);
+        assert_eq!(status(grey), TsQuestionStatus::Open);
+        assert_eq!(status(answered), TsQuestionStatus::Answered);
+        let closed_row = store.get_question(debris).expect("get").expect("exists");
+        assert_eq!(closed_row.answer, None, "no one answered the debris");
+        assert!(chrono::DateTime::parse_from_rfc3339(
+            closed_row
+                .answered_at
+                .as_deref()
+                .expect("closure stamp set")
+        )
+        .is_ok());
+
+        // Idempotent: an already-closed row no longer matches.
+        assert!(store
+            .supersede_questions(&[debris])
+            .expect("re-run")
+            .is_empty());
+        assert_eq!(
+            store
+                .list_questions(StatusFilter::Open)
+                .expect("open")
+                .len(),
+            1,
+            "only the grey question stays in the open queue"
+        );
     }
 }

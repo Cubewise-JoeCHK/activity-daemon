@@ -51,11 +51,11 @@
 use std::collections::BTreeMap;
 
 use activity_core::{CoreError, Db, EventEnvelope, EventRow};
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{StyleConfig, TimesheetConfig};
-use crate::storage::{EvidenceFrame, TsQuestion, TsQuestionStore};
+use crate::storage::{EvidenceFrame, TsQuestion, TsQuestionStatus, TsQuestionStore};
 
 /// Bucket for draft activities awaiting owner review (ADR addendum on
 /// issue #16; #47 approves them into `timesheet-approved`).
@@ -645,6 +645,167 @@ fn approved_span(row: &EventRow) -> Option<(DateTime<FixedOffset>, DateTime<Fixe
     let ts = row_ts(row)?;
     let end = ts + Duration::milliseconds((row.duration_s * 1000.0).round() as i64);
     Some((ts, end))
+}
+
+// ------------------------------------------- question supersession (issue #66)
+
+/// The span an open question covers, as far as the row itself tells it.
+/// Two producer shapes exist:
+/// - compiler questions: "What were you working on HH:MM-HH:MM (app)?" -
+///   the span lives in the text, local to the question's `day`;
+/// - analysis-worker questions: "What were you working on at <RFC3339>?
+///   (auto-detected: ...)" - a single instant, repeated by every evidence
+///   frame's `ts`.
+///
+/// A question of neither shape (or with nothing parseable) has an
+/// unknown span; the supersession rule never closes it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QuestionSpan {
+    /// Local-day wall-clock span from question text (no offset attached).
+    Text(NaiveTime, NaiveTime),
+    /// Concrete instants (text instant or evidence-frame bounds).
+    Instants(DateTime<FixedOffset>, DateTime<FixedOffset>),
+}
+
+const QUESTION_TEXT_PREFIX: &str = "What were you working on ";
+
+/// Parse a question's text span (see [`QuestionSpan`]).
+fn question_text_span(question: &TsQuestion) -> Option<QuestionSpan> {
+    let rest = question.question.strip_prefix(QUESTION_TEXT_PREFIX)?;
+    if let Some(instant) = rest.strip_prefix("at ") {
+        // Analysis-worker format: the RFC3339 instant runs up to the '?'.
+        let raw = instant.split('?').next()?.trim();
+        let ts = DateTime::parse_from_rfc3339(raw).ok()?;
+        return Some(QuestionSpan::Instants(ts, ts));
+    }
+    // Compiler format: "HH:MM-HH:MM (app)?".
+    let times = rest.split(" (").next()?;
+    let (start, end) = times.split_once('-')?;
+    Some(QuestionSpan::Text(
+        NaiveTime::parse_from_str(start.trim(), "%H:%M").ok()?,
+        NaiveTime::parse_from_str(end.trim(), "%H:%M").ok()?,
+    ))
+}
+
+/// A question's evidence-frame bounds, when every frame ts parses.
+fn question_evidence_span(question: &TsQuestion) -> Option<QuestionSpan> {
+    let mut times = question
+        .evidence
+        .iter()
+        .filter_map(|frame| DateTime::parse_from_rfc3339(&frame.ts).ok());
+    let first = times.next()?;
+    let (mut min, mut max) = (first, first);
+    for ts in times {
+        if ts < min {
+            min = ts;
+        }
+        if ts > max {
+            max = ts;
+        }
+    }
+    Some(QuestionSpan::Instants(min, max))
+}
+
+/// The question's own span: text first, evidence frames as fallback.
+fn question_span(question: &TsQuestion) -> Option<QuestionSpan> {
+    question_text_span(question).or_else(|| question_evidence_span(question))
+}
+
+/// Materialize a text span onto the drafts' own UTC offset (the device's
+/// local wall clock the compiler wrote the times in). `None` when there
+/// are no drafts to borrow the offset from or the day is malformed.
+fn materialize_question_span(
+    span: QuestionSpan,
+    question: &TsQuestion,
+    offset: Option<FixedOffset>,
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    match span {
+        QuestionSpan::Instants(start, end) => Some((start, end)),
+        QuestionSpan::Text(start_time, end_time) => {
+            let offset = offset?;
+            let day = parse_day(&question.day).ok()?;
+            let start = day
+                .and_time(start_time)
+                .and_local_timezone(offset)
+                .earliest()?;
+            let end = day
+                .and_time(end_time)
+                .and_local_timezone(offset)
+                .earliest()?;
+            Some((start, end))
+        }
+    }
+}
+
+/// Is `[start, end)` fully covered by the union of the sorted draft
+/// spans? A zero-length span (an instant) counts as covered when the
+/// instant falls inside some draft.
+fn covered_by_drafts(
+    start: DateTime<FixedOffset>,
+    end: DateTime<FixedOffset>,
+    draft_spans: &[(DateTime<FixedOffset>, DateTime<FixedOffset>)],
+) -> bool {
+    if end <= start {
+        return draft_spans
+            .iter()
+            .any(|(draft_start, draft_end)| *draft_start <= start && start < *draft_end);
+    }
+    let mut cursor = start;
+    for (draft_start, draft_end) in draft_spans {
+        if *draft_end <= cursor {
+            continue; // an earlier draft, already behind the cursor
+        }
+        if *draft_start > cursor {
+            return false; // a gap the drafts never cover
+        }
+        cursor = *draft_end;
+        if cursor >= end {
+            return true;
+        }
+    }
+    false
+}
+
+/// The open questions the recompiled drafts supersede (issue #66). A
+/// question closes when
+/// - its text span is zero-length (the superseded pre-#63 compile's
+///   sub-minute debris - dead by construction, drafts or not), or
+/// - its span is fully covered by the union of the current drafts: the
+///   owner reviews the drafts, not a queue of questions about drafted
+///   time. An evidence-backed instant question closes only through
+///   coverage - a still-grey instant stays askable even though a single
+///   instant is zero-length.
+///
+/// Non-open questions and unknown spans are never returned. Pure; the
+/// caller writes the closures through
+/// `TsQuestionStore::supersede_questions` (the regeneration guard and
+/// the maintenance endpoint share this exact rule).
+pub fn superseded_question_ids(questions: &[TsQuestion], drafts: &[DraftActivity]) -> Vec<i64> {
+    let mut draft_spans: Vec<(DateTime<FixedOffset>, DateTime<FixedOffset>)> = drafts
+        .iter()
+        .filter_map(|activity| {
+            let start = DateTime::parse_from_rfc3339(&activity.start).ok()?;
+            let end = DateTime::parse_from_rfc3339(&activity.end).ok()?;
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    draft_spans.sort();
+    let offset = draft_spans.first().map(|(start, _)| *start.offset());
+
+    questions
+        .iter()
+        .filter(|question| question.status == TsQuestionStatus::Open)
+        .filter(|question| match question_span(question) {
+            // Zero-length compile debris closes regardless of drafts.
+            Some(QuestionSpan::Text(start, end)) if start == end => true,
+            Some(span) => match materialize_question_span(span, question, offset) {
+                Some((start, end)) => covered_by_drafts(start, end, &draft_spans),
+                None => false,
+            },
+            None => false,
+        })
+        .map(|question| question.id)
+        .collect()
 }
 
 /// Compile one day's raw material into a [`DayPlan`] (activities, question
@@ -1831,6 +1992,143 @@ mod tests {
             .collect();
         drafted_ids.sort();
         assert_eq!(drafted_ids, vec![6497, 6516, 6598, 6668]);
+    }
+
+    // --------------------- fixture: question supersession (issue #66)
+
+    /// An open question row without a store round trip (the store path
+    /// is covered in storage and server integration tests).
+    fn open_question(id: i64, question: &str, evidence: &[EvidenceFrame]) -> TsQuestion {
+        TsQuestion {
+            id,
+            day: DAY.to_string(),
+            question: question.to_string(),
+            evidence: evidence.to_vec(),
+            status: TsQuestionStatus::Open,
+            answer: None,
+            created_at: "2026-11-06T20:00:00Z".to_string(),
+            answered_at: None,
+        }
+    }
+
+    fn activity(start: &str, end: &str) -> DraftActivity {
+        DraftActivity {
+            start: start.to_string(),
+            end: end.to_string(),
+            project_guess: "C1234".to_string(),
+            category: "Consulting".to_string(),
+            task: String::new(),
+            comment: String::new(),
+            confidence: 0.9,
+            sources: ActivitySources::default(),
+        }
+    }
+
+    fn instant_frame(ts: &str) -> EvidenceFrame {
+        EvidenceFrame {
+            frame_path: "media/frames/2026/11/06/f.jpg".to_string(),
+            frame_sha16: "aaaabbbbccccdddd".to_string(),
+            ts: ts.to_string(),
+        }
+    }
+
+    #[test]
+    fn zero_length_text_debris_closes_without_drafts() {
+        // The superseded pre-#63 compile's sub-minute questions
+        // ("12:04-12:04 (explorer.exe)" style): zero-length by
+        // construction, dead with or without drafts; a wide grey span
+        // stays askable.
+        let debris = open_question(
+            1,
+            "What were you working on 12:04-12:04 (explorer.exe)?",
+            &[],
+        );
+        let wide = open_question(2, "What were you working on 09:00-10:00 (Code.exe)?", &[]);
+        assert_eq!(superseded_question_ids(&[debris, wide], &[]), vec![1]);
+    }
+
+    #[test]
+    fn wide_text_span_closes_only_when_fully_covered() {
+        let wide = |id| open_question(id, "What were you working on 09:00-10:00 (Code.exe)?", &[]);
+        // Union coverage across two adjacent drafts closes it...
+        let drafts = [
+            activity("2026-11-06T09:00:00+08:00", "2026-11-06T09:30:00+08:00"),
+            activity("2026-11-06T09:30:00+08:00", "2026-11-06T10:00:00+08:00"),
+        ];
+        assert_eq!(superseded_question_ids(&[wide(1)], &drafts), vec![1]);
+        // ...partial coverage does not...
+        let drafts = [activity(
+            "2026-11-06T09:00:00+08:00",
+            "2026-11-06T09:30:00+08:00",
+        )];
+        assert!(superseded_question_ids(&[wide(1)], &drafts).is_empty());
+        // ...and neither does a hole between two drafts.
+        let drafts = [
+            activity("2026-11-06T09:00:00+08:00", "2026-11-06T09:30:00+08:00"),
+            activity("2026-11-06T09:45:00+08:00", "2026-11-06T10:00:00+08:00"),
+        ];
+        assert!(superseded_question_ids(&[wide(1)], &drafts).is_empty());
+        // Fully disjoint drafts leave it open.
+        let drafts = [
+            activity("2026-11-06T08:00:00+08:00", "2026-11-06T08:30:00+08:00"),
+            activity("2026-11-06T11:00:00+08:00", "2026-11-06T12:00:00+08:00"),
+        ];
+        assert!(superseded_question_ids(&[wide(1)], &drafts).is_empty());
+    }
+
+    #[test]
+    fn auto_detected_instant_closes_only_when_covered() {
+        // Analysis-worker hand-off: a real grey instant with real frame
+        // evidence. Zero-length alone must NOT close it - it closes only
+        // once a draft covers the instant (text-parsed or frame-derived,
+        // both shapes agree here).
+        let worker_text = |ts: &str| {
+            format!(
+                "What were you working on at {ts}? \
+                 (auto-detected: Creating a new project in the IDE; confidence 0.30)"
+            )
+        };
+        let covered = open_question(
+            1,
+            &worker_text("2026-11-06T09:15:00+08:00"),
+            &[instant_frame("2026-11-06T09:15:00+08:00")],
+        );
+        let grey = open_question(
+            2,
+            &worker_text("2026-11-06T11:45:00+08:00"),
+            &[instant_frame("2026-11-06T11:45:00+08:00")],
+        );
+        let drafts = [
+            activity("2026-11-06T09:00:00+08:00", "2026-11-06T09:30:00+08:00"),
+            activity("2026-11-06T10:00:00+08:00", "2026-11-06T11:00:00+08:00"),
+        ];
+        assert_eq!(superseded_question_ids(&[covered, grey], &drafts), vec![1]);
+        // Text-only instant (no evidence rows) follows the same rule.
+        let text_only = open_question(3, &worker_text("2026-11-06T09:15:00+08:00"), &[]);
+        assert_eq!(superseded_question_ids(&[text_only], &drafts), vec![3]);
+    }
+
+    #[test]
+    fn unknown_span_and_non_open_questions_never_close() {
+        let drafts = [activity(
+            "2026-11-06T09:00:00+08:00",
+            "2026-11-06T17:00:00+08:00",
+        )];
+        // Neither producer shape, no evidence: unknown span stays open.
+        let mystery = open_question(1, "Why is the sky blue?", &[]);
+        // An owner answer wins over supersession (already answered).
+        let mut answered =
+            open_question(2, "What were you working on 09:00-10:00 (Code.exe)?", &[]);
+        answered.status = TsQuestionStatus::Answered;
+        answered.answer = Some("cube work".to_string());
+        // Already-superseded debris is not reported a second time.
+        let mut closed = open_question(
+            3,
+            "What were you working on 12:04-12:04 (explorer.exe)?",
+            &[],
+        );
+        closed.status = TsQuestionStatus::Superseded;
+        assert!(superseded_question_ids(&[mystery, answered, closed], &drafts).is_empty());
     }
 
     // --------------------------- fixture: regeneration superseding
