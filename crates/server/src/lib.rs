@@ -49,6 +49,18 @@
 //!   into fresh drafts (old drafts marked `superseded_by`), optionally
 //!   consulting Lemonade once for titles/comments (`use_llm_titles`,
 //!   fail-soft to heuristics). Returns the same payload as GET.
+//! - `PUT  /api/timesheet/draft/{id}` - persist an owner edit (project,
+//!   category, task, comment) onto a stored draft and mark it reviewed
+//!   (issue #47).
+//! - `POST /api/timesheet/approve` - approve one draft or the day's
+//!   remaining drafts: a `timesheet-approved` event (draft JSON +
+//!   `approved_at`) plus the approved flag on the source draft (issue #47).
+//! - `GET  /api/timesheet/days?from=&to=` - per-day draft/reviewed/approved
+//!   counts for the review UI's day list (issue #47).
+//! - `GET  /api/timesheet/vocab` - the Cubewise template vocabulary
+//!   (same loader as worker + export) backing the review dropdowns.
+//! - `GET  /api/timesheet/frame/{sha16}?date=` - an analysed frame as JPEG
+//!   bytes, the review rows' evidence thumbnails (issue #47).
 //!
 //! All `/api/timesheet` endpoints follow the open `/api` precedent
 //! (issue #44): the hub is single-owner and tailnet-only, so owner-facing
@@ -81,10 +93,12 @@
 //! crate for the pipeline. It stops with the same shutdown signal as the
 //! HTTP server.
 //!
-//! Web UI (read-only, `web` module): `GET /` serves the embedded Graphite
-//! UI (machine status + behaviour calendar), backed by `GET /api/machines`
-//! and `GET /api/calendar`. `/api` reads follow the `/health` precedent:
-//! open, tailnet-only, no token (writes stay guarded).
+//! Web UI (`web` module + timesheet routes): `GET /` serves the embedded
+//! Graphite UI (machine status, behaviour calendar, timesheet review -
+//! issue #47), backed by `GET /api/machines`, `GET /api/calendar` and the
+//! `/api/timesheet/*` endpoints above. `/api` follows the `/health`
+//! precedent: open, tailnet-only, no token (device-facing `/ingest`
+//! writes stay guarded).
 //!
 //! Retention (issue #38, `retention` module): finished months of raw media
 //! are bundled into `bundles/<YYYY-MM>.tar.zst` once they age beyond the

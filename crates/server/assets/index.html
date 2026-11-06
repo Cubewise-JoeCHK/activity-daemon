@@ -16,6 +16,7 @@
     <symbol id="i-pulse" viewBox="0 0 20 20"><path d="M2 11h3l2-5 3 9 2.5-6 1.5 2h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-cal" viewBox="0 0 20 20"><rect x="2.5" y="4" width="15" height="13.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M2.5 8.5h15M6.5 2.5v3M13.5 2.5v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
     <symbol id="i-sync" viewBox="0 0 20 20"><path d="M16.5 8A6.5 6.5 0 0 0 4.8 6.2M3.5 12a6.5 6.5 0 0 0 11.7 1.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M16.8 3.5v4.5h-4.5M3.2 16.5V12h4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-sheet" viewBox="0 0 20 20"><rect x="3.5" y="2.5" width="13" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6.5 7h7M6.5 10h7M6.5 13h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
   </defs>
 </svg>
 
@@ -41,6 +42,9 @@
       </div>
       <div class="rail-item" id="rail-cal" title="Behaviour calendar (Ctrl+2)">
         <svg><use href="#i-cal"/></svg><span class="lbl">Calendar</span>
+      </div>
+      <div class="rail-item" id="rail-ts" title="Timesheet review (Ctrl+3)">
+        <svg><use href="#i-sheet"/></svg><span class="lbl">Timesheet</span>
       </div>
       <div class="rail-bottom">
         <div class="rail-avatar" title="single-owner hub">JC<span class="presence"></span></div>
@@ -107,6 +111,47 @@
           <div class="cal-grid-wrap" id="week-grid"><div class="empty">Loading…</div></div>
         </div>
       </main>
+    </section>
+
+    <!-- ================= VIEW: TIMESHEET REVIEW ================= -->
+    <section class="view" id="view-ts">
+      <aside class="pane">
+        <div class="pane-head"><h1>Timesheet</h1></div>
+        <div class="ts-month">
+          <button class="icon-btn sm" id="ts-month-prev" title="Previous month"><svg><use href="#i-chevl"/></svg></button>
+          <b id="ts-month-label">…</b>
+          <button class="icon-btn sm" id="ts-month-next" title="Next month"><svg><use href="#i-chevr"/></svg></button>
+        </div>
+        <div class="list" id="ts-days"><div class="empty">Loading…</div></div>
+        <div class="ts-export">
+          <div class="ts-export-title">Export month (xlsx)</div>
+          <div class="ts-export-row">
+            <input type="month" id="ts-export-month" aria-label="export month">
+            <button class="seg-btn" id="ts-export-btn" disabled title="Download the month's approved activities">Download</button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="chat-head">
+          <div class="chat-title">
+            <b id="ts-day-title">…</b>
+            <span id="ts-day-sub"></span>
+          </div>
+          <div class="tools">
+            <button class="seg-btn" id="ts-approve-all" title="Approve every remaining draft of this day">Approve all</button>
+            <button class="icon-btn" id="ts-refresh" title="Refresh"><svg><use href="#i-sync"/></svg></button>
+          </div>
+        </div>
+        <div class="chat-scroll" id="ts-rows"><div class="empty">Loading…</div></div>
+      </main>
+
+      <aside class="profile" id="ts-side">
+        <div class="pf-section">Open questions</div>
+        <div id="ts-questions"><div class="hint">Loading…</div></div>
+        <div class="pf-section">Owner style</div>
+        <div id="ts-style"><div class="hint">Loading…</div></div>
+      </aside>
     </section>
   </div>
 </div>

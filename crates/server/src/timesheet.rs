@@ -34,11 +34,41 @@
 //!   `superseded_by`); optionally one Lemonade call titles/comments the
 //!   blocks (`use_llm_titles`, fail-soft to heuristics).
 //!
-//! Token policy (issues #44/#45): the answer POST and the draft POST
-//! follow the same open precedent as the other `/api` reads (crate docs,
-//! `/health` precedent) - the hub is single-owner and never proxied
-//! outside the tailnet, so owner-facing `/api` stays open while
-//! device-facing `/ingest` writes keep their token guard.
+//! Owner review (issue #47):
+//! - `GET /api/timesheet/vocab` - the Cubewise template vocabulary
+//!   (categories + projects), loaded through the same `CubewiseVocab`
+//!   loader as the worker and the export - one source of truth for what
+//!   the review UI's dropdowns offer.
+//! - `GET /api/timesheet/days?from=YYYY-MM-DD&to=YYYY-MM-DD` - per-day
+//!   counts of current drafts by review state (draft / reviewed /
+//!   approved) for the day list. Approved drafts keep their draft row
+//!   (flag, not tombstone), so one bucket query covers all three states.
+//! - `PUT /api/timesheet/draft/{id}` - persist an owner edit (project,
+//!   category, task, comment) onto the stored draft and mark it
+//!   `reviewed`. Saved edits live on the draft, not in the approve call:
+//!   the review UI saves and approves as two separate actions, and the
+//!   approved event stays an exact copy of the stored draft plus
+//!   `approved_at`.
+//! - `POST /api/timesheet/approve` - body
+//!   `{"date": "YYYY-MM-DD", "draft_id": 42?}`; approves one draft or all
+//!   remaining drafts of the day: inserts a `timesheet-approved` event
+//!   (the draft JSON verbatim plus `approved_at`, ADR addendum on #16)
+//!   through the normal core insert, then marks the source draft approved
+//!   via data fields (`approved`, `approved_at`, `approved_event_id`).
+//!   Already-approved drafts are skipped idempotently. The approved event
+//!   is written before the flag - a crash between the two costs a visible
+//!   duplicate in the worst case, never a silently missing activity.
+//! - `GET /api/timesheet/frame/{sha16}?date=YYYY-MM-DD` - the analysed
+//!   frame with that content-hash prefix as JPEG bytes (the review rows'
+//!   evidence thumbnails; same media-root resolution rules as the
+//!   question evidence endpoint).
+//!
+//! Token policy (issues #44/#45/#47): the owner review writes (answer,
+//! draft regenerate/edit, approve) follow the same open precedent as the
+//! other `/api` reads (crate docs, `/health` precedent) - the hub is
+//! single-owner and never proxied outside the tailnet, so owner-facing
+//! `/api` stays open while device-facing `/ingest` writes keep their
+//! token guard.
 //!
 //! All storage and file work runs on `spawn_blocking`, exactly like the
 //! `/api/machines` and `/ingest` handlers. `GET /health` is untouched.
@@ -46,16 +76,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use activity_core::{CoreError, BUCKET_AFK, BUCKET_WINDOW};
+use activity_core::{CoreError, Db, EventRow, BUCKET_AFK, BUCKET_WINDOW};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{Local, NaiveDate, SecondsFormat, TimeZone, Utc};
 use refiner_timesheet::{
-    current_draft_from_row, export_month_bytes, parse_day, parse_month, plan_day, store_day,
-    BlockTitler, DayInput, HeuristicTitler, LemonadeTitler, StatusFilter, TimesheetConfig,
+    export_month_bytes, parse_day, parse_month, plan_day, store_day, BlockTitler, CubewiseVocab,
+    DayInput, DraftActivity, HeuristicTitler, LemonadeTitler, StatusFilter, TimesheetConfig,
     TsQuestion, TsQuestionStore, BUCKET_FRAME_ANALYSIS, BUCKET_TIMESHEET_APPROVED,
     BUCKET_TIMESHEET_DRAFT,
 };
@@ -64,9 +94,9 @@ use serde_json::{json, Value};
 
 use crate::{bad_request, internal_error, json_response, valid_component, AppState};
 
-/// Routes for the question queue, the month-end export and the daily
-/// itinerary drafts (merged into `build_router`, unguarded - see the token
-/// policy note in the module docs).
+/// Routes for the question queue, the month-end export, the daily
+/// itinerary drafts and the owner review loop (merged into `build_router`,
+/// unguarded - see the token policy note in the module docs).
 pub fn timesheet_router() -> Router<AppState> {
     Router::new()
         .route("/api/timesheet/questions", get(api_list_questions))
@@ -83,6 +113,11 @@ pub fn timesheet_router() -> Router<AppState> {
             "/api/timesheet/draft",
             get(api_get_draft).post(api_post_draft),
         )
+        .route("/api/timesheet/draft/{id}", put(api_edit_draft))
+        .route("/api/timesheet/approve", post(api_approve))
+        .route("/api/timesheet/days", get(api_days))
+        .route("/api/timesheet/vocab", get(api_vocab))
+        .route("/api/timesheet/frame/{sha}", get(api_frame))
 }
 
 // ------------------------------------- GET/POST /api/timesheet/draft
@@ -195,28 +230,28 @@ fn draft_payload(state: &AppState, day: NaiveDate) -> Result<Value, CoreError> {
     let mut drafts = Vec::new();
     let mut latest_batch: Option<String> = None;
     for row in &rows {
-        if !row_in_day(row, day) {
+        if !row_in_day(row, day) || !is_current_draft(row) {
             continue;
         }
-        let Some(activity) = current_draft_from_row(row) else {
+        let Ok(mut payload) = serde_json::from_str::<Value>(&row.data) else {
             continue;
         };
-        let batch: Option<String> =
-            serde_json::from_str::<Value>(&row.data)
-                .ok()
-                .and_then(|data| {
-                    data.get("batch")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
-        if let Some(batch) = &batch {
-            if latest_batch.as_ref().is_none_or(|latest| batch > latest) {
-                latest_batch = Some(batch.clone());
+        // The stored payload IS the response shape (activity fields + the
+        // `batch` stamp + the review flags the UI renders); only the row id
+        // is added. The activity parse guards the shape: a JSON object that
+        // is not one of our drafts stays hidden, exactly like before.
+        if serde_json::from_value::<DraftActivity>(payload.clone()).is_err() {
+            continue;
+        }
+        if let Some(batch) = payload.get("batch").and_then(Value::as_str) {
+            if latest_batch
+                .as_ref()
+                .is_none_or(|latest| batch > latest.as_str())
+            {
+                latest_batch = Some(batch.to_string());
             }
         }
-        let mut payload = serde_json::to_value(&activity)?;
         payload["id"] = json!(row.id);
-        payload["batch"] = batch.map(Value::String).unwrap_or(Value::Null);
         drafts.push(payload);
     }
     Ok(json!({
@@ -534,6 +569,483 @@ fn export_payload(
         db.query_events(BUCKET_TIMESHEET_APPROVED, None, None)?
     };
     export_month_bytes(&events, year, month, vocab_path.as_deref())
+}
+
+// --------------------------------------------------------- shared review helpers
+
+/// `true` when the row's payload is a JSON object without the supersession
+/// marker - the rows the review UI lists, counts and approves (superseded
+/// and malformed rows are invisible, same rule as `current_draft_from_row`).
+fn is_current_draft(row: &EventRow) -> bool {
+    serde_json::from_str::<Value>(&row.data)
+        .ok()
+        .and_then(|data| {
+            data.as_object()
+                .map(|obj| !obj.contains_key("superseded_by"))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a draft row carries the approved flag (the review state wins
+/// over everything else).
+fn row_approved(data: &Value) -> bool {
+    data.get("approved")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Current UTC time, RFC3339 with milliseconds - the same stamp convention
+/// as the question store and the compiler's batch ids.
+fn now_stamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Failure modes of the review write endpoints (draft edit, approve),
+/// mapped to status codes at the handler boundary.
+enum ReviewError {
+    /// 404: unknown draft id (or no such current draft on the day).
+    NotFound(String),
+    /// 409: the draft moved on (superseded by a regeneration, or already
+    /// approved) - the stored state wins over the stale request.
+    Conflict(String),
+    /// 500: storage failure.
+    Storage(CoreError),
+}
+
+impl From<CoreError> for ReviewError {
+    fn from(e: CoreError) -> ReviewError {
+        ReviewError::Storage(e)
+    }
+}
+
+fn review_error_response(e: ReviewError) -> Response {
+    match e {
+        ReviewError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+        ReviewError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+        ReviewError::Storage(e) => internal_error(e),
+    }
+}
+
+/// The day's current draft rows (superseded and malformed ones excluded),
+/// ascending by start instant.
+fn current_day_draft_rows(db: &Db, day: NaiveDate) -> Result<Vec<EventRow>, CoreError> {
+    let (from, to) = local_day_bounds(day)?;
+    let rows =
+        db.query_event_rows_in(Some(BUCKET_TIMESHEET_DRAFT), None, Some(&from), Some(&to))?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| row_in_day(row, day) && is_current_draft(row))
+        .collect())
+}
+
+// ---------------------------------------------------- PUT /api/timesheet/draft/{id}
+
+/// An owner edit on a stored draft: the four fields the review UI lets the
+/// owner change (the row's start/end, confidence and evidence sources are
+/// compiler facts and stay untouched).
+#[derive(Debug, Deserialize)]
+pub struct DraftEditBody {
+    project_guess: String,
+    category: String,
+    task: String,
+    comment: String,
+}
+
+async fn api_edit_draft(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+    axum::Json(body): axum::Json<DraftEditBody>,
+) -> Response {
+    let project = body.project_guess.trim().to_string();
+    let category = body.category.trim().to_string();
+    let task = body.task.trim().to_string();
+    if project.is_empty() || category.is_empty() || task.is_empty() {
+        return bad_request("project_guess, category and task must be non-empty");
+    }
+    let edits = (project, category, task, body.comment.trim().to_string());
+    let outcome = tokio::task::spawn_blocking(move || edit_draft_payload(&state, id, edits)).await;
+    match outcome {
+        Ok(Ok(payload)) => json_response(StatusCode::OK, payload),
+        Ok(Err(e)) => review_error_response(e),
+        Err(e) => internal_error(format!("draft edit task failed: {e}")),
+    }
+}
+
+/// Persist the edit onto the draft row in place and mark it `reviewed`.
+/// The approved flow reads the draft as stored - that is the documented
+/// saved-edits decision (issue #47): edits live on the draft, so Save and
+/// Approve are two independent actions and the approved event is always an
+/// exact copy of what the owner saw when approving.
+fn edit_draft_payload(
+    state: &AppState,
+    id: i64,
+    edits: (String, String, String, String),
+) -> Result<Value, ReviewError> {
+    let (project, category, task, comment) = edits;
+    let db = state.db.lock().map_err(|_| {
+        ReviewError::Storage(CoreError::Config("database lock poisoned".to_string()))
+    })?;
+    let rows = db
+        .query_event_rows_in(Some(BUCKET_TIMESHEET_DRAFT), None, None, None)
+        .map_err(ReviewError::Storage)?;
+    let row = rows
+        .into_iter()
+        .find(|row| row.id == id)
+        .ok_or_else(|| ReviewError::NotFound(format!("no draft {id}")))?;
+    let mut data: Value = serde_json::from_str(&row.data)
+        .map_err(CoreError::from)
+        .map_err(ReviewError::Storage)?;
+    if data.get("superseded_by").is_some() {
+        return Err(ReviewError::Conflict(format!(
+            "draft {id} is superseded by a regeneration"
+        )));
+    }
+    if row_approved(&data) {
+        return Err(ReviewError::Conflict(format!(
+            "draft {id} is already approved"
+        )));
+    }
+    data["project_guess"] = json!(project);
+    data["category"] = json!(category);
+    data["task"] = json!(task);
+    data["comment"] = json!(comment);
+    data["reviewed"] = json!(true);
+    data["reviewed_at"] = json!(now_stamp());
+    db.update_event_data(id, &data.to_string())
+        .map_err(ReviewError::Storage)?;
+    data["id"] = json!(id);
+    Ok(data)
+}
+
+// -------------------------------------------------- POST /api/timesheet/approve
+
+#[derive(Debug, Deserialize)]
+pub struct ApproveBody {
+    /// The owner's local day, `YYYY-MM-DD`; approves the day's remaining
+    /// unapproved drafts (or only `draft_id` when given).
+    date: String,
+    /// Approve exactly this draft instead of the whole day.
+    draft_id: Option<i64>,
+}
+
+async fn api_approve(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<ApproveBody>,
+) -> Response {
+    let day = match parse_day(&body.date) {
+        Ok(day) => day,
+        Err(e) => return bad_request(e),
+    };
+    let draft_id = body.draft_id;
+    let outcome = tokio::task::spawn_blocking(move || approve_payload(&state, day, draft_id)).await;
+    match outcome {
+        Ok(Ok(payload)) => json_response(StatusCode::OK, payload),
+        Ok(Err(e)) => review_error_response(e),
+        Err(e) => internal_error(format!("approve task failed: {e}")),
+    }
+}
+
+/// Approve one draft (or every remaining draft of the day): insert the
+/// `timesheet-approved` event - the draft JSON verbatim plus `approved_at`,
+/// same timestamp/duration/device as the draft row (ADR addendum on #16:
+/// "same JSON shape as drafts plus approved_at") - then flag the draft.
+/// Approving an already-approved draft is an idempotent no-op, reported in
+/// `already_approved_ids`.
+fn approve_payload(
+    state: &AppState,
+    day: NaiveDate,
+    draft_id: Option<i64>,
+) -> Result<Value, ReviewError> {
+    let db = state.db.lock().map_err(|_| {
+        ReviewError::Storage(CoreError::Config("database lock poisoned".to_string()))
+    })?;
+    let rows = current_day_draft_rows(&db, day)?;
+    let mut targets: Vec<EventRow> = Vec::new();
+    let mut already_approved_ids: Vec<i64> = Vec::new();
+    match draft_id {
+        Some(id) => match rows.into_iter().find(|row| row.id == id) {
+            Some(row) => {
+                if row_approved(&draft_data(&row)?) {
+                    already_approved_ids.push(id);
+                } else {
+                    targets.push(row);
+                }
+            }
+            None => {
+                return Err(ReviewError::NotFound(format!(
+                    "no current draft {id} on {day}"
+                )));
+            }
+        },
+        None => {
+            for row in rows {
+                if row_approved(&draft_data(&row)?) {
+                    already_approved_ids.push(row.id);
+                } else {
+                    targets.push(row);
+                }
+            }
+        }
+    }
+    let stamp = now_stamp();
+    let mut approved_ids = Vec::with_capacity(targets.len());
+    for row in &targets {
+        let mut data = draft_data(row)?;
+        data["approved_at"] = json!(stamp);
+        // Approved event first, flag second: a crash between the two writes
+        // costs a visible duplicate on re-approve, never a silently missing
+        // activity in the export.
+        let envelope = activity_core::EventEnvelope {
+            bucket: BUCKET_TIMESHEET_APPROVED.to_string(),
+            timestamp: row.ts_start.clone(),
+            duration_s: row.duration_s,
+            data: data.clone(),
+        };
+        let approved_id = db.insert_event(&envelope, &row.device)?;
+        db.mark_synced(&[approved_id])?;
+        data["approved"] = json!(true);
+        data["approved_event_id"] = json!(approved_id);
+        db.update_event_data(row.id, &data.to_string())?;
+        approved_ids.push(row.id);
+    }
+    Ok(json!({
+        "day": day.format("%Y-%m-%d").to_string(),
+        "approved": approved_ids.len(),
+        "approved_ids": approved_ids,
+        "already_approved_ids": already_approved_ids,
+    }))
+}
+
+/// A draft row's payload as a JSON value (storage failures carried as
+/// [`ReviewError::Storage`]).
+fn draft_data(row: &EventRow) -> Result<Value, ReviewError> {
+    serde_json::from_str(&row.data)
+        .map_err(CoreError::from)
+        .map_err(ReviewError::Storage)
+}
+
+// ----------------------------------------------------- GET /api/timesheet/days
+
+/// Maximum day-list range (the UI navigates one month at a time; the cap
+/// mirrors the calendar's bounded-range rule).
+const DAY_RANGE_MAX_DAYS: i64 = 62;
+
+#[derive(Debug, Deserialize)]
+pub struct DaysQuery {
+    /// Range start, `YYYY-MM-DD` (inclusive).
+    from: String,
+    /// Range end, `YYYY-MM-DD` (inclusive).
+    to: String,
+}
+
+/// Per-day review-state counts for the day list (issue #47): current
+/// drafts only, counted by state - `draft` (untouched), `reviewed` (owner
+/// edited it), `approved`. Days without current drafts are absent.
+async fn api_days(State(state): State<AppState>, Query(query): Query<DaysQuery>) -> Response {
+    let from = match parse_day(&query.from) {
+        Ok(day) => day,
+        Err(e) => return bad_request(e),
+    };
+    let to = match parse_day(&query.to) {
+        Ok(day) => day,
+        Err(e) => return bad_request(e),
+    };
+    if to < from {
+        return bad_request("from must not be after to");
+    }
+    if (to - from).num_days() + 1 > DAY_RANGE_MAX_DAYS {
+        return bad_request(format!("range too long (max {DAY_RANGE_MAX_DAYS} days)"));
+    }
+    let outcome = tokio::task::spawn_blocking(move || days_payload(&state, from, to)).await;
+    match outcome {
+        Ok(Ok(payload)) => json_response(StatusCode::OK, payload),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(format!("days task failed: {e}")),
+    }
+}
+
+fn days_payload(state: &AppState, from: NaiveDate, to: NaiveDate) -> Result<Value, CoreError> {
+    let range_start = local_day_bounds(from)?.0;
+    let range_end = local_day_bounds(to)?.1;
+    let rows = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| CoreError::Config("database lock poisoned".to_string()))?;
+        db.query_event_rows_in(
+            Some(BUCKET_TIMESHEET_DRAFT),
+            None,
+            Some(&range_start),
+            Some(&range_end),
+        )?
+    };
+    // (draft, reviewed, approved) per day, keyed by the row's own local
+    // date so a differently-offset device still lands on its own day.
+    let mut counts: std::collections::BTreeMap<NaiveDate, (u32, u32, u32)> =
+        std::collections::BTreeMap::new();
+    for row in &rows {
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&row.ts_start) else {
+            continue;
+        };
+        let day = ts.date_naive();
+        if day < from || day > to {
+            continue;
+        }
+        let Ok(data) = serde_json::from_str::<Value>(&row.data) else {
+            continue;
+        };
+        if data.get("superseded_by").is_some() {
+            continue;
+        }
+        let entry = counts.entry(day).or_default();
+        if row_approved(&data) {
+            entry.2 += 1;
+        } else if data
+            .get("reviewed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            entry.1 += 1;
+        } else {
+            entry.0 += 1;
+        }
+    }
+    let days: Vec<Value> = counts
+        .into_iter()
+        .map(|(day, (draft, reviewed, approved))| {
+            json!({
+                "day": day.format("%Y-%m-%d").to_string(),
+                "draft": draft,
+                "reviewed": reviewed,
+                "approved": approved,
+            })
+        })
+        .collect();
+    Ok(json!({ "days": days }))
+}
+
+// ----------------------------------------------------- GET /api/timesheet/vocab
+
+/// Dropdown source for the review rows: the exact template strings the
+/// export accepts, from the same vocabulary loader as the worker and the
+/// export (embedded seed or `[timesheet] vocab_path` override) - one
+/// source of truth, so an approved row can always round-trip the export.
+async fn api_vocab(State(state): State<AppState>) -> Response {
+    let vocab_path = state.timesheet.vocab_path.clone();
+    let outcome = tokio::task::spawn_blocking(move || vocab_payload(vocab_path.as_deref())).await;
+    match outcome {
+        Ok(Ok(payload)) => json_response(StatusCode::OK, payload),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(format!("vocab task failed: {e}")),
+    }
+}
+
+fn vocab_payload(vocab_path: Option<&Path>) -> Result<Value, CoreError> {
+    let vocab = CubewiseVocab::load(vocab_path)?;
+    Ok(json!({
+        "categories": vocab.categories,
+        "projects": vocab.projects,
+    }))
+}
+
+// ------------------------------------------------ GET /api/timesheet/frame/{sha}
+
+#[derive(Debug, Deserialize)]
+pub struct FrameQuery {
+    /// The owner's local day whose analyses to search, `YYYY-MM-DD`.
+    date: String,
+}
+
+/// A frame evidence key: exactly 16 hex characters (the watcher-screen
+/// dedup prefix). Doubles as the route segment's path-safety check.
+fn valid_sha16(sha: &str) -> bool {
+    sha.len() == 16 && sha.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The analysed frame with content-hash prefix `sha` as JPEG bytes: the
+/// evidence thumbnails of the review rows. The day narrows the search to
+/// that day's `frame-analysis` rows (the draft's sources reference frames
+/// of its own day); the stored path resolves against the media root under
+/// the same component rules as the question evidence endpoint.
+async fn api_frame(
+    State(state): State<AppState>,
+    AxumPath(sha): AxumPath<String>,
+    Query(query): Query<FrameQuery>,
+) -> Response {
+    if !valid_sha16(&sha) {
+        return bad_request("sha must be 16 hex characters");
+    }
+    let day = match parse_day(&query.date) {
+        Ok(day) => day,
+        Err(e) => return bad_request(e),
+    };
+    let sha = sha.to_ascii_lowercase();
+    let db = state.db.clone();
+    let media_dir = state.media_dir.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || frame_bytes(&db, &media_dir, day, &sha)).await;
+    match outcome {
+        // join error | storage error | the 404 cases (already a Response)
+        Ok(Ok(Ok(bytes))) => ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
+        Ok(Ok(Err(not_found))) => not_found,
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(format!("frame task failed: {e}")),
+    }
+}
+
+/// Same split as [`evidence_frame_bytes`]: outer `Err` = storage failure,
+/// inner `Err` = an already-built 404 for everything that simply does not
+/// exist (no such analysis that day, path outside the media convention,
+/// missing file).
+fn frame_bytes(
+    db: &Arc<Mutex<Db>>,
+    media_dir: &Path,
+    day: NaiveDate,
+    sha: &str,
+) -> Result<Result<Vec<u8>, Response>, CoreError> {
+    let not_found = |msg: String| -> Response { (StatusCode::NOT_FOUND, msg).into_response() };
+    let (from, to) = local_day_bounds(day)?;
+    let rows = {
+        let db = db
+            .lock()
+            .map_err(|_| CoreError::Config("database lock poisoned".to_string()))?;
+        db.query_event_rows_in(Some(BUCKET_FRAME_ANALYSIS), None, Some(&from), Some(&to))?
+    };
+    let mut frame_path: Option<String> = None;
+    for row in &rows {
+        if !row_in_day(row, day) {
+            continue;
+        }
+        let Ok(data) = serde_json::from_str::<Value>(&row.data) else {
+            continue;
+        };
+        if data.get("frame_sha16").and_then(Value::as_str) == Some(sha) {
+            frame_path = data
+                .get("frame_path")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            break;
+        }
+    }
+    let Some(frame_path) = frame_path else {
+        return Ok(Err(not_found(format!("no frame analysis {sha} on {day}"))));
+    };
+    let path = match resolve_frame_path(media_dir, &frame_path) {
+        Some(path) => path,
+        None => {
+            return Ok(Err(not_found(format!(
+                "frame path '{}' is not a media-relative path",
+                frame_path
+            ))))
+        }
+    };
+    Ok(match std::fs::read(&path) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => Err(not_found(format!(
+            "frame '{}' not found on disk",
+            frame_path
+        ))),
+    })
 }
 
 #[cfg(test)]
