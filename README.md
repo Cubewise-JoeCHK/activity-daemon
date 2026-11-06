@@ -60,10 +60,10 @@ First `run` creates a fully commented config template with defaults at
   hub-unreachable periods), `heartbeat` (liveness, rewritten every 5 s),
   `daemon.lock` (single instance), `daemon.log` (+ `logs\audio.log`). The
   hub holds raw media hot for 365 days as monthly `tar.zst` bundles, then
-  the bundles move to MinIO (`blob.joechowhk.internal`, inside the tailnet)
-  as the permanent tier (v1.2 target lifecycle; see the `[retention]`
-  runbook in docs/sync.md). Stop with Ctrl+C; the window watcher flushes
-  its open session.
+  the bundles move to MinIO (`blob.joechowhk.internal`) as the permanent
+  tier (v1.2 lifecycle, implemented in #38/#39; see the `[retention]` /
+  `[retention.minio]` runbook in docs/sync.md). Stop with Ctrl+C; the
+  window watcher flushes its open session.
 - **Multi-monitor**: `screen.monitors` picks what the frame watcher
   captures - `all` (default, one frame per connected monitor) or
   `primary` (the v0.1 behavior). Frame files carry their monitor in the

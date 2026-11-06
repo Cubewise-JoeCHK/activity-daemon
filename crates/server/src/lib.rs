@@ -74,8 +74,12 @@
 //! are bundled into `bundles/<YYYY-MM>.tar.zst` once they age beyond the
 //! hot window (`[retention]` in the server config file, disabled by
 //! default); `GET /api/retention` reports the stats the client's
-//! `status --json` surfaces.
+//! `status --json` surfaces. Stage 2 (issue #39, `minio` module) moves
+//! verified bundles to the MinIO permanent tier
+//! (`blob.joechowhk.internal`) and deletes the hub copy only after a
+//! verified round trip; nothing is ever deleted from MinIO.
 
+pub mod minio;
 pub mod retention;
 pub mod timesheet;
 pub mod web;

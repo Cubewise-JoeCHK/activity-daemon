@@ -8,8 +8,10 @@
 //! | `ACTIVITY_DB`     | `./data/activity.db`    | central SQLite store          |
 //! | `ACTIVITY_DATA`   | `./data`                | media root (`$DATA/media`)    |
 //! | `ACTIVITY_TOKEN`  | unset                   | require `X-Activity-Token`    |
-//! | `ACTIVITY_CONFIG` | `$ACTIVITY_DATA/config.toml` | server config (`[retention]`, `[timesheet]`) |
+//! | `ACTIVITY_CONFIG` | `$ACTIVITY_DATA/config.toml` | server config (`[retention]`, `[retention.minio]`, `[timesheet]`) |
 //! | `RUST_LOG`        | `info`                  | log filter for library logs (env_logger) |
+//! | `ACTIVITY_MINIO_ACCESS_KEY` | unset         | MinIO tier access key (#39)   |
+//! | `ACTIVITY_MINIO_SECRET_KEY` | unset         | MinIO tier secret key (#39)   |
 //!
 //! Flags: `--version` (print and exit), `--dry-run` (print the retention
 //! action plan for the store and exit - nothing is written or deleted,
@@ -21,6 +23,7 @@ use std::time::Duration;
 
 use chrono::Local;
 use refiner_timesheet::{TimesheetConfig, WorkerContext};
+use server::minio::{self, MinioTier};
 use server::retention::{self, RetentionStore};
 use server::{AppState, AuthConfig};
 
@@ -167,8 +170,16 @@ fn main() {
         // then a daily tick. Disabled by default; nothing is scheduled
         // until the owner opts in via the config file.
         if server_config.retention.enabled {
+            let move_note = if server_config.retention.minio.enabled {
+                format!(
+                    ", minio tier s3://{} ({})",
+                    server_config.retention.minio.bucket, server_config.retention.minio.endpoint
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "retention: enabled (hot_days {}, bundle monthly) - daily sweeper scheduled",
+                "retention: enabled (hot_days {}, bundle monthly{move_note}) - daily sweeper scheduled",
                 server_config.retention.hot_days
             );
             tokio::spawn(retention_tick(store, server_config.retention));
@@ -211,6 +222,10 @@ fn main() {
 /// Daily retention sweeper: run one pass now (blocking fs work on the
 /// blocking pool), log the outcome, then wait 24 h. Each pass is
 /// idempotent and crash-safe; failures keep the raw files and retry on
+/// the next tick. When the MinIO tier is configured (issue #39), a move
+/// pass follows the bundling pass: verified bundles upload to the
+/// permanent tier, the round trip verifies, and only then is the hub
+/// copy removed. Upload failures keep the hub-local bundle and retry on
 /// the next tick.
 async fn retention_tick(store: RetentionStore, cfg: retention::RetentionConfig) {
     loop {
@@ -227,6 +242,26 @@ async fn retention_tick(store: RetentionStore, cfg: retention::RetentionConfig) 
         for line in report.log_lines() {
             println!("{line}");
         }
+
+        // MinIO permanent tier (issue #39): stage 2 of the same tick.
+        if cfg.minio.enabled {
+            match MinioTier::from_config(&cfg.minio) {
+                Ok(tier) => {
+                    let report =
+                        minio::move_pass(&store, &cfg, &tier, Local::now().date_naive()).await;
+                    for line in report.log_lines() {
+                        println!("{line}");
+                    }
+                }
+                Err(reason) => {
+                    // Missing/misconfigured credentials: nothing moves, the
+                    // hub-local bundles stay (fail-safe) and the tick
+                    // retries tomorrow.
+                    println!("{reason} - bundles stay hub-local this tick");
+                }
+            }
+        }
+
         tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
     }
 }
