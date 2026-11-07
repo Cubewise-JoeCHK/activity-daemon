@@ -121,10 +121,11 @@ fn main() {
     // `[timesheet.style]` back into the config the hub started from.
     .with_config_path(config_path);
 
-    // Timesheet frame-analysis worker (issue #43): same store, own tokio
-    // task, stopped by the same shutdown signal as the HTTP server. A
-    // broken vocabulary must not take ingestion down - the worker just
-    // does not start (fail-soft), loudly.
+    // Timesheet frame-analysis worker (issue #43): same SQLite file, its
+    // own dedicated connection (issue #70 - analysis passes must never hold
+    // the API store's lock), own tokio task, stopped by the same shutdown
+    // signal as the HTTP server. A broken vocabulary or store must not take
+    // ingestion down - the worker just does not start (fail-soft), loudly.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker = if server_config.timesheet.enabled {
         match WorkerContext::build(
@@ -132,16 +133,22 @@ fn main() {
             state.ts_questions(),
             server_config.timesheet.clone(),
         ) {
-            Ok(ctx) => {
-                println!(
-                    "timesheet worker: enabled (mode {:?}, max/hour {}, lemonade {} model {})",
-                    server_config.timesheet.sampling_mode,
-                    server_config.timesheet.max_per_hour,
-                    server_config.timesheet.lemonade_base_url,
-                    server_config.timesheet.lemonade_model
-                );
-                Some((state.db_handle(), ctx, shutdown_rx))
-            }
+            Ok(ctx) => match activity_core::Db::open_db(&db_path) {
+                Ok(worker_db) => {
+                    println!(
+                        "timesheet worker: enabled (mode {:?}, max/hour {}, lemonade {} model {})",
+                        server_config.timesheet.sampling_mode,
+                        server_config.timesheet.max_per_hour,
+                        server_config.timesheet.lemonade_base_url,
+                        server_config.timesheet.lemonade_model
+                    );
+                    Some((worker_db, ctx, shutdown_rx))
+                }
+                Err(e) => {
+                    println!("timesheet worker: NOT started (worker store open failed: {e})");
+                    None
+                }
+            },
             Err(e) => {
                 println!("timesheet worker: NOT started ({e})");
                 None

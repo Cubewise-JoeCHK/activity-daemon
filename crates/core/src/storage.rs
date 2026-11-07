@@ -23,6 +23,7 @@
 //! event - the core stores the index, the producer plugin owns the file.
 
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use rusqlite::{params, params_from_iter, Connection};
@@ -226,6 +227,12 @@ impl Db {
 
     fn init(conn: Connection) -> Result<Db> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Multiple connections share the file in production (hub API store,
+        // the timesheet worker's dedicated store, the question store): a
+        // busy timeout turns the rare write overlap into a short wait
+        // instead of a `SQLITE_BUSY` error - the same rule the question
+        // store applies (issue #70).
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY,

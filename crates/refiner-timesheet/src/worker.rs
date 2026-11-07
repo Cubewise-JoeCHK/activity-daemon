@@ -8,6 +8,11 @@
 //! off exponentially (capped at `backoff_max_s`) and retries the same
 //! frame - a dead Lemonade costs analysis, not capture.
 //!
+//! Concurrency (issue #70): the worker owns a dedicated connection to the
+//! hub SQLite file (WAL mode). Analysis passes - including the long
+//! Lemonade vision calls - hold no shared lock, so hub API reads are
+//! never starved behind a running pass.
+//!
 //! Ordering: arrivals are consumed strictly in event-id order; the id of a
 //! row is only passed (and the durable cursor advanced) after its work is
 //! durably done, so crashes and failures re-process that row at least once.
@@ -89,11 +94,17 @@ pub struct BatchOutcome {
 
 /// Run the worker until `shutdown` carries `true`. Returns on graceful
 /// shutdown only; all runtime failures are retried with backoff instead.
-pub async fn run_worker(
-    db: Arc<Mutex<Db>>,
-    ctx: WorkerContext,
-    mut shutdown: watch::Receiver<bool>,
-) {
+///
+/// `db` is the worker's OWN connection to the hub SQLite file (WAL mode,
+/// issue #70): passes take a worker-private mutex that no API path ever
+/// touches, so hub API reads stay responsive while a Lemonade vision call
+/// is in flight. The server opens this connection separately from the API
+/// store; `busy_timeout` covers the rare write overlap between the two.
+pub async fn run_worker(db: Db, ctx: WorkerContext, mut shutdown: watch::Receiver<bool>) {
+    // Worker-private mutex: it exists only to give the !Sync SQLite
+    // connection a Send+Sync home for spawn_blocking. No other thread ever
+    // takes it, so a pass never contends with hub API reads (issue #70).
+    let db = Arc::new(Mutex::new(db));
     let client = LemonadeClient::new(&ctx.cfg);
     let mut sampler = SamplerState::new(ctx.cfg.sampling_mode, ctx.cfg.max_per_hour);
     let mut next_id = match db.lock() {
@@ -106,7 +117,7 @@ pub async fn run_worker(
             }
         },
         Err(_) => {
-            log::error!("timesheet worker: database lock poisoned at startup; worker not started");
+            log::error!("timesheet worker: worker store lock poisoned; worker not started");
             return;
         }
     };
@@ -145,7 +156,7 @@ pub async fn run_worker(
                 Ok(guard) => {
                     process_batch(&guard, &pass_ctx, &pass_client, &mut sampler, &mut next_id)
                 }
-                Err(_) => Err(CoreError::Config("database lock poisoned".to_string())),
+                Err(_) => Err(CoreError::Config("worker store lock poisoned".to_string())),
             };
             (outcome, sampler, next_id)
         })
@@ -1023,27 +1034,32 @@ mod tests {
     async fn run_worker_processes_arrivals_and_stops_on_shutdown() {
         let dir = temp_dir("loop");
         let media_dir = dir.join("media");
-        let db = Arc::new(Mutex::new(Db::open_in_memory().expect("db")));
+        // The production split (issue #70): the worker owns one connection,
+        // the assertions use a second open on the same WAL file.
+        let db_path = dir.join("activity.db");
+        let worker_db = Db::open_db(&db_path).expect("worker db");
         let rel = "media/frames/2026/11/04/090005_MONITOR1_2222222222222222.jpg";
         write_frame_file(&media_dir, rel, b"jpeg");
-        {
-            let guard = db.lock().expect("lock");
-            insert_media_frame(&guard, "2026-11-04T09:00:05+08:00", rel, "2222222222222222");
-        }
+        insert_media_frame(
+            &worker_db,
+            "2026-11-04T09:00:05+08:00",
+            rel,
+            "2222222222222222",
+        );
+        let hub_db = Db::open_db(&db_path).expect("hub db");
 
         let addr = spawn_mock(mock_state(good_content()));
         let ctx = ctx_for(media_dir, format!("http://{addr}/v1"), |cfg| {
             cfg.poll_interval_s = 1;
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let worker = tokio::spawn(run_worker(db.clone(), ctx, shutdown_rx));
+        let worker = tokio::spawn(run_worker(worker_db, ctx, shutdown_rx));
 
         // wait for the analysis to land (poll_interval_s = 1)
         let mut events = Vec::new();
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let guard = db.lock().expect("lock");
-            events = guard
+            events = hub_db
                 .query_events(BUCKET_FRAME_ANALYSIS, None, None)
                 .expect("query");
             if !events.is_empty() {
@@ -1052,15 +1068,73 @@ mod tests {
         }
         assert_eq!(events.len(), 1, "worker must analyse the arrival");
         assert_eq!(events[0].data["frame_path"], rel);
-        {
-            let guard = db.lock().expect("lock");
-            assert!(guard.refiner_cursor(CURSOR_NAME).expect("cursor").is_some());
-        }
+        assert!(hub_db
+            .refiner_cursor(CURSOR_NAME)
+            .expect("cursor")
+            .is_some());
 
         shutdown_tx.send(true).expect("shutdown send");
         tokio::time::timeout(Duration::from_secs(10), worker)
             .await
             .expect("worker must stop on shutdown")
+            .expect("worker task");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// Regression for issue #70: while a Lemonade analysis is in flight
+    /// (the mock stalls 3 s), a read on a second connection - the hub
+    /// API's view - answers immediately. The old shared-mutex design made
+    /// hub reads wait out the whole pass behind that call.
+    #[tokio::test]
+    async fn hub_reads_are_not_blocked_while_an_analysis_is_in_flight() {
+        let dir = temp_dir("nolock");
+        let media_dir = dir.join("media");
+        let db_path = dir.join("activity.db");
+        let worker_db = Db::open_db(&db_path).expect("worker db");
+        let rel = "media/frames/2026/11/04/090005_MONITOR1_3333333333333333.jpg";
+        write_frame_file(&media_dir, rel, b"jpeg");
+        insert_media_frame(
+            &worker_db,
+            "2026-11-04T09:00:05+08:00",
+            rel,
+            "3333333333333333",
+        );
+        let hub_db = Db::open_db(&db_path).expect("hub db");
+
+        let mut state = mock_state(good_content());
+        state.delay_s = 3;
+        let requests = state.requests.clone();
+        let addr = spawn_mock(state);
+        let ctx = ctx_for(media_dir, format!("http://{addr}/v1"), |cfg| {
+            cfg.poll_interval_s = 1;
+        });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run_worker(worker_db, ctx, shutdown_rx));
+
+        // wait until the worker is inside the stalled Lemonade call
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if requests.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "analysis started");
+
+        // the hub API's read answers while the analysis is still running
+        let started = std::time::Instant::now();
+        let events = hub_db
+            .query_events(BUCKET_FRAME_ANALYSIS, None, None)
+            .expect("query");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hub read must not wait behind the in-flight analysis"
+        );
+        assert!(events.is_empty(), "nothing stored yet - still analysing");
+
+        shutdown_tx.send(true).expect("shutdown send");
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("worker must stop")
             .expect("worker task");
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
