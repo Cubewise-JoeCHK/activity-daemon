@@ -699,10 +699,20 @@ fn build_segment(sessions: Vec<&SessionRec>) -> Segment<'_> {
 /// wins, vote ties go to the pair whose nearest-to-midpoint analysis is
 /// nearest (then the earlier analysis; full ties keep the lexicographically
 /// first pair - `votes` iterates a sorted map).
+///
+/// ACTIVE PROJECTS restriction (issue #69): with a non-empty shortlist,
+/// only votes whose implied project is one of the owner's active codes
+/// count. A pool voting exclusively for inactive codes yields no eligible
+/// votes, so the segment stays unclassified (grey) and the usual stretch
+/// question machinery asks the owner; a winning active vote classifies the
+/// segment as a normal draft block (a unanimous single-active vote never
+/// becomes a question). The evidence pool itself is untouched - the
+/// stretch's frames and dedup arms still see every attached analysis.
 fn classify_segment<'a>(
     segment: &Segment,
     analyses: &'a [AnalysisRec],
     window_ms: i64,
+    active_projects: &[String],
 ) -> Classification<'a> {
     let mut pool: Vec<&AnalysisRec> = Vec::new();
     for session in &segment.sessions {
@@ -744,7 +754,21 @@ fn classify_segment<'a>(
     let mut votes: BTreeMap<(String, String), Vec<&AnalysisRec>> = BTreeMap::new();
     for analysis in &pool {
         let (project, category) = classify_labels(Some(analysis));
+        if !active_projects.is_empty() && !active_projects.contains(&project) {
+            continue;
+        }
         votes.entry((project, category)).or_default().push(analysis);
+    }
+    if votes.is_empty() {
+        // Every vote pointed at an inactive code (issue #69): treat the
+        // segment like an evidence-less one - unclassified, never
+        // force-classified to an inactive project.
+        return Classification {
+            project_guess: PROJECT_UNKNOWN.to_string(),
+            category: CATEGORY_UNCLASSIFIED.to_string(),
+            selected: None,
+            pool,
+        };
     }
     let mut winner: Option<((String, String), &'a AnalysisRec)> = None;
     let mut winner_key: Option<(usize, i64, DateTime<FixedOffset>)> = None;
@@ -1335,7 +1359,8 @@ pub fn plan_day(
         let mut grey_pool: Vec<&AnalysisRec> = Vec::new();
         for chunk in split_at_max_block(&run, max_block) {
             let segment = build_segment(chunk);
-            let classification = classify_segment(&segment, &analyses, window_ms);
+            let classification =
+                classify_segment(&segment, &analyses, window_ms, &cfg.active_projects);
             // Rule (c) coverage (issue #68): the segmentation absorbs the
             // segment's sessions' asks whether the vote resolved them
             // (drafted), left them grey below the gate, or found no
@@ -1779,6 +1804,94 @@ mod tests {
 
     fn plan(input: &DayInput) -> DayPlan {
         plan_day(input, &[], &cfg(), &HeuristicTitler)
+    }
+
+    fn plan_with_cfg(input: &DayInput, config: &TimesheetConfig) -> DayPlan {
+        plan_day(input, &[], config, &HeuristicTitler)
+    }
+
+    // ------------------ ACTIVE PROJECTS vote restriction (issue #69)
+
+    #[test]
+    fn votes_only_for_inactive_codes_stay_grey_and_ask() {
+        // The pool votes exclusively for C8888, which is not on the
+        // owner's shortlist: the votes are discarded, the segment stays
+        // unclassified and the normal stretch question asks the owner.
+        // Without a shortlist the same pool classifies normally.
+        let input = input_for(vec![
+            session(1, 9, 0, 3600.0, "Excel.exe"),
+            analysis(10, 9, 30, "C8888", "Support", 0.95),
+        ]);
+        let mut config = cfg();
+        config.active_projects = vec!["C1234".to_string()];
+        let planned = plan_with_cfg(&input, &config);
+        assert!(
+            planned.activities.is_empty(),
+            "no draft may carry an inactive vote's labels"
+        );
+        assert_eq!(planned.questions.len(), 1, "the grey stretch asks");
+        assert!(planned.questions[0]
+            .question
+            .starts_with("What were you working on"));
+
+        let planned_all = plan(&input);
+        assert_eq!(planned_all.activities.len(), 1);
+        assert_eq!(planned_all.questions.len(), 0);
+    }
+
+    #[test]
+    fn unanimous_single_active_vote_classifies_and_never_asks() {
+        let input = input_for(vec![
+            session(1, 9, 0, 3600.0, "Excel.exe"),
+            analysis(10, 9, 30, "C1234", "Consulting", 0.95),
+        ]);
+        let mut config = cfg();
+        config.active_projects = vec!["C1234".to_string(), "C9999".to_string()];
+        let planned = plan_with_cfg(&input, &config);
+        assert_eq!(planned.activities.len(), 1);
+        assert_eq!(planned.activities[0].project_guess, "C1234");
+        assert_eq!(planned.activities[0].category, "Consulting");
+        assert_eq!(
+            planned.questions.len(),
+            0,
+            "a unanimous single-active vote never becomes a question"
+        );
+    }
+
+    #[test]
+    fn mixed_pool_votes_narrow_to_active_codes() {
+        // Three C8888 votes vs two C1234 votes: without the shortlist the
+        // inactive majority wins; with it the inactive votes are discarded
+        // and the active pair carries the block.
+        let base = vec![
+            session(1, 9, 0, 3600.0, "Excel.exe"),
+            analysis(10, 9, 10, "C8888", "QA", 0.95),
+            analysis(11, 9, 20, "C1234", "Consulting", 0.95),
+            analysis(12, 9, 30, "C1234", "Consulting", 0.95),
+            analysis(13, 9, 40, "C8888", "QA", 0.95),
+            analysis(14, 9, 50, "C8888", "QA", 0.95),
+        ];
+        let input = input_for(base);
+
+        let planned_all = plan(&input);
+        assert_eq!(planned_all.activities.len(), 1);
+        assert_eq!(planned_all.activities[0].project_guess, "C8888");
+
+        let input = input_for(vec![
+            session(1, 9, 0, 3600.0, "Excel.exe"),
+            analysis(10, 9, 10, "C8888", "QA", 0.95),
+            analysis(11, 9, 20, "C1234", "Consulting", 0.95),
+            analysis(12, 9, 30, "C1234", "Consulting", 0.95),
+            analysis(13, 9, 40, "C8888", "QA", 0.95),
+            analysis(14, 9, 50, "C8888", "QA", 0.95),
+        ]);
+        let mut config = cfg();
+        config.active_projects = vec!["C1234".to_string()];
+        let planned = plan_with_cfg(&input, &config);
+        assert_eq!(planned.activities.len(), 1);
+        assert_eq!(planned.activities[0].project_guess, "C1234");
+        assert_eq!(planned.activities[0].category, "Consulting");
+        assert_eq!(planned.questions.len(), 0);
     }
 
     fn input_for(rows: Vec<EventRow>) -> DayInput {

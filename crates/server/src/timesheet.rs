@@ -145,6 +145,10 @@ pub fn timesheet_router() -> Router<AppState> {
             post(api_answer_question),
         )
         .route(
+            "/api/timesheet/questions/{id}/skip",
+            post(api_skip_question),
+        )
+        .route(
             "/api/timesheet/questions/maintenance",
             post(api_questions_maintenance),
         )
@@ -156,6 +160,10 @@ pub fn timesheet_router() -> Router<AppState> {
         .route(
             "/api/timesheet/style",
             get(api_get_style).put(api_put_style),
+        )
+        .route(
+            "/api/timesheet/active-projects",
+            get(api_get_active_projects).put(api_put_active_projects),
         )
         .route("/api/timesheet/draft/{id}", put(api_edit_draft))
         .route("/api/timesheet/approve", post(api_approve))
@@ -414,6 +422,9 @@ fn regenerate_payload(
 pub struct QuestionListQuery {
     /// `open` (default) | `answered` | `all`.
     status: Option<String>,
+    /// Optional day narrow, `YYYY-MM-DD` (issue #69: the review panel asks
+    /// for exactly the selected day's questions - no cross-day pile-up).
+    date: Option<String>,
 }
 
 async fn api_list_questions(
@@ -426,8 +437,15 @@ async fn api_list_questions(
         Some("all") => StatusFilter::All,
         Some(other) => return bad_request(format!("unknown status '{other}' (open|answered|all)")),
     };
+    let day = match query.date.as_deref() {
+        None => None,
+        Some(day) => match parse_day(day) {
+            Ok(parsed) => Some(parsed.format("%Y-%m-%d").to_string()),
+            Err(e) => return bad_request(e),
+        },
+    };
     let store = state.ts_questions.clone();
-    let outcome = tokio::task::spawn_blocking(move || list_payload(&store, filter)).await;
+    let outcome = tokio::task::spawn_blocking(move || list_payload(&store, filter, day)).await;
     match outcome {
         Ok(Ok(payload)) => json_response(StatusCode::OK, payload),
         Ok(Err(e)) => internal_error(e),
@@ -438,15 +456,23 @@ async fn api_list_questions(
 fn list_payload(
     store: &Arc<Mutex<TsQuestionStore>>,
     filter: StatusFilter,
+    day: Option<String>,
 ) -> Result<Value, CoreError> {
     let store = store
         .lock()
         .map_err(|_| CoreError::Config("question store lock poisoned".to_string()))?;
-    let questions: Vec<Value> = store
-        .list_questions(filter)?
-        .iter()
-        .map(question_payload)
-        .collect();
+    let questions: Vec<Value> = match day.as_deref() {
+        Some(day) => store
+            .list_questions_on_day(filter, day)?
+            .iter()
+            .map(question_payload)
+            .collect(),
+        None => store
+            .list_questions(filter)?
+            .iter()
+            .map(question_payload)
+            .collect(),
+    };
     Ok(json!({ "questions": questions }))
 }
 
@@ -467,6 +493,7 @@ fn question_payload(question: &TsQuestion) -> Value {
             })
         })
         .collect();
+    let (auto_detect, auto_confidence) = parse_auto_detect(&question.question);
     json!({
         "id": question.id,
         "day": question.day,
@@ -476,7 +503,32 @@ fn question_payload(question: &TsQuestion) -> Value {
         "created_at": question.created_at,
         "answered_at": question.answered_at,
         "evidence": evidence,
+        "auto_detect": auto_detect,
+        "auto_confidence": auto_confidence,
     })
+}
+
+/// Split the worker's low-confidence hand-off text (issue #44: "What were
+/// you working on at <ts>? (auto-detected: <activity>; confidence 0.20)")
+/// into its structured parts, so clients can render the guess as a
+/// placeholder and collapse low-confidence asks (issue #69) without
+/// re-parsing prose. `None` for plain compiler/worker asks.
+fn parse_auto_detect(question: &str) -> (Option<String>, Option<f64>) {
+    const MARKER: &str = "(auto-detected: ";
+    let Some(start) = question.find(MARKER) else {
+        return (None, None);
+    };
+    let inner = &question[start + MARKER.len()..];
+    let Some(inner) = inner.strip_suffix(')') else {
+        return (None, None);
+    };
+    let Some((activity, confidence)) = inner.rsplit_once("; confidence ") else {
+        return (None, None);
+    };
+    (
+        Some(activity.trim().to_string()),
+        confidence.trim().parse::<f64>().ok(),
+    )
 }
 
 // -------------------------------- POST /api/timesheet/questions/maintenance
@@ -712,6 +764,29 @@ fn answer_payload(
         .map(question_payload))
 }
 
+// --------------------------------- POST /api/timesheet/questions/{id}/skip
+
+/// Owner Skip (issue #69): dismiss the ask without answering - closed and
+/// out of the queue, never re-opened by a recompile's supersession sweep
+/// (only open rows supersede). The owner is never forced to answer.
+async fn api_skip_question(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -> Response {
+    let store = state.ts_questions.clone();
+    let outcome = tokio::task::spawn_blocking(move || skip_payload(&store, id)).await;
+    match outcome {
+        Ok(Ok(Some(question))) => json_response(StatusCode::OK, question),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, format!("no question {id}")).into_response(),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(format!("skip task failed: {e}")),
+    }
+}
+
+fn skip_payload(store: &Arc<Mutex<TsQuestionStore>>, id: i64) -> Result<Option<Value>, CoreError> {
+    let store = store
+        .lock()
+        .map_err(|_| CoreError::Config("question store lock poisoned".to_string()))?;
+    Ok(store.skip_question(id)?.as_ref().map(question_payload))
+}
+
 // -------------------------------------------------- GET /api/timesheet/export
 
 #[derive(Debug, Deserialize)]
@@ -889,21 +964,22 @@ fn validate_style(
     })
 }
 
-/// Suffix of the one-time backup written before the first style write
-/// (`config.toml.bak-style` next to the config file).
+/// Suffix of the one-time backup written before the first settings write
+/// (`config.toml.bak-style` next to the config file; shared by the style
+/// section and the active-projects shortlist).
 const STYLE_BACKUP_SUFFIX: &str = "bak-style";
 
-/// Write `[timesheet.style]` into the server config file (issue #53):
-/// `toml_edit` replaces only that section, so every other section, key
-/// order and comment of the owner's file is preserved. A one-time backup
-/// (`<config>.bak-style`) is written before the first style write and is
-/// never overwritten afterwards. The file is replaced atomically
-/// (tmp + rename) so a crash cannot leave a torn config behind, and the
-/// returned config is re-parsed from the written file: what the caller
-/// stores is exactly what the disk now says.
-fn persist_style_section(
+/// Shared settings write-back (issues #53 + #69): apply one mutation to
+/// the `[timesheet]` table of the server config file. `toml_edit` touches
+/// only that section, so every other section, key order and comment of the
+/// owner's file is preserved. A one-time backup (`<config>.bak-style`) is
+/// written before the first write and never overwritten afterwards. The
+/// file is replaced atomically (tmp + rename) so a crash cannot leave a
+/// torn config behind, and the returned config is re-parsed from the
+/// written file: what the caller stores is exactly what the disk now says.
+fn persist_timesheet_section(
     config_path: &Path,
-    style: &StyleConfig,
+    apply: impl FnOnce(&mut toml_edit::Table),
 ) -> Result<TimesheetConfig, CoreError> {
     let original = match std::fs::read_to_string(config_path) {
         Ok(text) => text,
@@ -917,33 +993,15 @@ fn persist_style_section(
     };
     let mut doc = original.parse::<toml_edit::DocumentMut>().map_err(|e| {
         CoreError::Config(format!(
-            "cannot parse {}: {e} (the style was NOT written; fix the file by hand \
+            "cannot parse {}: {e} (the setting was NOT written; fix the file by hand \
              or restore it from the .bak-style backup)",
             config_path.display()
         ))
     })?;
 
-    let mut style_tbl = toml_edit::Table::new();
-    style_tbl.insert(
-        "style_prompt",
-        toml_edit::value(style.style_prompt.as_str()),
-    );
-    if style.style_examples.is_empty() {
-        style_tbl.insert("style_examples", toml_edit::value(toml_edit::Array::new()));
-    } else {
-        let mut examples = toml_edit::ArrayOfTables::new();
-        for example in &style.style_examples {
-            let mut table = toml_edit::Table::new();
-            table.insert("task", toml_edit::value(example.task.as_str()));
-            table.insert("comment", toml_edit::value(example.comment.as_str()));
-            examples.push(table);
-        }
-        style_tbl.insert("style_examples", toml_edit::Item::ArrayOfTables(examples));
-    }
-
     if !doc.contains_key("timesheet") {
-        // Implicit: only `[timesheet.style]` should appear in a fresh file,
-        // matching the spelling the refiner config parser documents.
+        // Implicit: only `[timesheet.*]` tables should appear in a fresh
+        // file, matching the spelling the refiner config parser documents.
         let mut table = toml_edit::Table::new();
         table.set_implicit(true);
         doc.insert("timesheet", toml_edit::Item::Table(table));
@@ -953,11 +1011,11 @@ fn persist_style_section(
         .and_then(|item| item.as_table_mut())
     else {
         return Err(CoreError::Config(format!(
-            "{}: [timesheet] is not a table; the style was NOT written",
+            "{}: [timesheet] is not a table; the setting was NOT written",
             config_path.display()
         )));
     };
-    timesheet["style"] = toml_edit::Item::Table(style_tbl);
+    apply(timesheet);
 
     // One-time backup before the first write; never overwritten afterwards.
     let backup_path = config_path.with_file_name(format!(
@@ -994,7 +1052,128 @@ fn persist_style_section(
 
     // Reload from disk: the return value is exactly what the file says now.
     TimesheetConfig::load_file(config_path)
-        .map_err(|e| CoreError::Config(format!("style write-back reload failed: {e}")))
+        .map_err(|e| CoreError::Config(format!("settings write-back reload failed: {e}")))
+}
+
+/// Write `[timesheet.style]` into the server config file (issue #53) via
+/// the shared write-back (section-scoped `toml_edit`, one-time backup,
+/// atomic replace, reload-from-disk).
+fn persist_style_section(
+    config_path: &Path,
+    style: &StyleConfig,
+) -> Result<TimesheetConfig, CoreError> {
+    persist_timesheet_section(config_path, |timesheet| {
+        let mut style_tbl = toml_edit::Table::new();
+        style_tbl.insert(
+            "style_prompt",
+            toml_edit::value(style.style_prompt.as_str()),
+        );
+        if style.style_examples.is_empty() {
+            style_tbl.insert("style_examples", toml_edit::value(toml_edit::Array::new()));
+        } else {
+            let mut examples = toml_edit::ArrayOfTables::new();
+            for example in &style.style_examples {
+                let mut table = toml_edit::Table::new();
+                table.insert("task", toml_edit::value(example.task.as_str()));
+                table.insert("comment", toml_edit::value(example.comment.as_str()));
+                examples.push(table);
+            }
+            style_tbl.insert("style_examples", toml_edit::Item::ArrayOfTables(examples));
+        }
+        timesheet["style"] = toml_edit::Item::Table(style_tbl);
+    })
+}
+
+// ------------------------------------ GET/PUT /api/timesheet/active-projects
+
+async fn api_get_active_projects(State(state): State<AppState>) -> Response {
+    match state.timesheet_snapshot() {
+        Ok(timesheet) => json_response(
+            StatusCode::OK,
+            active_projects_payload(&timesheet.active_projects),
+        ),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn api_put_active_projects(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<ActiveProjectsBody>,
+) -> Response {
+    // Validate against the same vocabulary the dropdowns and the export
+    // use (the snapshot's vocab_path override honoured) before anything
+    // is written.
+    let vocab_path = match state.timesheet_snapshot() {
+        Ok(timesheet) => timesheet.vocab_path.clone(),
+        Err(e) => return internal_error(e),
+    };
+    let vocab = match CubewiseVocab::load(vocab_path.as_deref()) {
+        Ok(vocab) => vocab,
+        Err(e) => return internal_error(e),
+    };
+    let active_projects =
+        match TimesheetConfig::normalize_active_projects(&body.active_projects, &vocab.projects) {
+            Ok(projects) => projects,
+            Err(reason) => return bad_request(reason),
+        };
+    let Some(config_path) = state.config_path.clone() else {
+        return internal_error(
+            "no server config file known to this state; the shortlist cannot be persisted",
+        );
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        persist_active_projects_section(&config_path, &active_projects)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(timesheet)) => {
+            // Hot reload (issue #53 pattern): the written file is the
+            // source of truth; swap the shared config so every clone of
+            // AppState sees the new shortlist.
+            {
+                let mut guard = match state.timesheet.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return internal_error("timesheet config lock poisoned");
+                    }
+                };
+                *guard = timesheet.clone();
+            }
+            json_response(
+                StatusCode::OK,
+                active_projects_payload(&timesheet.active_projects),
+            )
+        }
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(format!("active-projects persist task failed: {e}")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActiveProjectsBody {
+    active_projects: Vec<String>,
+}
+
+/// The `{active_projects}` payload the endpoints return: exact vocabulary
+/// strings in the owner's order; empty = full vocabulary.
+fn active_projects_payload(active_projects: &[String]) -> Value {
+    json!({ "active_projects": active_projects })
+}
+
+/// Write `active_projects` into the server config file (issue #69) via the
+/// shared write-back (section-scoped toml_edit, one-time backup, atomic
+/// replace, reload-from-disk).
+fn persist_active_projects_section(
+    config_path: &Path,
+    active_projects: &[String],
+) -> Result<TimesheetConfig, CoreError> {
+    persist_timesheet_section(config_path, |timesheet| {
+        let mut array = toml_edit::Array::new();
+        for project in active_projects {
+            array.push(project.as_str());
+        }
+        timesheet.insert("active_projects", toml_edit::value(array));
+    })
 }
 
 // --------------------------------------------------------- shared review helpers
@@ -2268,6 +2447,186 @@ mod tests {
                 .map(|(task, comment)| json!({ "task": task, "comment": comment }))
                 .collect::<Vec<_>>(),
         })
+    }
+
+    #[test]
+    fn parse_auto_detect_splits_the_worker_hand_off_text() {
+        // The worker's low-confidence format (issue #44) parses cleanly.
+        let (activity, confidence) = parse_auto_detect(
+            "What were you working on at 2026-11-06T10:00:00+08:00?              (auto-detected: Browsing charts; confidence 0.30)",
+        );
+        assert_eq!(activity.as_deref(), Some("Browsing charts"));
+        assert!((confidence.expect("conf") - 0.30).abs() < 1e-9);
+        // Plain asks (compiler stretch, session-span) carry no marker.
+        for plain in [
+            "What were you working on 09:00-09:10 (Excel.exe)?",
+            "Several stretches of 2026-11-06 had no confident analysis.",
+            "",
+        ] {
+            let (activity, confidence) = parse_auto_detect(plain);
+            assert_eq!(activity, None, "{plain}");
+            assert_eq!(confidence, None, "{plain}");
+        }
+        // A truncated marker (no closing paren) does not parse.
+        let (activity, confidence) =
+            parse_auto_detect("ask (auto-detected: half-open; confidence 0.20");
+        assert_eq!(activity, None);
+        assert_eq!(confidence, None);
+    }
+
+    async fn put_active_projects(app: Router, projects: &[&str]) -> axum::http::Response<Body> {
+        let body = json!({
+            "active_projects": projects.iter().map(|p| json!(p)).collect::<Vec<_>>(),
+        });
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/timesheet/active-projects")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+    }
+
+    async fn get_active_projects(app: Router) -> axum::http::Response<Body> {
+        app.oneshot(
+            axum::http::Request::builder()
+                .uri("/api/timesheet/active-projects")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+    }
+
+    #[test]
+    fn parse_auto_detect_is_attached_to_question_payloads() {
+        // question_payload threads the parsed fields through (issue #69).
+        let question = TsQuestion {
+            id: 7,
+            day: "2026-11-06".to_string(),
+            question: "ask (auto-detected: Compiling rules; confidence 0.45)".to_string(),
+            evidence: vec![],
+            status: TsQuestionStatus::Open,
+            answer: None,
+            created_at: "2026-11-06T02:00:00Z".to_string(),
+            answered_at: None,
+        };
+        let payload = question_payload(&question);
+        assert_eq!(payload["auto_detect"], "Compiling rules");
+        assert!((payload["auto_confidence"].as_f64().expect("conf") - 0.45).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn active_projects_put_get_round_trip_preserves_other_sections() {
+        // Issue #69: the shortlist is a first-class setting with the same
+        // write-back + hot-reload contract as the style (issue #53).
+        let dir = ExportTempDir::new("active-rt");
+        let seed = "# hub config\n\n[retention]\nenabled = false # keep raw media\n\n\
+             [timesheet]\nuse_llm_titles = false\nmax_block_min = 90\n\n\
+             [timesheet.style]\nstyle_prompt = \"German, telegraphic.\"\n";
+        let (state, config_path) = style_app(&dir.0, Some(seed));
+        let state_for_assert = state.clone();
+        let app = crate::build_router(state);
+
+        let response = put_active_projects(
+            app.clone(),
+            &[
+                "C000P004 - Cubewise - Infrastructure",
+                "A143P010 - Frasers - H2 FH - BU Core",
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stored = response_json(response).await;
+        assert_eq!(
+            stored["active_projects"],
+            json!([
+                "C000P004 - Cubewise - Infrastructure",
+                "A143P010 - Frasers - H2 FH - BU Core"
+            ])
+        );
+
+        // GET returns the persisted value; an empty PUT means full vocabulary.
+        let fetched = response_json(get_active_projects(app.clone()).await).await;
+        assert_eq!(fetched, stored);
+        let response = put_active_projects(app.clone(), &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let fetched = response_json(get_active_projects(app.clone()).await).await;
+        assert_eq!(
+            fetched["active_projects"].as_array().expect("list").len(),
+            0
+        );
+
+        // Write the real shortlist back and check the file keeps every
+        // other section, comment and value.
+        let response = put_active_projects(app, &["C000P004 - Cubewise - Infrastructure"]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let file = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(file.contains("# hub config"), "file:\n{file}");
+        assert!(file.contains("# keep raw media"), "file:\n{file}");
+        assert!(file.contains("use_llm_titles = false"), "file:\n{file}");
+        assert!(file.contains("max_block_min = 90"), "file:\n{file}");
+        assert!(
+            file.contains("German, telegraphic."),
+            "style section untouched: file:\n{file}"
+        );
+        // ...and the shortlist round-trips through the refiner parse side.
+        let cfg = TimesheetConfig::from_toml_str(&file).expect("written config parses");
+        assert_eq!(
+            cfg.active_projects,
+            vec!["C000P004 - Cubewise - Infrastructure"]
+        );
+
+        // The in-memory config was reloaded with the written value.
+        let snapshot = state_for_assert.timesheet_snapshot().expect("snapshot");
+        assert_eq!(snapshot.active_projects, cfg.active_projects);
+    }
+
+    #[tokio::test]
+    async fn active_projects_put_rejects_unknown_codes_and_over_cap() {
+        let dir = ExportTempDir::new("active-validate");
+        let (state, config_path) = style_app(&dir.0, Some("[timesheet]\n"));
+        let before = std::fs::read_to_string(&config_path).expect("read config");
+        let app = crate::build_router(state);
+
+        // An unknown code is rejected with the exact-string rule.
+        let response = put_active_projects(app.clone(), &["C000P004 - Not In Vocab"]).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // 26 entries exceed the 25 cap (vocabulary-shaped strings).
+        let many: Vec<String> = (0..26)
+            .map(|n| format!("C{n:03}P{n:03} - Client {n}"))
+            .collect();
+        let body = json!({ "active_projects": many });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/timesheet/active-projects")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Rejections leave the config file and the served shortlist untouched.
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            before
+        );
+        let fetched = response_json(get_active_projects(app).await).await;
+        assert_eq!(
+            fetched["active_projects"].as_array().expect("list").len(),
+            0
+        );
+        // No backup file appeared either (nothing was ever written).
+        assert!(!config_path.with_file_name("config.toml.bak-style").exists());
     }
 
     #[test]

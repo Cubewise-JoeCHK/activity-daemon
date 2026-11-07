@@ -28,6 +28,13 @@
 //!   questions per day, beyond it one aggregate summary question);
 //! - the month-end export (issue #46): `vocab_path` overrides the embedded
 //!   Cubewise template vocabulary;
+//! - `active_projects` (issue #69): the owner's ACTIVE PROJECTS shortlist -
+//!   exact vocabulary project strings, at most 25, empty = full vocabulary.
+//!   The worker prompt is constrained to these, and the compiler's
+//!   majority vote only accepts votes for these (blocks whose votes point
+//!   only at inactive codes stay unclassified -> normal stretch question).
+//!   Edited via `GET/PUT /api/timesheet/active-projects`, same write-back +
+//!   server-cache reload pattern as the style section;
 //! - `[timesheet.style]` (issue #53): the owner decides HOW generated
 //!   timesheet text is written. `style_prompt` is free text injected into
 //!   every prompt after the builder's internal instructions;
@@ -115,6 +122,11 @@ pub struct TimesheetConfig {
     pub daily_question_cap: u32,
     /// Owner writing style (issue #53).
     pub style: StyleConfig,
+    /// Owner ACTIVE PROJECTS shortlist (issue #69): exact project strings
+    /// from the template vocabulary, at most 25. Empty = full vocabulary
+    /// (current behaviour). The server validates membership before both
+    /// parse-free use (worker prompt, compiler vote) and API write-back.
+    pub active_projects: Vec<String>,
 }
 
 /// Sampling policy selector. Lowercase serde spelling matches the config
@@ -127,6 +139,41 @@ pub enum SamplingMode {
     Keyframe,
     /// Every arrival, capped per hour.
     All,
+}
+
+/// Cap on the ACTIVE PROJECTS shortlist (issue #69).
+pub const ACTIVE_PROJECTS_MAX: usize = 25;
+
+impl TimesheetConfig {
+    /// Validate a candidate ACTIVE PROJECTS shortlist (issue #69): exact
+    /// vocabulary strings only, deduplicated, at most
+    /// [`ACTIVE_PROJECTS_MAX`]. Empty input is valid (= full vocabulary).
+    /// Returns the normalized list in the owner's order, first occurrence
+    /// kept.
+    pub fn normalize_active_projects(
+        projects: &[String],
+        vocab_projects: &[String],
+    ) -> Result<Vec<String>, String> {
+        if projects.len() > ACTIVE_PROJECTS_MAX {
+            return Err(format!(
+                "at most {ACTIVE_PROJECTS_MAX} active_projects are allowed, got {}",
+                projects.len()
+            ));
+        }
+        let mut out: Vec<String> = Vec::with_capacity(projects.len());
+        for project in projects {
+            let project = project.trim();
+            if !vocab_projects.iter().any(|known| known == project) {
+                return Err(format!(
+                    "unknown project '{project}': active_projects must be exact                      vocabulary strings"
+                ));
+            }
+            if !out.iter().any(|seen| seen == project) {
+                out.push(project.to_string());
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Owner writing style (issue #53).
@@ -182,6 +229,7 @@ impl Default for TimesheetConfig {
             segment_gap_s: 300,
             daily_question_cap: 5,
             style: StyleConfig::default(),
+            active_projects: Vec::new(),
         }
     }
 }
@@ -348,6 +396,65 @@ mod tests {
             .expect("parse without segment keys");
         assert_eq!(untouched.segment_gap_s, 300);
         assert_eq!(untouched.daily_question_cap, 5);
+    }
+
+    #[test]
+    fn active_projects_parse_and_default_empty() {
+        // issue #69: the shortlist key parses next to the other keys;
+        // untouched config keeps it empty (= full vocabulary).
+        let untouched = TimesheetConfig::from_toml_str("[timesheet]\nmax_block_min = 90\n")
+            .expect("parse without active_projects");
+        assert!(untouched.active_projects.is_empty());
+        assert_eq!(
+            untouched.active_projects,
+            TimesheetConfig::default().active_projects
+        );
+
+        let cfg = TimesheetConfig::from_toml_str(
+            "[timesheet]\nactive_projects = [\"C000P004 - Cubewise - Infrastructure\"]\n",
+        )
+        .expect("parse active_projects");
+        assert_eq!(cfg.active_projects.len(), 1);
+        assert_eq!(
+            cfg.active_projects[0],
+            "C000P004 - Cubewise - Infrastructure"
+        );
+    }
+
+    #[test]
+    fn normalize_active_projects_validates_caps_and_dedupes() {
+        let vocab = vec![
+            "A - One".to_string(),
+            "B - Two".to_string(),
+            "C - Three".to_string(),
+        ];
+        // empty input is valid (= full vocabulary)
+        assert!(TimesheetConfig::normalize_active_projects(&[], &vocab).is_ok());
+        // unknown code rejected
+        let err = TimesheetConfig::normalize_active_projects(&["X - Nope".to_string()], &vocab)
+            .expect_err("unknown project must be rejected");
+        assert!(err.contains("unknown project"));
+        // trim + dedupe, owner's order kept
+        let out = TimesheetConfig::normalize_active_projects(
+            &[
+                "  A - One  ".to_string(),
+                "B - Two".to_string(),
+                "A - One".to_string(),
+            ],
+            &vocab,
+        )
+        .expect("valid shortlist");
+        assert_eq!(out, ["A - One", "B - Two"]);
+        // cap
+        let too_many: Vec<String> = (0..26).map(|n| format!("P{n}")).collect();
+        let vocab26: Vec<String> = (0..26).map(|n| format!("P{n}")).collect();
+        let err = TimesheetConfig::normalize_active_projects(&too_many, &vocab26)
+            .expect_err("over-cap shortlist must be rejected");
+        assert!(err.contains("at most 25"));
+        // exactly at the cap is allowed
+        let at_cap: Vec<String> = (0..25).map(|n| format!("P{n}")).collect();
+        let vocab25: Vec<String> = (0..25).map(|n| format!("P{n}")).collect();
+        assert!(TimesheetConfig::normalize_active_projects(&at_cap, &vocab25).is_ok());
     }
 
     #[test]

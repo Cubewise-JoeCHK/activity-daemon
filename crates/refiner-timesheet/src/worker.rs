@@ -319,7 +319,15 @@ pub fn process_batch(
                         continue;
                     }
                 };
-                match client.analyze_jpeg(&jpeg, &ctx.vocab, &ctx.cfg.style) {
+                // The ACTIVE PROJECTS shortlist (issue #69) constrains the
+                // prompt's project_guess options; the snapshot semantics
+                // match the style block (worker restart picks up edits).
+                match client.analyze_jpeg(
+                    &jpeg,
+                    &ctx.vocab,
+                    &ctx.cfg.style,
+                    &ctx.cfg.active_projects,
+                ) {
                     Err(e) => {
                         // Failure contract: stop before this row, the loop
                         // backs off and retries it.
@@ -1020,7 +1028,7 @@ mod tests {
         let client = LemonadeClient::new(&ctx.cfg);
         let outcome = tokio::task::spawn_blocking(move || {
             let vocab = CubewiseVocab::embedded().clone();
-            client.analyze_jpeg(b"jpeg-bytes", &vocab, &ctx.cfg.style)
+            client.analyze_jpeg(b"jpeg-bytes", &vocab, &ctx.cfg.style, &[])
         })
         .await
         .expect("join");

@@ -84,15 +84,20 @@ impl LemonadeClient {
     }
 
     /// Analyse one JPEG frame: build the strict-JSON prompt (internal
-    /// instructions, then the owner style block, issue #53), POST it, parse
-    /// and vocabulary-validate the reply.
+    /// instructions, the owner style block per the issue #53 injection
+    /// contract, then the ACTIVE PROJECTS constraint per issue #69), POST
+    /// it, parse and vocabulary-validate the reply. A non-empty
+    /// `active_projects` shortlist is what the prompt offers and demands
+    /// (exact vocabulary strings, so the reply still validates against the
+    /// full vocabulary); confidence semantics unchanged.
     pub fn analyze_jpeg(
         &self,
         jpeg: &[u8],
         vocab: &CubewiseVocab,
         style: &StyleConfig,
+        active_projects: &[String],
     ) -> Result<FrameAnalysis, LemonadeError> {
-        let messages = build_messages(jpeg, vocab, style);
+        let messages = build_messages(jpeg, vocab, style, active_projects);
         let content = self.chat_content(&messages)?;
         parse_analysis(&content, vocab)
     }
@@ -145,6 +150,7 @@ pub fn build_messages(
     jpeg: &[u8],
     vocab: &CubewiseVocab,
     style: &StyleConfig,
+    active_projects: &[String],
 ) -> Vec<serde_json::Value> {
     let data_url = format!(
         "data:image/jpeg;base64,{}",
@@ -158,7 +164,7 @@ pub fn build_messages(
         json!({
             "role": "user",
             "content": [
-                {"type": "text", "text": build_text_prompt(vocab, style)},
+                {"type": "text", "text": build_text_prompt(vocab, style, active_projects)},
                 {"type": "image_url", "image_url": {"url": data_url}},
             ],
         }),
@@ -166,15 +172,35 @@ pub fn build_messages(
 }
 
 /// The user-message text: internal instructions first, then the owner style
-/// block appended after them (injection contract, issue #53).
-pub fn build_text_prompt(vocab: &CubewiseVocab, style: &StyleConfig) -> String {
+/// block appended after them (injection contract, issue #53). When the
+/// owner maintains an ACTIVE PROJECTS shortlist (issue #69, non-empty),
+/// only those projects are offered and the model is told they are the
+/// owner's current projects; an empty shortlist offers the full vocabulary.
+pub fn build_text_prompt(
+    vocab: &CubewiseVocab,
+    style: &StyleConfig,
+    active_projects: &[String],
+) -> String {
     let categories = vocab.categories.join(" | ");
+    let offered: Vec<&String> = if active_projects.is_empty() {
+        vocab.projects.iter().collect()
+    } else {
+        active_projects.iter().collect()
+    };
     let mut projects = String::new();
-    for project in &vocab.projects {
+    for project in &offered {
         projects.push_str("  - ");
         projects.push_str(project);
         projects.push('\n');
     }
+    let project_rule = if active_projects.is_empty() {
+        "- \"project_guess\" must be exactly one of the project strings below, \
+         or \"\" if no project is identifiable:\n"
+    } else {
+        "- \"project_guess\" must be exactly one of the owner's current projects \
+         below (the owner's ACTIVE PROJECTS shortlist), or \"\" if none of them \
+         matches what is visible:\n"
+    };
     let mut prompt = format!(
         "Analyse this desktop screenshot for a work timesheet entry.\n\n\
          Reply with EXACTLY this JSON object (raw JSON, no markdown fences):\n\
@@ -185,8 +211,7 @@ pub fn build_text_prompt(vocab: &CubewiseVocab, style: &StyleConfig) -> String {
          \"evidence\": \"<what you saw that justifies the answer>\"}}\n\n\
          Rules:\n\
          - \"category\" must be exactly one of: {categories}\n\
-         - \"project_guess\" must be exactly one of the project strings below, \
-         or \"\" if no project is identifiable:\n\
+         {project_rule}\
          {projects}\
          - \"confidence\" reflects how sure you are, 0.0 to 1.0.\n\
          Never invent activity that is not visible on screen.\n"
@@ -325,7 +350,7 @@ mod tests {
     #[test]
     fn prompt_carries_schema_vocabulary_and_image() {
         let jpeg = b"fakejpeg-bytes";
-        let messages = build_messages(jpeg, &vocab(), &style(""));
+        let messages = build_messages(jpeg, &vocab(), &style(""), &[]);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
@@ -352,6 +377,24 @@ mod tests {
     }
 
     #[test]
+    fn active_projects_constrain_the_offered_projects() {
+        // Empty shortlist: full vocabulary, the original rule wording.
+        let full = build_text_prompt(&vocab(), &style(""), &[]);
+        assert!(full.contains("A1P01 - Demo"));
+        assert!(full.contains("C2P02 - Internal"));
+        assert!(full.contains("exactly one of the project strings below"));
+
+        // Non-empty shortlist (issue #69): only the owner's current
+        // projects are offered and the prompt says so.
+        let active = vec!["C2P02 - Internal".to_string()];
+        let narrowed = build_text_prompt(&vocab(), &style(""), &active);
+        assert!(narrowed.contains("C2P02 - Internal"));
+        assert!(narrowed.contains("owner's current projects"));
+        assert!(!narrowed.contains("A1P01 - Demo"));
+        assert!(!narrowed.contains("exactly one of the project strings below"));
+    }
+
+    #[test]
     fn custom_style_changes_the_assembled_prompt_after_internal_instructions() {
         // Issue #53 injection contract: internal instructions first, owner
         // style appended after; custom style must actually appear.
@@ -362,8 +405,8 @@ mod tests {
                 comment: "Fixed three rules".to_string(),
             }],
         };
-        let with_default = build_text_prompt(&vocab(), &style(""));
-        let with_custom = build_text_prompt(&vocab(), &custom);
+        let with_default = build_text_prompt(&vocab(), &style(""), &[]);
+        let with_custom = build_text_prompt(&vocab(), &custom, &[]);
 
         assert!(with_default.contains(DEFAULT_STYLE_PROMPT));
         assert!(!with_default.contains("Traditional Chinese"));

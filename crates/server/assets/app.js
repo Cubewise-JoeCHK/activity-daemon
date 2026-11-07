@@ -23,6 +23,10 @@
     tsVocab: null,              // /api/timesheet/vocab payload
     tsQuestions: null,          // open questions payload
     tsStyle: null,              // /api/timesheet/style payload (issue #53)
+    tsActive: null,             // /api/timesheet/active-projects payload (issue #69)
+    tsActivePending: null,      // Set of checked projects not yet saved (survives re-filter)
+    tsActiveSearch: "",         // active-projects panel filter text
+    tsShowAllProjects: false,   // dropdown escape hatch: full vocabulary vs active set
     tsStyleAvailable: null,     // false once the style API 404s
     tsDirty: new Map(),         // draftId -> edited fields not yet saved
     nowTimer: null,
@@ -592,7 +596,7 @@
     if (!monthInput.value) monthInput.value = isoMonth(new Date());
     $("#ts-export-btn").disabled = !/^\d{4}-\d{2}$/.test(monthInput.value);
     await refreshTsVocab();
-    await Promise.all([refreshTsDays(), refreshTsDay(), refreshTsQuestions(), refreshTsStyle()]);
+    await Promise.all([refreshTsDays(), refreshTsDay(), refreshTsQuestions(), refreshTsStyle(), refreshTsActive()]);
   }
 
   async function refreshTsVocab() {
@@ -602,6 +606,7 @@
     } catch (e) {
       state.tsVocab = { categories: [], projects: [] };
     }
+    renderTsActive();
   }
 
   async function refreshTsDays() {
@@ -621,9 +626,11 @@
     const days = state.tsDays.days || [];
     const [first, last] = tsMonthRange(state.tsMonthAnchor);
     const inMonth = (iso) => iso >= isoDate(first) && iso <= isoDate(last);
+    let selectionChanged = false;
     if (!state.tsSelectedDay || !inMonth(state.tsSelectedDay)) {
       const todayIso = isoDate(new Date());
       state.tsSelectedDay = inMonth(todayIso) ? todayIso : (days.length ? days[0].day : isoDate(first));
+      selectionChanged = true;
     }
     if (!days.length) {
       el.innerHTML = '<div class="empty">No drafted activities this month. Compile a day first (POST /api/timesheet/draft?date=…), or pick another month.</div>';
@@ -647,6 +654,9 @@
         refreshTsDay();
       });
     });
+    // First visit / month switch: the auto-selected day has no data yet.
+    // (A day click re-renders too, but it fetches on its own.)
+    if (selectionChanged) refreshTsDay();
   }
 
   async function refreshTsDay() {
@@ -655,6 +665,9 @@
       state.tsDraft = await fetchJSON(`/api/timesheet/draft?date=${state.tsSelectedDay}`);
       state.tsDirty.clear();
       renderTsRows();
+      // Questions are day-scoped (issue #69): the panel always mirrors the
+      // day list selection, so a new day means a new question set.
+      refreshTsQuestions();
     } catch (e) {
       showError(e.message);
     }
@@ -671,6 +684,18 @@
       `<option value="${esc(v)}"${v === current ? " selected" : ""}>${esc(v)}</option>`).join("");
   }
 
+  // The project list the day-review dropdowns offer (issue #69): the
+  // owner's ACTIVE PROJECTS shortlist by default, the full 189-entry
+  // vocabulary behind the "all projects" escape hatch. The row's current
+  // value is always offered (optionsWithCurrent prepends it) so an
+  // inactive-coded draft stays editable.
+  function tsProjectOptions() {
+    const vocab = state.tsVocab || { projects: [], categories: [] };
+    const active = state.tsActive?.active_projects || [];
+    if (state.tsShowAllProjects || !active.length) return vocab.projects;
+    return active;
+  }
+
   function tsRowHtml(d) {
     const st = rowState(d);
     const sha = d.sources?.frame_sha16s?.[0];
@@ -679,7 +704,7 @@
       : null;
     const conf = d.confidence || 0;
     const confCls = conf >= 0.8 ? "hi" : conf >= 0.6 ? "mid" : "low";
-    const vocab = state.tsVocab || { projects: [], categories: [] };
+    const vocab = { projects: tsProjectOptions(), categories: state.tsVocab?.categories || [] };
     const lock = st === "approved" ? " disabled" : "";
     return `
       <div class="ts-row ${st}" data-id="${d.id}">
@@ -784,52 +809,104 @@
     if (/^\d{4}-\d{2}$/.test(month)) window.location.href = "/api/timesheet/export?month=" + month;
   }
 
+  // Questions are day-scoped (issue #69): exactly the selected day, no
+  // cross-day pile-up.
   async function refreshTsQuestions() {
+    if (!state.tsSelectedDay) { renderTsQuestions(); return; }
     try {
-      state.tsQuestions = await fetchJSON("/api/timesheet/questions?status=open");
+      state.tsQuestions = await fetchJSON(
+        `/api/timesheet/questions?status=open&date=${state.tsSelectedDay}`);
     } catch (e) {
       state.tsQuestions = null;
     }
     renderTsQuestions();
   }
 
+  function questionHtml(q) {
+    const conf = typeof q.auto_confidence === "number" ? q.auto_confidence : null;
+    const lowConf = conf !== null && conf < 0.5;
+    const evidence = (q.evidence || []).length > 0;
+    const placeholder = lowConf && q.auto_detect
+      ? `auto-detected: ${q.auto_detect}`
+      : "your answer";
+    const asked = fmtAge((Date.now() - new Date(q.created_at)) / 1000);
+    const answerRow = `
+        <div class="q-answer">
+          <input placeholder="${esc(placeholder)}" aria-label="answer for question ${q.id}">
+          <button class="ts-btn primary q-answer-btn">Answer</button>
+          <button class="ts-btn q-skip-btn" title="Dismiss without answering — the owner is never forced">Skip</button>
+        </div>`;
+    if (!evidence) {
+      // Evidence-less ask (issue #69): compact one-liner with an inline
+      // answer box - no big card, no thumbnail hole. Low-confidence
+      // auto-detects show muted with the guess only as the placeholder.
+      const muted = lowConf ? " q-lowconf" : "";
+      return `
+      <div class="q-line${muted}" data-id="${q.id}">
+        <div class="q-line-text" title="${esc(q.question)}">${esc(q.question)}</div>
+        ${answerRow}
+      </div>`;
+    }
+    const body = `
+        <div class="q-text">${esc(q.question)}</div>
+        <div class="q-meta">asked ${asked}</div>
+        <div class="q-thumbs">${q.evidence.map((f) =>
+          `<a href="${f.url}" target="_blank" rel="noopener" title="evidence frame"><img src="${f.url}" alt="" loading="lazy" onerror="this.parentNode.style.display='none'"></a>`).join("")}</div>
+        ${answerRow}`;
+    if (lowConf) {
+      // Low-confidence auto-detect with evidence (issue #69): collapsed by
+      // default, the guess in the summary; expand only on demand.
+      const guess = q.auto_detect ? esc(q.auto_detect) : esc(q.question);
+      return `
+      <details class="q-card q-collapsed" data-id="${q.id}">
+        <summary><span class="q-guess">${guess}</span><span class="q-conf">conf ${Math.round(conf * 100)}%</span></summary>
+        ${body}
+      </details>`;
+    }
+    return `
+      <div class="q-card" data-id="${q.id}">${body}</div>`;
+  }
+
   function renderTsQuestions() {
     const el = $("#ts-questions");
-    const qs = state.tsQuestions?.questions || [];
     if (!state.tsQuestions) { el.innerHTML = '<div class="hint">Open questions are not reachable right now.</div>'; return; }
+    if (!state.tsSelectedDay) { el.innerHTML = '<div class="hint">Pick a day to see its open questions.</div>'; return; }
+    const qs = state.tsQuestions?.questions || [];
     if (!qs.length) {
-      el.innerHTML = '<div class="hint">No open questions — the analysis was confident, or nothing was captured yet.</div>';
+      el.innerHTML = `<div class="hint">No open questions for ${esc(state.tsSelectedDay)} — the analysis was confident, or nothing was captured.</div>`;
       return;
     }
-    el.innerHTML = qs.map((q) => `
-      <div class="q-card" data-id="${q.id}">
-        <div class="q-text">${esc(q.question)}</div>
-        <div class="q-meta">${esc(q.day)} · asked ${fmtAge((Date.now() - new Date(q.created_at)) / 1000)}</div>
-        ${(q.evidence || []).length ? `<div class="q-thumbs">${q.evidence.map((f) =>
-          `<a href="${f.url}" target="_blank" rel="noopener" title="evidence frame"><img src="${f.url}" alt="" loading="lazy" onerror="this.parentNode.style.display='none'"></a>`).join("")}</div>` : ""}
-        <div class="q-answer">
-          <input placeholder="your answer" aria-label="answer for question ${q.id}">
-          <button class="ts-btn primary">Answer</button>
-        </div>
-      </div>`).join("");
-    el.querySelectorAll(".q-card").forEach((card) => {
+    el.innerHTML = `<div class="q-day">${esc(state.tsSelectedDay)} · ${qs.length} open</div>` +
+      qs.map(questionHtml).join("");
+    el.querySelectorAll("[data-id]").forEach((card) => {
       const id = Number(card.dataset.id);
       const input = card.querySelector("input");
-      const btn = card.querySelector("button");
+      const answerBtn = card.querySelector(".q-answer-btn");
+      const skipBtn = card.querySelector(".q-skip-btn");
       const send = async () => {
         const text = input.value.trim();
         if (!text) return;
-        btn.disabled = true;
+        answerBtn.disabled = true;
         try {
           await sendJSON(`/api/timesheet/questions/${id}/answer`, "POST", { answer: text });
           await refreshTsQuestions();
         } catch (e) {
           showError(e.message);
-          btn.disabled = false;
+          answerBtn.disabled = false;
         }
       };
-      btn.addEventListener("click", send);
+      answerBtn.addEventListener("click", send);
       input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+      skipBtn.addEventListener("click", async () => {
+        skipBtn.disabled = true;
+        try {
+          await sendJSON(`/api/timesheet/questions/${id}/skip`, "POST", {});
+          await refreshTsQuestions();
+        } catch (e) {
+          showError(e.message);
+          skipBtn.disabled = false;
+        }
+      });
     });
   }
 
@@ -897,6 +974,90 @@
     });
   }
 
+  // --------------------------- active projects (issue #69)
+
+  async function refreshTsActive() {
+    try {
+      state.tsActive = await fetchJSON("/api/timesheet/active-projects");
+      state.tsActiveAvailable = true;
+    } catch (e) {
+      state.tsActiveAvailable = false;
+    }
+    renderTsActive();
+  }
+
+  function renderTsActive() {
+    const el = $("#ts-active");
+    if (state.tsActiveAvailable === false) {
+      // Graceful degradation, same contract as the style panel (issue #53):
+      // the endpoint is not on this hub yet.
+      el.innerHTML = '<div class="hint">The active-projects panel is not on this hub yet (GET /api/timesheet/active-projects → 404). It appears after the hub updates.</div>';
+      return;
+    }
+    if (!state.tsVocab) { el.innerHTML = '<div class="hint">Loading vocabulary…</div>'; return; }
+    const saved = state.tsActive?.active_projects || [];
+    // Unsaved checkmarks live in tsActivePending so a filter re-render
+    // never wipes them; null = nothing touched yet, mirror the saved set.
+    const active = state.tsActivePending || new Set(saved);
+    state.tsActivePending = new Set(active);
+    const search = state.tsActiveSearch.toLowerCase();
+    const projects = (state.tsVocab.projects || [])
+      .filter((p) => !search || p.toLowerCase().includes(search));
+    const rows = projects.map((p) => {
+      const on = active.has(p);
+      return `
+        <label class="ap-row${on ? " on" : ""}" title="${esc(p)}">
+          <input type="checkbox" class="ap-check" value="${esc(p)}"${on ? " checked" : ""}>
+          <span class="ap-name">${esc(p)}</span>
+        </label>`;
+    }).join("");
+    el.innerHTML = `
+      <div class="ap-panel">
+        <input id="ap-search" class="ap-search" placeholder="Filter ${esc(String((state.tsVocab.projects || []).length))} projects…" value="${esc(state.tsActiveSearch)}" autocomplete="off">
+        <div class="ap-list">${rows || '<div class="hint">No project matches the filter.</div>'}</div>
+        <div class="ap-foot">
+          <span class="hint" id="ap-count">${active.size} active${active.size ? " · capped at 25" : " · empty = full vocabulary"}</span>
+          <button class="ts-btn primary" id="ap-save">Save</button>
+        </div>
+      </div>`;
+    el.querySelectorAll(".ap-check").forEach((box) => {
+      box.addEventListener("change", () => {
+        if (box.checked) state.tsActivePending.add(box.value);
+        else state.tsActivePending.delete(box.value);
+        const row = box.closest(".ap-row");
+        if (row) row.classList.toggle("on", box.checked);
+        $("#ap-count").textContent =
+          `${state.tsActivePending.size} active${state.tsActivePending.size ? " · capped at 25" : " · empty = full vocabulary"}`;
+      });
+    });
+    $("#ap-search").addEventListener("input", (e) => {
+      state.tsActiveSearch = e.target.value;
+      // keep the search text, re-render the filtered rows
+      const value = e.target.value;
+      renderTsActive();
+      const box = $("#ap-search");
+      box.focus();
+      box.setSelectionRange(value.length, value.length);
+    });
+    $("#ap-save").addEventListener("click", async () => {
+      const picked = [...state.tsActivePending];
+      const saveBtn = $("#ap-save");
+      saveBtn.disabled = true;
+      try {
+        state.tsActive = await sendJSON("/api/timesheet/active-projects", "PUT", {
+          active_projects: picked,
+        });
+        state.tsActivePending = null;
+        renderTsActive();
+        // the day-review dropdowns default to the new shortlist immediately
+        renderTsRows();
+      } catch (e) {
+        showError(e.message);
+        saveBtn.disabled = false;
+      }
+    });
+  }
+
   // -------------------------------------------------------------- wiring
 
   function wire() {
@@ -919,6 +1080,10 @@
       refreshTsQuestions();
     });
     $("#ts-approve-all").addEventListener("click", approveAllDay);
+    $("#ts-show-all").addEventListener("change", (e) => {
+      state.tsShowAllProjects = e.target.checked;
+      renderTsRows();
+    });
     $("#ts-export-month").addEventListener("change", (e) => {
       $("#ts-export-btn").disabled = !/^\d{4}-\d{2}$/.test(e.target.value);
     });

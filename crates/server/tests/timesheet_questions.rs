@@ -385,6 +385,194 @@ async fn answer_marks_answered_and_unknown_or_empty_answers_rejected() {
 }
 
 #[tokio::test]
+async fn skip_dismisses_the_ask_and_it_leaves_the_open_queue() {
+    // Issue #69: Skip marks closed/ignored - the owner is never forced.
+    let (dir, state) = test_state("skip");
+    let app = build_router(state);
+    let kept = seed_question(
+        &dir,
+        "2026-11-06",
+        "What were you working on 09:00-09:10?",
+        &[],
+    );
+    let skipped_id = seed_question(
+        &dir,
+        "2026-11-06",
+        "What were you working on 10:00-10:20?",
+        &[],
+    );
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/timesheet/questions/{skipped_id}/skip"),
+            &json!({}),
+        ))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["status"], "skipped");
+    assert_eq!(v["id"], skipped_id);
+    assert!(v["answer"].is_null(), "a skip carries no answer");
+
+    // the skipped ask is out of the open queue, the other one stays
+    let res = app
+        .clone()
+        .oneshot(get("/api/timesheet/questions?status=open"))
+        .await
+        .expect("oneshot");
+    let v = body_json(res).await;
+    let ids: Vec<i64> = v["questions"]
+        .as_array()
+        .expect("questions")
+        .iter()
+        .map(|q| q["id"].as_i64().expect("id"))
+        .collect();
+    assert_eq!(ids, vec![kept], "only the un-skipped ask remains open");
+
+    // re-skip is idempotent; answering is still possible on the skipped row
+    // (an owner answer wins over a skip, mirroring the store contract)
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/timesheet/questions/{skipped_id}/skip"),
+            &json!({}),
+        ))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/timesheet/questions/{skipped_id}/answer"),
+            &json!({ "answer": "answering after a skip works" }),
+        ))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["status"], "answered");
+
+    // unknown id 404s
+    let res = app
+        .oneshot(post_json("/api/timesheet/questions/999/skip", &json!({})))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn list_narrows_to_the_selected_day() {
+    // Issue #69: the review panel groups strictly by the day list
+    // selection - the date query narrows server-side.
+    let (dir, state) = test_state("day-narrow");
+    let app = build_router(state);
+    seed_question(&dir, "2026-11-05", "ask day 5", &[]);
+    let skipped = seed_question(&dir, "2026-11-06", "ask day 6 skipped", &[]);
+    let open6 = seed_question(&dir, "2026-11-06", "ask day 6 open", &[]);
+    seed_question(&dir, "2026-11-07", "ask day 7", &[]);
+    let res = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/timesheet/questions/{skipped}/skip"),
+            &json!({}),
+        ))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // all statuses of one day
+    let res = app
+        .clone()
+        .oneshot(get("/api/timesheet/questions?status=all&date=2026-11-06"))
+        .await
+        .expect("oneshot");
+    let v = body_json(res).await;
+    let qs = v["questions"].as_array().expect("questions");
+    assert_eq!(qs.len(), 2);
+    assert!(qs.iter().all(|q| q["day"] == "2026-11-06"));
+
+    // open only: the skipped one is out
+    let res = app
+        .clone()
+        .oneshot(get("/api/timesheet/questions?status=open&date=2026-11-06"))
+        .await
+        .expect("oneshot");
+    let v = body_json(res).await;
+    let qs = v["questions"].as_array().expect("questions");
+    assert_eq!(qs.len(), 1);
+    assert_eq!(qs[0]["id"], open6);
+
+    // a day with nothing
+    let res = app
+        .clone()
+        .oneshot(get("/api/timesheet/questions?status=open&date=2026-11-08"))
+        .await
+        .expect("oneshot");
+    let v = body_json(res).await;
+    assert_eq!(v["questions"].as_array().expect("questions").len(), 0);
+
+    // a malformed date is a 400, not a silent full listing
+    let res = app
+        .oneshot(get("/api/timesheet/questions?status=open&date=not-a-day"))
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn question_payload_exposes_auto_detect_fields() {
+    // Issue #69: the worker's low-confidence hand-off text carries the
+    // guess and confidence; the payload parses them so clients can
+    // collapse the ask without re-parsing prose. Plain asks stay null.
+    let (dir, state) = test_state("auto-detect");
+    let app = build_router(state);
+    seed_question(
+        &dir,
+        "2026-11-06",
+        "What were you working on at 2026-11-06T10:00:00+08:00? (auto-detected: Browsing charts; confidence 0.30)",
+        &[],
+    );
+    seed_question(
+        &dir,
+        "2026-11-06",
+        "What were you working on 11:00-11:30 (Excel.exe)?",
+        &[],
+    );
+
+    let res = app
+        .clone()
+        .oneshot(get("/api/timesheet/questions?status=open&date=2026-11-06"))
+        .await
+        .expect("oneshot");
+    let v = body_json(res).await;
+    let qs = v["questions"].as_array().expect("questions");
+    assert_eq!(qs.len(), 2);
+    let auto = qs
+        .iter()
+        .find(|q| {
+            q["question"]
+                .as_str()
+                .expect("text")
+                .contains("auto-detected")
+        })
+        .expect("auto-detected ask");
+    assert_eq!(auto["auto_detect"], "Browsing charts");
+    assert_eq!(auto["auto_confidence"], 0.30);
+    let plain = qs
+        .iter()
+        .find(|q| q["question"].as_str().expect("text").contains("Excel.exe"))
+        .expect("plain ask");
+    assert!(plain["auto_detect"].is_null());
+    assert!(plain["auto_confidence"].is_null());
+    drop(dir);
+}
+
+#[tokio::test]
 async fn health_is_untouched_by_the_question_queue() {
     let (dir, state) = test_state("health");
     let app = build_router(state);

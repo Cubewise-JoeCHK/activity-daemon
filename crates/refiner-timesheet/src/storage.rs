@@ -8,6 +8,8 @@
 //!
 //! `evidence_json` holds a JSON list of `{frame_path, frame_sha16, ts}`
 //! objects - references to captured screen frames backing the question.
+//! `status` also carries `skipped` (issue #69): the owner dismissed the
+//! ask without answering it - a terminal state nothing re-opens.
 //! `frame_path` uses the media convention (`media/<kind>/<YYYY>/<MM>/<DD>/
 //! <filename>`, relative to the hub data root); serving the bytes is the
 //! hub API's job (issue #44), this module only stores the references.
@@ -44,14 +46,18 @@ pub struct EvidenceFrame {
 
 /// Lifecycle of a question: created `open` by the analysis worker or
 /// the compiler, flipped to `answered` (with the answer text) by the
-/// owner, or closed `superseded` (issue #66: zero-length or fully
-/// covered span; `answered_at` is the closure stamp, `answer` stays
-/// NULL).
+/// owner, closed `superseded` (issue #66: zero-length or fully covered
+/// span; `answered_at` is the closure stamp, `answer` stays NULL), or
+/// dismissed `skipped` by the owner (issue #69: "not now / not
+/// interesting" - the owner is never forced to answer; `answered_at`
+/// carries the skip stamp, `answer` stays NULL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TsQuestionStatus {
     Open,
     Answered,
     Superseded,
+    /// Owner-dismissed without an answer (issue #69).
+    Skipped,
 }
 
 impl TsQuestionStatus {
@@ -60,6 +66,7 @@ impl TsQuestionStatus {
             TsQuestionStatus::Open => "open",
             TsQuestionStatus::Answered => "answered",
             TsQuestionStatus::Superseded => "superseded",
+            TsQuestionStatus::Skipped => "skipped",
         }
     }
 
@@ -68,6 +75,7 @@ impl TsQuestionStatus {
             "open" => Ok(TsQuestionStatus::Open),
             "answered" => Ok(TsQuestionStatus::Answered),
             "superseded" => Ok(TsQuestionStatus::Superseded),
+            "skipped" => Ok(TsQuestionStatus::Skipped),
             other => Err(CoreError::Validation(format!(
                 "unknown question status '{other}' in store"
             ))),
@@ -217,6 +225,45 @@ impl TsQuestionStore {
         Ok(rows)
     }
 
+    /// [`TsQuestionStore::list_questions`] narrowed to one day
+    /// (`YYYY-MM-DD`, issue #69): the review panel asks for exactly the
+    /// selected day's questions - no cross-day pile-up. Same ordering.
+    pub fn list_questions_on_day(
+        &self,
+        filter: StatusFilter,
+        day: &str,
+    ) -> Result<Vec<TsQuestion>, CoreError> {
+        let sql = match filter {
+            StatusFilter::All => {
+                "SELECT id, day, question, evidence_json, status, answer, created_at, answered_at
+                 FROM ts_questions WHERE day = ?1 ORDER BY id DESC"
+            }
+            StatusFilter::Open | StatusFilter::Answered => {
+                "SELECT id, day, question, evidence_json, status, answer, created_at, answered_at
+                 FROM ts_questions WHERE day = ?1 AND status = ?2 ORDER BY id DESC"
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = Vec::new();
+        match filter {
+            StatusFilter::All => {
+                for row in stmt.query_map(params![day], map_question)? {
+                    rows.push(row?);
+                }
+            }
+            StatusFilter::Open | StatusFilter::Answered => {
+                let status = match filter {
+                    StatusFilter::Open => TsQuestionStatus::Open,
+                    _ => TsQuestionStatus::Answered,
+                };
+                for row in stmt.query_map(params![day, status.as_str()], map_question)? {
+                    rows.push(row?);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     /// Answer a question: fills `answer`/`answered_at` and flips `status`
     /// to `answered`; evidence is never touched (answered questions keep
     /// their evidence link). Re-answering an already-answered question
@@ -239,6 +286,29 @@ impl TsQuestionStore {
         if updated == 0 {
             return Ok(None);
         }
+        self.get_question(id)
+    }
+
+    /// Skip a question (issue #69): the owner dismisses the ask without
+    /// answering. Only currently-`open` rows flip - an owner answer or a
+    /// supersession wins and is never overwritten; re-skipping a closed
+    /// row returns it unchanged (idempotent). `answered_at` carries the
+    /// skip stamp; `answer` stays NULL. Returns the updated row, `None`
+    /// if the id is unknown.
+    pub fn skip_question(&self, id: i64) -> Result<Option<TsQuestion>, CoreError> {
+        let current = self.get_question(id)?;
+        let Some(question) = current else {
+            return Ok(None);
+        };
+        if question.status != TsQuestionStatus::Open {
+            return Ok(Some(question));
+        }
+        self.conn.execute(
+            "UPDATE ts_questions
+             SET status = 'skipped', answered_at = ?2
+             WHERE id = ?1",
+            params![id, now_rfc3339()],
+        )?;
         self.get_question(id)
     }
 
@@ -379,6 +449,94 @@ mod tests {
         assert_eq!(q.evidence[0].frame_sha16, "a1b2c3d4e5f60718");
         drop(store);
         cleanup(&path);
+    }
+
+    #[test]
+    fn skip_dismisses_only_open_rows() {
+        let store = TsQuestionStore::open_in_memory().expect("open");
+        let id = store
+            .create_question("2026-11-06", "What were you working on?", &[])
+            .expect("create");
+
+        // open -> skipped: answer stays NULL, closure stamp set
+        let skipped = store.skip_question(id).expect("skip").expect("row");
+        assert_eq!(skipped.status.as_str(), "skipped");
+        assert_eq!(skipped.answer, None);
+        let stamp = skipped.answered_at.clone().expect("stamp");
+        assert!(chrono::DateTime::parse_from_rfc3339(&stamp).is_ok());
+
+        // idempotent: re-skipping returns the row unchanged (same stamp)
+        let again = store.skip_question(id).expect("re-skip").expect("row");
+        assert_eq!(again.status.as_str(), "skipped");
+        assert_eq!(again.answered_at, skipped.answered_at);
+
+        // skipped rows leave the open listing
+        assert!(store
+            .list_questions(StatusFilter::Open)
+            .expect("open list")
+            .is_empty());
+        assert_eq!(
+            store.list_questions(StatusFilter::All).expect("all").len(),
+            1
+        );
+
+        // an owner answer wins: skipping an answered row changes nothing
+        let id2 = store
+            .create_question("2026-11-06", "Another ask", &[])
+            .expect("create 2");
+        store
+            .answer_question(id2, "the owner's answer")
+            .expect("answer");
+        let untouched = store
+            .skip_question(id2)
+            .expect("skip answered")
+            .expect("row");
+        assert_eq!(untouched.status.as_str(), "answered");
+        assert_eq!(untouched.answer.as_deref(), Some("the owner's answer"));
+
+        // unknown id
+        assert!(store.skip_question(999).expect("skip unknown").is_none());
+    }
+
+    #[test]
+    fn list_questions_on_day_narrows_by_day_and_status() {
+        let store = TsQuestionStore::open_in_memory().expect("open");
+        store
+            .create_question("2026-11-05", "ask day 5", &[])
+            .expect("create");
+        let id6 = store
+            .create_question("2026-11-06", "ask day 6", &[])
+            .expect("create");
+        store
+            .create_question("2026-11-06", "ask day 6 b", &[])
+            .expect("create 2");
+
+        let day6 = store
+            .list_questions_on_day(StatusFilter::All, "2026-11-06")
+            .expect("day list");
+        assert_eq!(day6.len(), 2);
+        assert!(day6.iter().all(|q| q.day == "2026-11-06"));
+
+        // skip one day-6 row; the open narrow sees only the other
+        store.skip_question(id6).expect("skip");
+        let open6 = store
+            .list_questions_on_day(StatusFilter::Open, "2026-11-06")
+            .expect("day open list");
+        assert_eq!(open6.len(), 1);
+        assert_eq!(open6[0].question, "ask day 6 b");
+
+        // other days untouched
+        assert_eq!(
+            store
+                .list_questions_on_day(StatusFilter::Open, "2026-11-05")
+                .expect("day 5 open")
+                .len(),
+            1
+        );
+        assert!(store
+            .list_questions_on_day(StatusFilter::All, "2026-11-07")
+            .expect("empty day")
+            .is_empty());
     }
 
     #[test]
