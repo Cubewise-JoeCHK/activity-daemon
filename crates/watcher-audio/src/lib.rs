@@ -20,8 +20,9 @@
 //!   `{data_dir}/logs/audio.log`. The Windows mic-in-use indicator and
 //!   hardware LEDs cannot be suppressed legitimately (ADR rev 4); no work
 //!   is spent on hiding them.
-//! - **Retention**: rolling budget, oldest-first, default 60 days / 10 GB
-//!   (`audio.max_age_days` / `audio.max_total_mb`), swept hourly. Files
+//! - **Retention**: rolling budget, oldest-first, default 3 days / 10 GB
+//!   (`audio.max_age_days` / `audio.max_total_mb`; tightened from 60 days
+//!   by issue #71, 2026-11-17), swept hourly. Files
 //!   whose `media` index row is not yet synced are never pruned (ADR
 //!   rev 5); stale `*.part` crash leftovers are removed after a day.
 //! - Files are local-first under `{data_dir}/media/audio/` and sync to the
@@ -125,8 +126,9 @@ pub use recording::{CaptureCommand, FinalizedFile, FinishedRecording, StartSpec,
 pub use retention::{FileInfo, RetentionBudget, MB_BYTES};
 pub use sink::{AudioSink, FakeSink, WavSink};
 
-/// Default rolling retention for meeting audio: max age in days (ADR rev 4).
-pub const DEFAULT_MAX_AGE_DAYS: u64 = 60;
+/// Default rolling retention for meeting audio: max age in days (ADR rev 4
+/// set 60; tightened to 3 by issue #71, 2026-11-17).
+pub const DEFAULT_MAX_AGE_DAYS: u64 = 3;
 
 /// Default rolling retention for meeting audio: max total size in MB.
 pub const DEFAULT_MAX_TOTAL_MB: u64 = 10 * 1024;
@@ -137,7 +139,7 @@ mod tests {
 
     #[test]
     fn retention_defaults_match_adr() {
-        assert_eq!(DEFAULT_MAX_AGE_DAYS, 60);
+        assert_eq!(DEFAULT_MAX_AGE_DAYS, 3);
         assert_eq!(DEFAULT_MAX_TOTAL_MB, 10 * 1024);
         // The core config defaults must agree with this crate's ADR consts.
         let cfg = activity_core::Config::default();
