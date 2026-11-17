@@ -1,9 +1,10 @@
 //! TOML configuration for the daemon and its watchers.
 //!
 //! Every field has a sensible default (see `Default` impls, matching the ADR
-//! decisions): screen frames keep a rolling budget of 90 days / 20 GB on the
-//! device, meeting audio 60 days / 10 GB. Partial config files are valid:
-//! missing fields fall back to defaults.
+//! decisions as amended by issue #71, 2026-11-17): screen frames keep a
+//! rolling budget of 3 days / 20 GB on the device, meeting audio
+//! 3 days / 10 GB. Partial config files are valid: missing fields fall back
+//! to defaults.
 
 use std::path::{Path, PathBuf};
 
@@ -156,12 +157,13 @@ impl Default for Config {
 
 impl Default for ScreenConfig {
     fn default() -> Self {
-        // ADR rev 2: rolling budget default max 90 days / 20 GB.
+        // ADR rev 2 set 90 days; tightened to 3 days / 20 GB (issue #71,
+        // 2026-11-17).
         ScreenConfig {
             interval_s: 5,
             quality: 70,
             monitors: ScreenMonitors::All,
-            max_age_days: 90,
+            max_age_days: 3,
             max_total_mb: 20 * 1024,
         }
     }
@@ -169,7 +171,8 @@ impl Default for ScreenConfig {
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        // ADR rev 4: rolling retention default 60 days / 10 GB.
+        // ADR rev 4 set 60 days; tightened to 3 days / 10 GB (issue #71,
+        // 2026-11-17).
         AudioConfig {
             hotkey: "ctrl+shift+alt+m".to_string(),
             process_list: vec![
@@ -179,7 +182,7 @@ impl Default for AudioConfig {
                 "webex.exe".to_string(),
             ],
             grace_stop_s: 10,
-            max_age_days: 60,
+            max_age_days: 3,
             max_total_mb: 10 * 1024,
         }
     }
@@ -232,7 +235,7 @@ mod tests {
         )
         .expect("parse partial config");
         assert_eq!(cfg.screen.interval_s, 10);
-        assert_eq!(cfg.screen.max_age_days, 90);
+        assert_eq!(cfg.screen.max_age_days, 3);
         assert_eq!(cfg.screen.max_total_mb, 20 * 1024);
         assert_eq!(cfg.data_dir, PathBuf::from("data"));
         assert_eq!(cfg.poll_interval_s, 1);
@@ -241,7 +244,7 @@ mod tests {
         assert!(cfg.sync.auto_update);
         assert_eq!(cfg.screen.quality, 70);
         assert_eq!(cfg.audio.grace_stop_s, 10);
-        assert_eq!(cfg.audio.max_age_days, 60);
+        assert_eq!(cfg.audio.max_age_days, 3);
         assert_eq!(cfg.audio.max_total_mb, 10 * 1024);
     }
 

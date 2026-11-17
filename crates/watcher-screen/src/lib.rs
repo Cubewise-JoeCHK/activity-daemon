@@ -7,8 +7,8 @@
 //! threshold), with content dedup (`sha16`: a frame identical to its
 //! monitor's previous frame is not written at all) and a rolling retention
 //! budget of `screen.max_age_days` / `screen.max_total_mb` shared by all
-//! monitors and enforced by an hourly oldest-first sweep (ADR rev 2
-//! defaults: 90 days / 20 GB).
+//! monitors and enforced by an hourly oldest-first sweep (ADR rev 2 set
+//! 90 days; default since issue #71, 2026-11-17: 3 days / 20 GB).
 //!
 //! # Layout (ADR media contract)
 //!

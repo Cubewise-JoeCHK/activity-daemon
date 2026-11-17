@@ -291,11 +291,12 @@ curl -s http://activity-hub:8080/ingest/events \
   both the bytes (checksum-verified PUT) and the referencing index row:
   deletion happens only then (sync contract v2, issue #40, ADR rev 12) - a
   rejected row keeps its file and retries. During an outage nothing is
-  deleted until the rolling budgets bite - at current capture rates roughly
-  26 days of frames accumulate before eviction begins; the budgets are the
-  outage backstop. Audio retention additionally spares not-yet-synced files
-  (ADR rev 5). A media row whose file is missing is skipped and retried
-  later - it is never posted and never marked synced.
+  deleted until the rolling budgets bite: the 3-day age default (issue #71,
+  2026-11-17) starts eviction after roughly 3 days of accumulation - well
+  before the 20 GB frame budget would (~26 days at current capture rates);
+  the budgets are the outage backstop. Audio retention additionally spares
+  not-yet-synced files (ADR rev 5). A media row whose file is missing is
+  skipped and retried later - it is never posted and never marked synced.
 - Rejected events (server-side 4xx with reasons) stay unsynced and are
   logged each round - nothing is silently dropped; a poison row shows up in
   the client log and can be fixed or removed manually.
